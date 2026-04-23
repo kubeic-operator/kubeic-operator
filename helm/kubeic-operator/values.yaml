@@ -2,7 +2,7 @@
 operator:
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/operator
-    tag: "0.0.1-alpha.4"
+    tag: "0.0.1-alpha.5"
     pullPolicy: IfNotPresent
   replicas: 1
   resources:
@@ -17,7 +17,7 @@ operator:
 checker:
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/checker
-    tag: "0.0.1-alpha.4"
+    tag: "0.0.1-alpha.5"
     pullPolicy: IfNotPresent
   resources:
     requests:
