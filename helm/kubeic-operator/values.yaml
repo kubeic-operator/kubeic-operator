@@ -27,6 +27,20 @@ checker:
       cpu: 200m
       memory: 128Mi
 
+  # Namespaces excluded from auditing entirely (no checker deployed)
+  excludedNamespaces:
+    - kube-public
+    - kube-node-lease
+
+  # Namespaces where checkers get restricted or no secret RBAC
+  noSecretNamespaces:
+    - kube-system
+
+  # Explicit secret names per namespace (grants get secrets restricted to these names only)
+  namespaceSecrets: {}
+    # kube-system:
+    #   - my-pull-secret
+
 # Default audit policy (applied as cluster-defaults ImageAuditPolicy)
 policy:
   prerelease:

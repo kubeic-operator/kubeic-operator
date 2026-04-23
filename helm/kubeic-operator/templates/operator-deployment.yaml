@@ -41,6 +41,12 @@ spec:
               value: {{ .Values.checker.resources.limits.cpu | quote }}
             - name: CHECKER_MEMORY_LIMIT
               value: {{ .Values.checker.resources.limits.memory | quote }}
+            - name: EXCLUDED_NAMESPACES
+              value: {{ .Values.checker.excludedNamespaces | join "," | quote }}
+            - name: NO_SECRET_NAMESPACES
+              value: {{ .Values.checker.noSecretNamespaces | join "," | quote }}
+            - name: NAMESPACE_SECRETS
+              value: {{ .Values.checker.namespaceSecrets | toJson | quote }}
           ports:
             - name: metrics
               containerPort: 9090
