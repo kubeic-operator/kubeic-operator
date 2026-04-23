@@ -1,5 +1,6 @@
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 
 from kubeic_operator.checks.prerelease import _parse_image
@@ -21,9 +22,9 @@ class AvailabilityResult:
 
 
 def _run_skopeo_inspect(
-    image: str, auth_file: str | None = None,
+    image: str, auth_file: str | None = None, retries: int = 3,
 ) -> tuple[bool, str | None, dict | None]:
-    """Run skopeo inspect against an image.
+    """Run skopeo inspect against an image with exponential backoff retry.
 
     Returns (success, error_message, parsed_json).
     parsed_json contains the full skopeo inspect output including the Digest field.
@@ -33,26 +34,33 @@ def _run_skopeo_inspect(
     if auth_file:
         cmd.extend(["--authfile", auth_file])
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if result.returncode == 0:
-            try:
-                inspect_data = json.loads(result.stdout)
-            except (json.JSONDecodeError, ValueError):
-                inspect_data = None
-            return True, None, inspect_data
-        return False, result.stderr.strip() or f"skopeo exited with code {result.returncode}", None
-    except subprocess.TimeoutExpired:
-        return False, "skopeo inspect timed out after 30s", None
-    except FileNotFoundError:
-        return False, "skopeo binary not found", None
-    except Exception as exc:
-        return False, str(exc), None
+    last_error: str | None = None
+    for attempt in range(retries):
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                try:
+                    inspect_data = json.loads(result.stdout)
+                except (json.JSONDecodeError, ValueError):
+                    inspect_data = None
+                return True, None, inspect_data
+            last_error = result.stderr.strip() or f"skopeo exited with code {result.returncode}"
+        except subprocess.TimeoutExpired:
+            last_error = "skopeo inspect timed out after 30s"
+        except FileNotFoundError:
+            return False, "skopeo binary not found", None
+        except Exception as exc:
+            last_error = str(exc)
+
+        if attempt < retries - 1:
+            time.sleep(2 ** attempt)
+
+    return False, last_error, None
 
 
 def check_availability(
@@ -60,6 +68,9 @@ def check_availability(
     auth_file: str | None = None,
 ) -> list[AvailabilityResult]:
     """Check image availability for all containers in the given pods.
+
+    Each unique image is inspected once and the result is reused for all
+    containers referencing it.
 
     Args:
         pods: List of pod dicts with metadata and spec.
@@ -69,6 +80,17 @@ def check_availability(
         One AvailabilityResult per container.
     """
     results: list[AvailabilityResult] = []
+
+    # Inspect each unique image once
+    seen_images: dict[str, tuple[bool, str | None, dict | None]] = {}
+    for pod in pods:
+        containers = pod.get("spec", {}).get("containers", [])
+        init_containers = pod.get("spec", {}).get("initContainers", [])
+        for container in list(containers) + list(init_containers):
+            image = container["image"]
+            if image not in seen_images:
+                inspect_image = image.split("@")[0] if "@" in image else image
+                seen_images[image] = _run_skopeo_inspect(inspect_image, auth_file)
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]
@@ -80,11 +102,9 @@ def check_availability(
             image = container["image"]
             pinned_digest: str | None = None
             if "@" in image:
-                inspect_image, pinned_digest = image.split("@", 1)
-            else:
-                inspect_image = image
+                _, pinned_digest = image.split("@", 1)
 
-            available, error, inspect_data = _run_skopeo_inspect(inspect_image, auth_file)
+            available, error, inspect_data = seen_images[image]
             registry, image_name, _ = _parse_image(image)
 
             digest_match: bool | None = None
