@@ -1,5 +1,5 @@
 # kubeic-operator
-
+![kubeic operator logo](https://github.com/organizations/kubeic-operator/settings/profile)
 Kubernetes operator that audits running pod images for availability, pre-release age, and version spread. Surfaces findings as Prometheus metrics for Grafana dashboards and alerting.
 
 ## What it checks
