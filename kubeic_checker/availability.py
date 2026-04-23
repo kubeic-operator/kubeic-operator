@@ -2,11 +2,14 @@ import json
 import subprocess
 from dataclasses import dataclass
 
+from kubeic_operator.checks.prerelease import _parse_image
+
 
 @dataclass
 class AvailabilityResult:
     image: str
-    image_base: str
+    registry: str
+    image_name: str
     namespace: str
     pod: str
     container: str
@@ -39,16 +42,6 @@ def _run_skopeo_inspect(image: str, auth_file: str | None = None) -> tuple[bool,
         return False, str(exc)
 
 
-def _image_base(image: str) -> str:
-    """Strip tag or digest from an image reference, returning the base path."""
-    if "@" in image:
-        return image.split("@")[0]
-    last_colon = image.rfind(":")
-    if last_colon != -1 and "/" not in image[last_colon:]:
-        return image[:last_colon]
-    return image
-
-
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
@@ -73,10 +66,12 @@ def check_availability(
         for container in list(containers) + list(init_containers):
             image = container["image"]
             available, error = _run_skopeo_inspect(image, auth_file)
+            registry, image_name, _ = _parse_image(image)
 
             results.append(AvailabilityResult(
                 image=image,
-                image_base=_image_base(image),
+                registry=registry,
+                image_name=image_name,
                 namespace=namespace,
                 pod=pod_name,
                 container=container["name"],

@@ -5,31 +5,31 @@ from prometheus_client import Gauge
 kube_image_is_prerelease = Gauge(
     "kube_image_is_prerelease",
     "Whether the image tag is a pre-release version (0 or 1)",
-    ["image", "image_base", "tag", "namespace", "pod", "container"],
+    ["image", "registry", "image_name", "tag", "namespace", "pod", "container"],
 )
 
 kube_image_prerelease_age_days = Gauge(
     "kube_image_prerelease_age_days",
     "Age in days of a pod running a pre-release image",
-    ["image", "image_base", "tag", "namespace", "pod", "container"],
+    ["image", "registry", "image_name", "tag", "namespace", "pod", "container"],
 )
 
 kube_image_version_count = Gauge(
     "kube_image_version_count",
-    "Number of distinct versions running for an image base",
-    ["image_base"],
+    "Number of distinct versions running for an image",
+    ["registry", "image_name"],
 )
 
 kube_image_version_pod_count = Gauge(
     "kube_image_version_pod_count",
     "Number of pods running a specific image version",
-    ["image_base", "tag", "namespace"],
+    ["registry", "image_name", "tag", "namespace"],
 )
 
 kube_image_version_spread_violation = Gauge(
     "kube_image_version_spread_violation",
-    "Whether this image base exceeds the version spread threshold (0 or 1)",
-    ["image_base"],
+    "Whether this image exceeds the version spread threshold (0 or 1)",
+    ["registry", "image_name"],
 )
 
 kube_image_total_prerelease_violations = Gauge(
@@ -47,7 +47,7 @@ kube_image_total_spread_violations = Gauge(
 kube_image_available = Gauge(
     "kube_image_available",
     "Whether the image is reachable in the registry (0 or 1)",
-    ["image", "image_base", "namespace", "pod", "container"],
+    ["image", "registry", "image_name", "namespace", "pod", "container"],
 )
 
 kube_image_credential_valid = Gauge(
@@ -76,7 +76,8 @@ def update_prerelease_metrics(findings: list, violation_count: int = 0) -> None:
     for f in findings:
         labels = {
             "image": f.image,
-            "image_base": f.image_base,
+            "registry": f.registry,
+            "image_name": f.image_name,
             "tag": f.tag,
             "namespace": f.namespace,
             "pod": f.pod,
@@ -100,17 +101,20 @@ def update_spread_metrics(findings: list) -> None:
 
     violation_count = 0
     for f in findings:
-        kube_image_version_count.labels(image_base=f.image_base).set(f.version_count)
-        kube_image_version_spread_violation.labels(image_base=f.image_base).set(
-            1 if f.violates_threshold else 0
-        )
+        kube_image_version_count.labels(
+            registry=f.registry, image_name=f.image_name,
+        ).set(f.version_count)
+        kube_image_version_spread_violation.labels(
+            registry=f.registry, image_name=f.image_name,
+        ).set(1 if f.violates_threshold else 0)
         if f.violates_threshold:
             violation_count += 1
 
         for tag, ns_counts in f.version_pod_counts.items():
             for ns, count in ns_counts.items():
                 kube_image_version_pod_count.labels(
-                    image_base=f.image_base, tag=tag, namespace=ns
+                    registry=f.registry, image_name=f.image_name,
+                    tag=tag, namespace=ns,
                 ).set(count)
 
     kube_image_total_spread_violations.set(violation_count)
@@ -129,7 +133,7 @@ def update_availability_metrics(results: list, namespace: str = "") -> None:
     for r in results:
         value = 1 if r.available else 0
         kube_image_available.labels(
-            image=r.image, image_base=r.image_base,
+            image=r.image, registry=r.registry, image_name=r.image_name,
             namespace=r.namespace, pod=r.pod, container=r.container,
         ).set(value)
         if not r.available:

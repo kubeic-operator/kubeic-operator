@@ -38,7 +38,8 @@ _STABLE_OS_SUFFIX_RE = re.compile(
 @dataclass
 class PrereleaseFinding:
     image: str
-    image_base: str
+    registry: str
+    image_name: str
     tag: str
     namespace: str
     pod: str
@@ -47,22 +48,66 @@ class PrereleaseFinding:
     age_days: float
 
 
-def _parse_image(image_str: str) -> tuple[str, str]:
-    """Split image into (base, tag). Handles registry/path:tag and registry/path (implies :latest)."""
-    # Handle digest references (sha256:...) - not a tag
+def _parse_registry(image_base: str) -> tuple[str, str]:
+    """Split an image base (no tag/digest) into (registry, image_name).
+
+    Docker Hub images without an explicit registry get 'docker.io' and a
+    'library/' prefix for official images.
+
+    Examples:
+        nginx                                  -> (docker.io, library/nginx)
+        myuser/myapp                           -> (docker.io, myuser/myapp)
+        quay.io/myorg/myapp                    -> (quay.io, myorg/myapp)
+        registry.k8s.io/ingress-nginx/ctrl     -> (registry.k8s.io, ingress-nginx/ctrl)
+        myregistry.corp.com:5000/app           -> (myregistry.corp.com:5000, app)
+    """
+    parts = image_base.split("/")
+    if len(parts) == 1:
+        # Bare image name like "nginx" — Docker Hub official
+        return "docker.io", f"library/{image_base}"
+    if "." in parts[0] or ":" in parts[0]:
+        # Explicit registry (has a dot or port)
+        return parts[0], "/".join(parts[1:])
+    # No explicit registry but has a slash, e.g. "myuser/myapp" — Docker Hub
+    return "docker.io", image_base
+
+
+def _parse_image(image_str: str) -> tuple[str, str, str]:
+    """Split image into (registry, image_name, tag).
+
+    For images with both a tag and a digest (e.g. repo:v1.0@sha256:abc),
+    the tag is extracted and the digest is stripped.
+    For images with only a digest (e.g. repo@sha256:abc), the digest is used as the tag.
+    """
+    # Strip digest, but first check if there's a tag before the @
     if "@" in image_str:
-        base, digest = image_str.rsplit("@", 1)
-        return base, digest
+        before_at = image_str.split("@", 1)[0]
+        # Try to extract a tag from the part before the digest
+        last_colon = before_at.rfind(":")
+        if last_colon != -1 and "/" not in before_at[last_colon:]:
+            # Has a tag before the digest: repo:tag@sha256:...
+            base = before_at[:last_colon]
+            tag = before_at[last_colon + 1:]
+            registry, image_name = _parse_registry(base)
+            return registry, image_name, tag
+        # No tag, just a digest: repo@sha256:...
+        registry, image_name = _parse_registry(before_at)
+        return registry, image_name, image_str.split("@", 1)[1]
 
     if ":" in image_str:
         # Split on last : to handle registry ports (registry:5000/image:tag)
         last_colon = image_str.rfind(":")
         # If there's a / after the last colon, it's a port not a tag
         if "/" in image_str[last_colon:]:
-            return image_str, "latest"
-        return image_str[:last_colon], image_str[last_colon + 1:]
+            registry, image_name = _parse_registry(image_str)
+            return registry, image_name, "latest"
+        base = image_str[:last_colon]
+        tag = image_str[last_colon + 1:]
+        registry, image_name = _parse_registry(base)
+        return registry, image_name, tag
 
-    return image_str, "latest"
+    registry, image_name = _parse_registry(image_str)
+    return registry, image_name, "latest"
 
 
 def is_prerelease_tag(tag: str, patterns: list[str] | None = None) -> bool:
@@ -124,13 +169,14 @@ def check_prerelease(
         for container_list in [containers, init_containers]:
             for container in container_list:
                 image_str = container["image"]
-                base, tag = _parse_image(image_str)
+                registry, image_name, tag = _parse_image(image_str)
                 is_pre = is_prerelease_tag(tag, patterns)
 
                 if is_pre:
                     findings.append(PrereleaseFinding(
                         image=image_str,
-                        image_base=base,
+                        registry=registry,
+                        image_name=image_name,
                         tag=tag,
                         namespace=namespace,
                         pod=pod_name,

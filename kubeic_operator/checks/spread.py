@@ -6,7 +6,8 @@ from kubeic_operator.checks.prerelease import _parse_image
 
 @dataclass
 class VersionSpreadFinding:
-    image_base: str
+    registry: str
+    image_name: str
     versions: list[str]
     version_count: int
     violates_threshold: bool
@@ -15,25 +16,16 @@ class VersionSpreadFinding:
     version_pod_counts: dict[str, dict[str, int]]  # tag -> {namespace: count}
 
 
-def _get_image_base(image_str: str) -> str:
-    """Extract the image base (registry/path without tag or digest)."""
-    base, _ = _parse_image(image_str)
-    # Strip digest if present
-    if "@" in base:
-        base = base.split("@")[0]
-    return base
-
-
 def aggregate_version_spread(
     pods: list[dict],
     threshold: int = 3,
 ) -> list[VersionSpreadFinding]:
-    """Group running pods by image base and detect version spread violations.
+    """Group running pods by image (registry + image_name) and detect version spread violations.
 
-    Returns one finding per image base that has more than 1 version running.
+    Returns one finding per image that has more than 1 version running.
     """
-    # image_base -> {tag -> {namespace -> count}}
-    image_versions: dict[str, dict[str, dict[str, int]]] = defaultdict(
+    # (registry, image_name) -> {tag -> {namespace -> count}}
+    image_versions: dict[tuple[str, str], dict[str, dict[str, int]]] = defaultdict(
         lambda: defaultdict(lambda: defaultdict(int))
     )
 
@@ -44,12 +36,12 @@ def aggregate_version_spread(
 
         for container in list(containers) + list(init_containers):
             image_str = container["image"]
-            base, tag = _parse_image(image_str)
-            image_versions[base][tag][namespace] += 1
+            registry, image_name, tag = _parse_image(image_str)
+            image_versions[(registry, image_name)][tag][namespace] += 1
 
     findings: list[VersionSpreadFinding] = []
 
-    for image_base, tags in sorted(image_versions.items()):
+    for (registry, image_name), tags in sorted(image_versions.items()):
         version_count = len(tags)
         if version_count < 2:
             continue
@@ -60,7 +52,8 @@ def aggregate_version_spread(
         }
 
         findings.append(VersionSpreadFinding(
-            image_base=image_base,
+            registry=registry,
+            image_name=image_name,
             versions=sorted(tags.keys()),
             version_count=version_count,
             violates_threshold=version_count > threshold,
