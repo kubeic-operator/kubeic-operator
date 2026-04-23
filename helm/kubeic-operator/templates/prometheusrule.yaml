@@ -1,0 +1,51 @@
+{{- if .Values.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: image-audit
+      rules:
+        - alert: ImageUnavailableInRegistry
+          expr: kube_image_available == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Image unreachable: {{`{{ $labels.image }}`}}"
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry."
+
+        - alert: PrereleaseImageRunningTooLong
+          expr: kube_image_prerelease_age_days > {{ .Values.policy.prerelease.maxAgeDays }}
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pre-release image running {{`{{ $value }}`}}d: {{`{{ $labels.image }}`}}"
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} for over {{ .Values.policy.prerelease.maxAgeDays }} days."
+
+        - alert: ImageVersionSpreadTooHigh
+          expr: kube_image_version_spread_violation == 1
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Version spread on {{`{{ $labels.image_base }}`}}"
+            description: "Image base {{`{{ $labels.image_base }}`}} has too many distinct versions running simultaneously."
+
+        - alert: RegistryCredentialInvalid
+          expr: kube_image_credential_valid == 0
+          for: 10m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Registry credential invalid: {{`{{ $labels.registry }}`}}"
+            description: "Credential {{`{{ $labels.secret_name }}`}} in namespace {{`{{ $labels.namespace }}`}} failed validation against {{`{{ $labels.registry }}`}}."
+{{- end }}

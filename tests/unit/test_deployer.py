@@ -1,0 +1,233 @@
+from unittest.mock import MagicMock, patch
+
+from kubernetes.client import ApiException as K8sApiException
+
+from kubeic_operator.deployer import (
+    _build_service_account,
+    _build_role,
+    _build_role_binding,
+    _build_service,
+    _build_deployment,
+    _selector_labels,
+    _common_labels,
+    deploy_checker,
+    teardown_checker,
+    CHECKER_SERVICE_ACCOUNT,
+    CHECKER_ROLE,
+    CHECKER_ROLE_BINDING,
+    CHECKER_DEPLOYMENT,
+    CHECKER_SERVICE,
+)
+
+
+class TestLabels:
+    def test_selector_labels_are_subset_of_common_labels(self):
+        sel = _selector_labels()
+        common = _common_labels()
+        assert sel.items() <= common.items()
+
+    def test_common_labels_include_version_and_managed_by(self):
+        common = _common_labels()
+        assert "app.kubernetes.io/version" in common
+        assert "app.kubernetes.io/managed-by" in common
+
+    def test_selector_labels_exclude_mutable_fields(self):
+        sel = _selector_labels()
+        assert "app.kubernetes.io/version" not in sel
+
+
+class TestBuildServiceAccount:
+    def test_has_correct_name_and_namespace(self):
+        sa = _build_service_account("my-ns")
+        assert sa.metadata.name == CHECKER_SERVICE_ACCOUNT
+        assert sa.metadata.namespace == "my-ns"
+
+    def test_has_managed_by_label(self):
+        sa = _build_service_account("my-ns")
+        assert sa.metadata.labels["app.kubernetes.io/managed-by"] == "kubeic-operator"
+
+    def test_has_instance_label(self):
+        sa = _build_service_account("my-ns")
+        assert "app.kubernetes.io/instance" in sa.metadata.labels
+
+
+class TestBuildRole:
+    def test_has_pod_and_secret_rules(self):
+        role = _build_role("my-ns")
+        assert len(role.rules) == 2
+        resources = {r.resources[0] for r in role.rules}
+        assert "pods" in resources
+        assert "secrets" in resources
+
+    def test_secrets_only_get(self):
+        role = _build_role("my-ns")
+        secret_rule = next(r for r in role.rules if "secrets" in r.resources)
+        assert secret_rule.verbs == ["get"]
+
+
+class TestBuildRoleBinding:
+    def test_binds_sa_to_role(self):
+        rb = _build_role_binding("my-ns")
+        assert rb.role_ref.name == CHECKER_ROLE
+        assert rb.role_ref.kind == "Role"
+        assert len(rb.subjects) == 1
+        assert rb.subjects[0].name == CHECKER_SERVICE_ACCOUNT
+        assert rb.subjects[0].namespace == "my-ns"
+
+
+class TestBuildService:
+    def test_has_metrics_port(self):
+        svc = _build_service("my-ns")
+        assert svc.metadata.name == CHECKER_SERVICE
+        assert svc.metadata.namespace == "my-ns"
+        assert len(svc.spec.ports) == 1
+        assert svc.spec.ports[0].port == 9090
+        assert svc.spec.ports[0].name == "metrics"
+
+    def test_selector_uses_stable_labels_only(self):
+        svc = _build_service("my-ns")
+        assert svc.spec.selector == _selector_labels()
+        assert "app.kubernetes.io/version" not in svc.spec.selector
+
+
+class TestBuildDeployment:
+    def test_has_correct_env_vars(self):
+        deploy = _build_deployment("my-ns", check_interval_minutes=15, credential_source="workloadIdentity")
+        container = deploy.spec.template.spec.containers[0]
+        env = {e.name: e.value for e in container.env}
+        assert env["NAMESPACE"] == "my-ns"
+        assert env["CHECK_INTERVAL_MINUTES"] == "15"
+        assert env["CREDENTIAL_SOURCE"] == "workloadIdentity"
+
+    def test_match_labels_use_selector_labels_only(self):
+        deploy = _build_deployment("my-ns")
+        assert deploy.spec.selector.match_labels == _selector_labels()
+        assert "app.kubernetes.io/version" not in deploy.spec.selector.match_labels
+
+    def test_pod_template_labels_use_common_labels(self):
+        deploy = _build_deployment("my-ns")
+        pod_labels = deploy.spec.template.metadata.labels
+        assert "app.kubernetes.io/version" in pod_labels
+        assert "app.kubernetes.io/instance" in pod_labels
+
+    def test_metrics_port(self):
+        deploy = _build_deployment("my-ns")
+        container = deploy.spec.template.spec.containers[0]
+        assert container.ports[0].container_port == 9090
+
+    def test_prometheus_annotations(self):
+        deploy = _build_deployment("my-ns")
+        annotations = deploy.spec.template.metadata.annotations
+        assert annotations["prometheus.io/scrape"] == "true"
+        assert annotations["prometheus.io/port"] == "9090"
+
+    def test_resource_requests_and_limits_are_set(self):
+        deploy = _build_deployment("my-ns")
+        resources = deploy.spec.template.spec.containers[0].resources
+        assert resources.requests["cpu"] is not None
+        assert resources.requests["memory"] is not None
+        assert resources.limits["cpu"] is not None
+        assert resources.limits["memory"] is not None
+
+    def test_container_security_context_drops_all_capabilities(self):
+        deploy = _build_deployment("my-ns")
+        sc = deploy.spec.template.spec.containers[0].security_context
+        assert "ALL" in sc.capabilities.drop
+
+    def test_container_security_context_no_privilege_escalation(self):
+        deploy = _build_deployment("my-ns")
+        sc = deploy.spec.template.spec.containers[0].security_context
+        assert sc.allow_privilege_escalation is False
+
+    def test_container_security_context_non_root_readonly_fs(self):
+        deploy = _build_deployment("my-ns")
+        sc = deploy.spec.template.spec.containers[0].security_context
+        assert sc.run_as_non_root is True
+        assert sc.read_only_root_filesystem is True
+
+    def test_pod_security_context_non_root_with_seccomp(self):
+        deploy = _build_deployment("my-ns")
+        pod_sc = deploy.spec.template.spec.security_context
+        assert pod_sc.run_as_non_root is True
+        assert pod_sc.seccomp_profile.type == "RuntimeDefault"
+
+
+class TestDeployChecker:
+    @patch("kubeic_operator.deployer.client")
+    def test_creates_all_resources_when_not_found(self, mock_client):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        not_found = K8sApiException(status=404)
+        mock_v1.read_namespaced_service_account.side_effect = not_found
+        mock_rbac.read_namespaced_role.side_effect = not_found
+        mock_rbac.read_namespaced_role_binding.side_effect = not_found
+        mock_v1.read_namespaced_service.side_effect = not_found
+        mock_apps.read_namespaced_deployment.side_effect = not_found
+
+        deploy_checker("test-ns")
+
+        mock_v1.create_namespaced_service_account.assert_called_once()
+        mock_rbac.create_namespaced_role.assert_called_once()
+        mock_rbac.create_namespaced_role_binding.assert_called_once()
+        mock_v1.create_namespaced_service.assert_called_once()
+        mock_apps.create_namespaced_deployment.assert_called_once()
+
+    @patch("kubeic_operator.deployer.client")
+    def test_patches_existing_resources(self, mock_client):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        deploy_checker("test-ns")
+
+        mock_v1.patch_namespaced_service_account.assert_called_once()
+        mock_rbac.patch_namespaced_role.assert_called_once()
+        mock_rbac.patch_namespaced_role_binding.assert_called_once()
+        mock_v1.patch_namespaced_service.assert_called_once()
+        mock_apps.patch_namespaced_deployment.assert_called_once()
+
+
+class TestTeardownChecker:
+    @patch("kubeic_operator.deployer.client")
+    def test_deletes_all_resources_including_service(self, mock_client):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        teardown_checker("test-ns")
+
+        mock_apps.delete_namespaced_deployment.assert_called_once_with(CHECKER_DEPLOYMENT, "test-ns")
+        mock_v1.delete_namespaced_service.assert_called_once_with(CHECKER_SERVICE, "test-ns")
+        mock_rbac.delete_namespaced_role_binding.assert_called_once_with(CHECKER_ROLE_BINDING, "test-ns")
+        mock_rbac.delete_namespaced_role.assert_called_once_with(CHECKER_ROLE, "test-ns")
+        mock_v1.delete_namespaced_service_account.assert_called_once_with(CHECKER_SERVICE_ACCOUNT, "test-ns")
+
+    @patch("kubeic_operator.deployer.client")
+    def test_ignores_404_on_delete(self, mock_client):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        not_found = K8sApiException(status=404)
+        mock_apps.delete_namespaced_deployment.side_effect = not_found
+
+        teardown_checker("test-ns")
+        mock_v1.delete_namespaced_service.assert_called_once()

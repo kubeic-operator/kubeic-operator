@@ -1,0 +1,41 @@
+{{- if .Values.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{ toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "kubeic-operator.operatorSelectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      path: /metrics
+---
+# Service for the operator so the ServiceMonitor can discover it
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubeic-operator.operatorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+{{- end }}

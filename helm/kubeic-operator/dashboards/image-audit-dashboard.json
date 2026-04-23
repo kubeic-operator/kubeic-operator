@@ -1,0 +1,244 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Unavailable Images",
+      "description": "Total number of images that cannot be reached in the registry",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "kube_image_total_unavailable",
+          "legendFormat": "Unavailable"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": { "colorMode": "background" }
+    },
+    {
+      "title": "Pre-release Violations",
+      "description": "Total number of pre-release images running beyond max age",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "targets": [
+        {
+          "expr": "kube_image_total_prerelease_violations",
+          "legendFormat": "Violations"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" }
+    },
+    {
+      "title": "Spread Violations",
+      "description": "Total number of image bases exceeding version spread threshold",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "targets": [
+        {
+          "expr": "kube_image_total_spread_violations",
+          "legendFormat": "Violations"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": { "colorMode": "background" }
+    },
+    {
+      "title": "Unavailable Images",
+      "description": "Pods with images that cannot be verified in the registry",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "kube_image_available == 0",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "filterable": true } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Value": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": {
+              "namespace": "Namespace",
+              "pod": "Pod",
+              "container": "Container",
+              "image": "Image"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Pre-release Image Age (days)",
+      "description": "Pre-release images sorted by age in descending order",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "kube_image_prerelease_age_days",
+          "legendFormat": "{{namespace}}/{{pod}} {{image}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "red", "value": 7 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xTickLabelRotation": 0,
+        "groupWidth": 0.7,
+        "barWidth": 0.5
+      }
+    },
+    {
+      "title": "Version Distribution per Image Base",
+      "description": "Number of pods running each version, stacked by tag",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "kube_image_version_pod_count",
+          "legendFormat": "{{image_base}}:{{tag}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "stacking": "normal"
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "groupWidth": 0.7,
+        "barWidth": 0.5
+      }
+    },
+    {
+      "title": "Version Spread Over Time",
+      "description": "Number of distinct versions per image base over time, highlighting when drift started",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "kube_image_version_count",
+          "legendFormat": "{{image_base}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 4 }
+            ]
+          },
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        }
+      }
+    },
+    {
+      "title": "Credential Validity",
+      "description": "Registry credentials that have failed validation",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "kube_image_credential_valid == 0",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "filterable": true } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Value": true, "__name__": true, "job": true, "instance": true },
+            "renameByName": {
+              "namespace": "Namespace",
+              "image": "Registry",
+              "secret_name": "Secret"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["kubernetes", "image-audit", "operator"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "title": "Cluster Image Health",
+  "uid": "image-audit",
+  "version": 1
+}

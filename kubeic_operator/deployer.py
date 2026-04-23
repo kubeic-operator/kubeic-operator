@@ -1,0 +1,290 @@
+import logging
+import os
+
+from kubernetes import client
+from kubernetes.client import ApiException
+
+logger = logging.getLogger("kubeic-operator.deployer")
+
+CHECKER_SERVICE_ACCOUNT = "kubeic-checker"
+CHECKER_ROLE = "kubeic-checker"
+CHECKER_ROLE_BINDING = "kubeic-checker"
+CHECKER_DEPLOYMENT = "kubeic-checker"
+CHECKER_SERVICE = "kubeic-checker-metrics"
+OPERATOR_NAME = "kubeic-operator"
+
+CHECKER_IMAGE = os.environ.get("CHECKER_IMAGE", "kubeic-checker:latest")
+RELEASE_NAME = os.environ.get("RELEASE_NAME", "kubeic-operator")
+CHECKER_VERSION = os.environ.get("CHECKER_VERSION", "latest")
+CHECKER_CPU_REQUEST = os.environ.get("CHECKER_CPU_REQUEST", "50m")
+CHECKER_MEMORY_REQUEST = os.environ.get("CHECKER_MEMORY_REQUEST", "64Mi")
+CHECKER_CPU_LIMIT = os.environ.get("CHECKER_CPU_LIMIT", "200m")
+CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
+
+
+def _selector_labels() -> dict[str, str]:
+    """Stable labels for Deployment.spec.selector and Service.spec.selector.
+
+    Must not change after first creation — Kubernetes rejects selector mutations.
+    """
+    return {
+        "app.kubernetes.io/name": "kubeic-operator",
+        "app.kubernetes.io/component": "checker",
+        "app.kubernetes.io/instance": RELEASE_NAME,
+    }
+
+
+def _common_labels() -> dict[str, str]:
+    """Full label set for resource metadata, extending selector labels with mutable fields."""
+    return {
+        **_selector_labels(),
+        "app.kubernetes.io/version": CHECKER_VERSION,
+        "app.kubernetes.io/managed-by": OPERATOR_NAME,
+    }
+
+
+def _build_service_account(namespace: str) -> client.V1ServiceAccount:
+    return client.V1ServiceAccount(
+        api_version="v1",
+        kind="ServiceAccount",
+        metadata=client.V1ObjectMeta(
+            name=CHECKER_SERVICE_ACCOUNT,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+    )
+
+
+def _build_role(namespace: str) -> client.V1Role:
+    return client.V1Role(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="Role",
+        metadata=client.V1ObjectMeta(
+            name=CHECKER_ROLE,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        rules=[
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["pods"],
+                verbs=["get", "list"],
+            ),
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["secrets"],
+                verbs=["get"],
+            ),
+        ],
+    )
+
+
+def _build_role_binding(namespace: str) -> client.V1RoleBinding:
+    return client.V1RoleBinding(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="RoleBinding",
+        metadata=client.V1ObjectMeta(
+            name=CHECKER_ROLE_BINDING,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        role_ref=client.V1RoleRef(
+            api_group="rbac.authorization.k8s.io",
+            kind="Role",
+            name=CHECKER_ROLE,
+        ),
+        subjects=[
+            client.RbacV1Subject(
+                kind="ServiceAccount",
+                name=CHECKER_SERVICE_ACCOUNT,
+                namespace=namespace,
+            ),
+        ],
+    )
+
+
+def _build_service(namespace: str) -> client.V1Service:
+    return client.V1Service(
+        api_version="v1",
+        kind="Service",
+        metadata=client.V1ObjectMeta(
+            name=CHECKER_SERVICE,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        spec=client.V1ServiceSpec(
+            selector=_selector_labels(),
+            ports=[
+                client.V1ServicePort(
+                    name="metrics",
+                    port=9090,
+                    target_port=9090,
+                    protocol="TCP",
+                ),
+            ],
+        ),
+    )
+
+
+def _build_deployment(
+    namespace: str,
+    checker_image: str = CHECKER_IMAGE,
+    check_interval_minutes: int = 30,
+    credential_source: str = "pullSecret",
+) -> client.V1Deployment:
+    return client.V1Deployment(
+        api_version="apps/v1",
+        kind="Deployment",
+        metadata=client.V1ObjectMeta(
+            name=CHECKER_DEPLOYMENT,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        spec=client.V1DeploymentSpec(
+            replicas=1,
+            selector=client.V1LabelSelector(
+                match_labels=_selector_labels(),
+            ),
+            template=client.V1PodTemplateSpec(
+                metadata=client.V1ObjectMeta(
+                    labels=_common_labels(),
+                    annotations={
+                        "prometheus.io/scrape": "true",
+                        "prometheus.io/port": "9090",
+                    },
+                ),
+                spec=client.V1PodSpec(
+                    service_account_name=CHECKER_SERVICE_ACCOUNT,
+                    security_context=client.V1PodSecurityContext(
+                        run_as_non_root=True,
+                        seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+                    ),
+                    containers=[
+                        client.V1Container(
+                            name="checker",
+                            image=checker_image,
+                            env=[
+                                client.V1EnvVar(name="NAMESPACE", value=namespace),
+                                client.V1EnvVar(name="CHECK_INTERVAL_MINUTES", value=str(check_interval_minutes)),
+                                client.V1EnvVar(name="CREDENTIAL_SOURCE", value=credential_source),
+                            ],
+                            ports=[
+                                client.V1ContainerPort(container_port=9090, name="metrics"),
+                            ],
+                            resources=client.V1ResourceRequirements(
+                                requests={
+                                    "cpu": CHECKER_CPU_REQUEST,
+                                    "memory": CHECKER_MEMORY_REQUEST,
+                                },
+                                limits={
+                                    "cpu": CHECKER_CPU_LIMIT,
+                                    "memory": CHECKER_MEMORY_LIMIT,
+                                },
+                            ),
+                            security_context=client.V1SecurityContext(
+                                run_as_non_root=True,
+                                read_only_root_filesystem=True,
+                                allow_privilege_escalation=False,
+                                capabilities=client.V1Capabilities(drop=["ALL"]),
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+        ),
+    )
+
+
+def deploy_checker(
+    namespace: str,
+    checker_image: str = CHECKER_IMAGE,
+    check_interval_minutes: int = 30,
+    credential_source: str = "pullSecret",
+) -> None:
+    """Create SA, Role, RoleBinding, Service, and Deployment for the checker in a namespace."""
+    v1 = client.CoreV1Api()
+    rbac_v1 = client.RbacAuthorizationV1Api()
+    apps_v1 = client.AppsV1Api()
+
+    sa = _build_service_account(namespace)
+    role = _build_role(namespace)
+    rb = _build_role_binding(namespace)
+    svc = _build_service(namespace)
+    deploy = _build_deployment(namespace, checker_image, check_interval_minutes, credential_source)
+
+    try:
+        v1.read_namespaced_service_account(CHECKER_SERVICE_ACCOUNT, namespace)
+        v1.patch_namespaced_service_account(CHECKER_SERVICE_ACCOUNT, namespace, sa)
+        logger.info("Updated ServiceAccount in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            v1.create_namespaced_service_account(namespace, sa)
+            logger.info("Created ServiceAccount in %s", namespace)
+        else:
+            raise
+
+    try:
+        rbac_v1.read_namespaced_role(CHECKER_ROLE, namespace)
+        rbac_v1.patch_namespaced_role(CHECKER_ROLE, namespace, role)
+        logger.info("Updated Role in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            rbac_v1.create_namespaced_role(namespace, role)
+            logger.info("Created Role in %s", namespace)
+        else:
+            raise
+
+    try:
+        rbac_v1.read_namespaced_role_binding(CHECKER_ROLE_BINDING, namespace)
+        rbac_v1.patch_namespaced_role_binding(CHECKER_ROLE_BINDING, namespace, rb)
+        logger.info("Updated RoleBinding in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            rbac_v1.create_namespaced_role_binding(namespace, rb)
+            logger.info("Created RoleBinding in %s", namespace)
+        else:
+            raise
+
+    try:
+        v1.read_namespaced_service(CHECKER_SERVICE, namespace)
+        v1.patch_namespaced_service(CHECKER_SERVICE, namespace, svc)
+        logger.info("Updated metrics Service in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            v1.create_namespaced_service(namespace, svc)
+            logger.info("Created metrics Service in %s", namespace)
+        else:
+            raise
+
+    try:
+        apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, namespace)
+        apps_v1.patch_namespaced_deployment(CHECKER_DEPLOYMENT, namespace, deploy)
+        logger.info("Updated checker Deployment in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            apps_v1.create_namespaced_deployment(namespace, deploy)
+            logger.info("Created checker Deployment in %s", namespace)
+        else:
+            raise
+
+
+def teardown_checker(namespace: str) -> None:
+    """Delete checker Deployment, RoleBinding, Role, and ServiceAccount from a namespace."""
+    v1 = client.CoreV1Api()
+    rbac_v1 = client.RbacAuthorizationV1Api()
+    apps_v1 = client.AppsV1Api()
+
+    for delete_fn in [
+        lambda: apps_v1.delete_namespaced_deployment(CHECKER_DEPLOYMENT, namespace),
+        lambda: v1.delete_namespaced_service(CHECKER_SERVICE, namespace),
+        lambda: rbac_v1.delete_namespaced_role_binding(CHECKER_ROLE_BINDING, namespace),
+        lambda: rbac_v1.delete_namespaced_role(CHECKER_ROLE, namespace),
+        lambda: v1.delete_namespaced_service_account(CHECKER_SERVICE_ACCOUNT, namespace),
+    ]:
+        try:
+            delete_fn()
+        except ApiException as e:
+            if e.status != 404:
+                raise
+
+    logger.info("Tore down checker in %s", namespace)

@@ -1,0 +1,101 @@
+{{- if .Values.crds.install }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: imageauditpolicies.imageaudit.kubeic.io
+  labels:
+    {{- include "kubeic-operator.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  group: imageaudit.kubeic.io
+  scope: Namespaced
+  names:
+    plural: imageauditpolicies
+    singular: imageauditpolicy
+    kind: ImageAuditPolicy
+    shortNames:
+      - iap
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                prerelease:
+                  type: object
+                  properties:
+                    maxAgeDays:
+                      type: integer
+                      minimum: 1
+                      default: 7
+                    patterns:
+                      type: array
+                      items:
+                        type: string
+                      default:
+                        - alpha
+                        - beta
+                        - rc
+                        - dev
+                        - nightly
+                        - snapshot
+                        - canary
+                        - unstable
+                        - latest
+                versionSpread:
+                  type: object
+                  properties:
+                    threshold:
+                      type: integer
+                      minimum: 1
+                      default: 3
+                availability:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    intervalMinutes:
+                      type: integer
+                      minimum: 1
+                      default: 30
+                namespaceSelector:
+                  type: object
+                  properties:
+                    excludeLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      default:
+                        audit: disabled
+                credentialSource:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum:
+                        - pullSecret
+                        - workloadIdentity
+                      default: pullSecret
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Pre-release Max Age
+          type: string
+          jsonPath: .spec.prerelease.maxAgeDays
+        - name: Spread Threshold
+          type: string
+          jsonPath: .spec.versionSpread.threshold
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+{{- end }}

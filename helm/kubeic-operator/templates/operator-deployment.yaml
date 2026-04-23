@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.operator.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kubeic-operator.operatorSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeic-operator.operatorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+    spec:
+      serviceAccountName: {{ include "kubeic-operator.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: {{ include "kubeic-operator.operatorImage" . }}
+          imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          env:
+            - name: OPERATOR_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: CHECKER_IMAGE
+              value: {{ include "kubeic-operator.checkerImage" . | quote }}
+            - name: RELEASE_NAME
+              value: {{ .Release.Name | quote }}
+            - name: CHECKER_VERSION
+              value: {{ .Values.checker.image.tag | quote }}
+            - name: CHECKER_CPU_REQUEST
+              value: {{ .Values.checker.resources.requests.cpu | quote }}
+            - name: CHECKER_MEMORY_REQUEST
+              value: {{ .Values.checker.resources.requests.memory | quote }}
+            - name: CHECKER_CPU_LIMIT
+              value: {{ .Values.checker.resources.limits.cpu | quote }}
+            - name: CHECKER_MEMORY_LIMIT
+              value: {{ .Values.checker.resources.limits.memory | quote }}
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.operator.resources | nindent 12 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

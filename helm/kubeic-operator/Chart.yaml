@@ -1,0 +1,14 @@
+apiVersion: v2
+name: kubeic-operator
+description: Kubernetes operator that audits running pod images for availability, pre-release age, and version spread
+type: application
+version: 0.1.0-alpha.32
+appVersion: "0.1.0-alpha.32"
+maintainers:
+  - name: kubeic-operator
+keywords:
+  - kubernetes
+  - operator
+  - image-audit
+  - monitoring
+  - prometheus

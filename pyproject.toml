@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kubeic-operator"
+version = "0.1.0-alpha.32"
+description = "Kubernetes Image Audit Operator - detects silent image failure risks"
+requires-python = ">=3.11"
+dependencies = [
+    "kopf>=1.37",
+    "kubernetes>=29.0",
+    "prometheus_client>=0.20",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+include = ["kubeic_operator*", "kubeic_checker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

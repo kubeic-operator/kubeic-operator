@@ -1,0 +1,95 @@
+# Operator settings
+operator:
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/operator
+    tag: "0.1.0-alpha.32"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 256Mi
+    limits:
+      cpu: 200m
+      memory: 512Mi
+
+# Checker settings (applied to per-namespace checker deployments)
+checker:
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/checker
+    tag: "0.1.0-alpha.32"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# Default audit policy (applied as cluster-defaults ImageAuditPolicy)
+policy:
+  prerelease:
+    maxAgeDays: 7
+    patterns:
+      - alpha
+      - beta
+      - rc
+      - dev
+      - nightly
+      - snapshot
+      - canary
+      - unstable
+      - latest
+  versionSpread:
+    threshold: 3
+  availability:
+    enabled: true
+    intervalMinutes: 30
+  namespaceSelector:
+    excludeLabels:
+      audit: disabled
+  credentialSource:
+    type: pullSecret
+
+# Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  # Additional labels for ServiceMonitor discovery, e.g:
+  # release: prometheus
+
+# Grafana dashboard (deployed as ConfigMap for sidecar discovery)
+grafanaDashboard:
+  enabled: true
+  labels: {}
+  # For kube-prometheus-stack, the sidecar uses grafana_dashboard: "1" (included by default).
+  # If the sidecar is configured to filter by release, add:
+  # release: kube-prometheus-stack
+  annotations: {}
+  # Annotations for folder targeting, e.g:
+  # grafana_folder: "Kubernetes"
+
+# Prometheus alert rules (deployed as PrometheusRule)
+prometheusRule:
+  enabled: true
+  labels: {}
+  # For kube-prometheus-stack, Prometheus selects rules by release label.
+  # Set this to the release name of your kube-prometheus-stack install:
+  # release: kube-prometheus-stack
+
+# Network policy
+networkPolicy:
+  enabled: true
+
+# CRD installation
+crds:
+  install: true
+
+# Image pull secrets (for private registries)
+imagePullSecrets: []
+
+# Additional labels applied to all resources
+additionalLabels: {}
