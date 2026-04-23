@@ -3,7 +3,7 @@ import logging
 import kopf
 from kubernetes import client
 
-from kubeic_operator.deployer import deploy_checker
+from kubeic_operator.deployer import deploy_checker, get_secret_names_for_namespace
 
 logger = logging.getLogger("kubeic-operator.handlers.policy")
 
@@ -37,6 +37,7 @@ def _reconcile_all_namespaces() -> None:
             namespace=name,
             check_interval_minutes=interval,
             credential_source=cred_source,
+            secret_names=get_secret_names_for_namespace(name),
         )
         logger.info("Reconciled checker in %s after policy change", name)
 

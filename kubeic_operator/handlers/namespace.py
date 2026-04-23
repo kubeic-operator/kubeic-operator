@@ -4,17 +4,9 @@ import os
 import kopf
 from kubernetes import client
 
-from kubeic_operator.deployer import deploy_checker, teardown_checker
+from kubeic_operator.deployer import deploy_checker, teardown_checker, EXCLUDED_NAMESPACES, get_secret_names_for_namespace
 
 logger = logging.getLogger("kubeic-operator.handlers.namespace")
-
-# Namespaces to never audit
-EXCLUDED_NAMESPACES = {
-    "kube-system",
-    "kube-public",
-    "kube-node-lease",
-    "kubeic-operator",
-}
 
 
 def _get_effective_policy(namespace: str) -> dict:
@@ -95,6 +87,7 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
         namespace=namespace,
         check_interval_minutes=interval,
         credential_source=cred_source,
+        secret_names=get_secret_names_for_namespace(namespace),
     )
 
 

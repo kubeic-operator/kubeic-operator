@@ -81,7 +81,7 @@ def _get_default_policy() -> dict:
 
 
 def _bootstrap_checkers() -> None:
-    from kubeic_operator.deployer import deploy_checker
+    from kubeic_operator.deployer import deploy_checker, get_secret_names_for_namespace
     from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
 
     v1 = client.CoreV1Api()
@@ -101,7 +101,8 @@ def _bootstrap_checkers() -> None:
         cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
         try:
             deploy_checker(namespace=name,
-                           check_interval_minutes=interval, credential_source=cred_source)
+                           check_interval_minutes=interval, credential_source=cred_source,
+                           secret_names=get_secret_names_for_namespace(name))
             logger.info("Bootstrapped checker in namespace %s", name)
         except Exception as exc:
             logger.error("Failed to bootstrap checker in %s: %s", name, exc)
