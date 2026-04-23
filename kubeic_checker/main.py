@@ -111,8 +111,9 @@ def _check_credential_validity(
 
         # Test against the actual images from pods that reference this secret
         pod_images = secret_images.get(secret_name, set())
+        cred_host = cred.registry.split("/")[0]
         matching = [
-            img for img in pod_images if registry_from_image(img) == cred.registry
+            img for img in pod_images if registry_from_image(img) == cred_host
         ]
 
         if CREDENTIAL_TEST_IMAGE:
