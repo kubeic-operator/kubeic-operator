@@ -154,7 +154,7 @@
       "targets": [
         {
           "expr": "kube_image_version_pod_count",
-          "legendFormat": "{{image_base}}:{{tag}}"
+          "legendFormat": "{{registry}}/{{image_name}}:{{tag}}"
         }
       ],
       "fieldConfig": {
@@ -178,7 +178,7 @@
       "targets": [
         {
           "expr": "kube_image_version_count",
-          "legendFormat": "{{image_base}}"
+          "legendFormat": "{{registry}}/{{image_name}}"
         }
       ],
       "fieldConfig": {

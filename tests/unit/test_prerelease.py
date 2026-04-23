@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 
 from kubeic_operator.checks.prerelease import (
     _parse_image,
+    _parse_registry,
     is_prerelease_tag,
     check_prerelease,
     filter_violations,
@@ -9,35 +10,84 @@ from kubeic_operator.checks.prerelease import (
 )
 
 
+class TestParseRegistry:
+    def test_bare_image(self):
+        registry, name = _parse_registry("nginx")
+        assert registry == "docker.io"
+        assert name == "library/nginx"
+
+    def test_docker_hub_user_repo(self):
+        registry, name = _parse_registry("myuser/myapp")
+        assert registry == "docker.io"
+        assert name == "myuser/myapp"
+
+    def test_explicit_registry(self):
+        registry, name = _parse_registry("quay.io/myorg/myapp")
+        assert registry == "quay.io"
+        assert name == "myorg/myapp"
+
+    def test_registry_with_port(self):
+        registry, name = _parse_registry("myregistry.corp.com:5000/app")
+        assert registry == "myregistry.corp.com:5000"
+        assert name == "app"
+
+    def test_deep_path(self):
+        registry, name = _parse_registry("registry.k8s.io/ingress-nginx/controller")
+        assert registry == "registry.k8s.io"
+        assert name == "ingress-nginx/controller"
+
+
 class TestParseImage:
     def test_simple_image_with_tag(self):
-        base, tag = _parse_image("nginx:1.25")
-        assert base == "nginx"
+        registry, name, tag = _parse_image("nginx:1.25")
+        assert registry == "docker.io"
+        assert name == "library/nginx"
         assert tag == "1.25"
 
     def test_registry_with_port_and_tag(self):
-        base, tag = _parse_image("myregistry.corp.com:5000/app:v2")
-        assert base == "myregistry.corp.com:5000/app"
+        registry, name, tag = _parse_image("myregistry.corp.com:5000/app:v2")
+        assert registry == "myregistry.corp.com:5000"
+        assert name == "app"
         assert tag == "v2"
 
     def test_image_without_tag(self):
-        base, tag = _parse_image("nginx")
-        assert base == "nginx"
+        registry, name, tag = _parse_image("nginx")
+        assert registry == "docker.io"
+        assert name == "library/nginx"
         assert tag == "latest"
 
-    def test_image_with_digest(self):
-        base, tag = _parse_image("nginx@sha256:abc123")
-        assert base == "nginx"
+    def test_image_with_digest_only(self):
+        registry, name, tag = _parse_image("nginx@sha256:abc123")
+        assert registry == "docker.io"
+        assert name == "library/nginx"
         assert tag == "sha256:abc123"
 
+    def test_image_with_tag_and_digest(self):
+        registry, name, tag = _parse_image(
+            "registry.k8s.io/ingress-nginx/controller:v1.15.1@sha256:594ceea76b01c592858f803f9ff4d2cb"
+        )
+        assert registry == "registry.k8s.io"
+        assert name == "ingress-nginx/controller"
+        assert tag == "v1.15.1"
+
+    def test_image_with_tag_and_digest_registry_port(self):
+        registry, name, tag = _parse_image(
+            "myregistry.corp.com:5000/app:v2.0@sha256:abc123"
+        )
+        assert registry == "myregistry.corp.com:5000"
+        assert name == "app"
+        assert tag == "v2.0"
+
     def test_full_registry_path(self):
-        base, tag = _parse_image("quay.io/myorg/myapp:1.0.0-rc1")
-        assert base == "quay.io/myorg/myapp"
+        registry, name, tag = _parse_image("quay.io/myorg/myapp:1.0.0-rc1")
+        assert registry == "quay.io"
+        assert name == "myorg/myapp"
         assert tag == "1.0.0-rc1"
 
     def test_registry_port_no_tag(self):
-        base, tag = _parse_image("localhost:5000/myimage")
-        assert base == "localhost:5000/myimage"
+        registry, name, tag = _parse_image("localhost:5000/myimage")
+        assert registry == "localhost:5000"
+        assert name == "myimage"
         assert tag == "latest"
 
 
@@ -133,6 +183,8 @@ class TestCheckPrerelease:
         assert len(findings) == 1
         assert findings[0].is_prerelease is True
         assert findings[0].tag == "1.0.0-alpha"
+        assert findings[0].registry == "docker.io"
+        assert findings[0].image_name == "library/myapp"
 
     def test_ignores_stable_images(self):
         pods = [
@@ -176,8 +228,8 @@ class TestFilterViolations:
     def test_filters_by_max_age(self):
         from kubeic_operator.checks.prerelease import PrereleaseFinding
         findings = [
-            PrereleaseFinding("img:alpha", "img", "alpha", "ns", "pod", "c", True, 10),
-            PrereleaseFinding("img2:beta", "img2", "beta", "ns", "pod2", "c", True, 3),
+            PrereleaseFinding("img:alpha", "docker.io", "library/img", "alpha", "ns", "pod", "c", True, 10),
+            PrereleaseFinding("img2:beta", "docker.io", "library/img2", "beta", "ns", "pod2", "c", True, 3),
         ]
         violations = filter_violations(findings, max_age_days=7)
         assert len(violations) == 1

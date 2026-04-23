@@ -37,8 +37,8 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: "Version spread on {{`{{ $labels.image_base }}`}}"
-            description: "Image base {{`{{ $labels.image_base }}`}} has too many distinct versions running simultaneously."
+            summary: "Version spread on {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}}"
+            description: "Image {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}} has too many distinct versions running simultaneously."
 
         - alert: RegistryCredentialInvalid
           expr: kube_image_credential_valid == 0

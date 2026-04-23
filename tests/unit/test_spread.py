@@ -26,7 +26,8 @@ class TestAggregateVersionSpread:
         ]
         findings = aggregate_version_spread(pods)
         assert len(findings) == 1
-        assert findings[0].image_base == "nginx"
+        assert findings[0].registry == "docker.io"
+        assert findings[0].image_name == "library/nginx"
         assert findings[0].version_count == 4
         assert findings[0].violates_threshold is True
 
@@ -71,8 +72,8 @@ class TestAggregateVersionSpread:
         ]
         findings = aggregate_version_spread(pods)
         assert len(findings) == 2
-        bases = {f.image_base for f in findings}
-        assert bases == {"nginx", "redis"}
+        names = {f.image_name for f in findings}
+        assert names == {"library/nginx", "library/redis"}
 
     def test_includes_init_containers(self):
         pods = [{
@@ -93,4 +94,5 @@ class TestAggregateVersionSpread:
         ]
         findings = aggregate_version_spread(pods)
         assert len(findings) == 1
-        assert findings[0].image_base == "myregistry.corp.com:5000/app"
+        assert findings[0].registry == "myregistry.corp.com:5000"
+        assert findings[0].image_name == "app"
