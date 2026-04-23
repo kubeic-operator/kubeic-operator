@@ -1,24 +1,27 @@
 {
   "annotations": { "list": [] },
+  "description": "Cluster-wide image health audit — availability, pre-release age, version spread, and credential validity",
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
   "links": [],
   "panels": [
     {
       "title": "Unavailable Images",
-      "description": "Total number of images that cannot be reached in the registry",
+      "description": "Total images that cannot be reached in their registry. Cluster-wide — not affected by namespace filter.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_total_unavailable",
-          "legendFormat": "Unavailable"
+          "expr": "sum(kube_image_total_unavailable{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"})",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -29,70 +32,98 @@
           "mappings": []
         }
       },
-      "options": { "colorMode": "background" }
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "wideLayout": true
+      }
     },
     {
       "title": "Pre-release Violations",
-      "description": "Total number of pre-release images running beyond max age",
+      "description": "Pre-release images (alpha, beta, rc, dev, latest, etc.) running beyond the max age threshold. Cluster-wide total.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_total_prerelease_violations",
-          "legendFormat": "Violations"
+          "expr": "max(kube_image_total_prerelease_violations{job=\"kubic-operator-kubeic-operator\"})",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
               { "color": "orange", "value": 1 }
             ]
-          }
+          },
+          "mappings": []
         }
       },
-      "options": { "colorMode": "background" }
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "wideLayout": true
+      }
     },
     {
       "title": "Spread Violations",
-      "description": "Total number of image bases exceeding version spread threshold",
+      "description": "Image bases running more distinct versions than the configured threshold. Cluster-wide total.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_total_spread_violations",
-          "legendFormat": "Violations"
+          "expr": "max(kube_image_total_spread_violations{job=\"kubic-operator-kubeic-operator\"})",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
               { "color": "orange", "value": 1 }
             ]
-          }
+          },
+          "mappings": []
         }
       },
-      "options": { "colorMode": "background" }
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "wideLayout": true
+      }
     },
     {
       "title": "Unavailable Images",
-      "description": "Pods with images that cannot be verified in the registry",
+      "description": "Pods with images that failed skopeo inspect — no longer reachable in their registry",
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_available == 0",
+          "expr": "kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"} == 0",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "refId": "A"
         }
       ],
       "fieldConfig": {
-        "defaults": { "custom": { "filterable": true } },
+        "defaults": {
+          "custom": { "filterable": true }
+        },
         "overrides": [
           {
             "matcher": { "id": "byName", "options": "Value" },
@@ -100,16 +131,29 @@
           }
         ]
       },
-      "options": { "showHeader": true },
+      "options": { "showHeader": true, "footer": { "show": false } },
       "transformations": [
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Value": true, "__name__": true, "job": true, "instance": true },
+            "excludeByName": {
+              "Value": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "endpoint": true,
+              "cluster": true,
+              "container": true,
+              "pod": true,
+              "namespace": true,
+              "service": true,
+              "registry": true,
+              "image_name": true
+            },
             "renameByName": {
-              "namespace": "Namespace",
-              "pod": "Pod",
-              "container": "Container",
+              "exported_namespace": "Namespace",
+              "exported_pod": "Pod",
+              "exported_container": "Container",
               "image": "Image"
             }
           }
@@ -118,23 +162,65 @@
     },
     {
       "title": "Pre-release Image Age (days)",
-      "description": "Pre-release images sorted by age in descending order",
+      "description": "Pre-release images running for more than 0 days. Green < 3d, Yellow >= 3d, Red >= 7d.",
       "type": "barchart",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_prerelease_age_days",
-          "legendFormat": "{{namespace}}/{{pod}} {{image}}"
+          "expr": "kube_image_prerelease_age_days{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"} > 0",
+          "format": "instant",
+          "instant": true,
+          "legendFormat": "{{exported_namespace}}/{{image_name}}:{{tag}}",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "decimals": 1,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               { "color": "green", "value": null },
               { "color": "yellow", "value": 3 },
               { "color": "red", "value": 7 }
+            ]
+          },
+          "unit": "d"
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "xTickLabelRotation": 0,
+        "groupWidth": 0.7,
+        "barWidth": 0.5,
+        "stacking": "none",
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "title": "Distinct Versions per Image",
+      "description": "Number of different tags running for each image base. Red threshold at the configured spread limit.",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "kube_image_version_count{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"}",
+          "format": "instant",
+          "instant": true,
+          "legendFormat": "{{image_name}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 4 }
             ]
           }
         }
@@ -143,46 +229,27 @@
         "orientation": "horizontal",
         "xTickLabelRotation": 0,
         "groupWidth": 0.7,
-        "barWidth": 0.5
-      }
-    },
-    {
-      "title": "Version Distribution per Image Base",
-      "description": "Number of pods running each version, stacked by tag",
-      "type": "barchart",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
-      "targets": [
-        {
-          "expr": "kube_image_version_pod_count",
-          "legendFormat": "{{registry}}/{{image_name}}:{{tag}}"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "stacking": "normal"
-          }
-        }
-      },
-      "options": {
-        "orientation": "horizontal",
-        "groupWidth": 0.7,
-        "barWidth": 0.5
+        "barWidth": 0.5,
+        "stacking": "none",
+        "tooltip": { "mode": "single" }
       }
     },
     {
       "title": "Version Spread Over Time",
-      "description": "Number of distinct versions per image base over time, highlighting when drift started",
+      "description": "Number of distinct versions per image base over time — highlights when drift started",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_version_count",
-          "legendFormat": "{{registry}}/{{image_name}}"
+          "expr": "kube_image_version_count{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"}",
+          "legendFormat": "{{image_name}}",
+          "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
+          "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -192,41 +259,81 @@
           },
           "custom": {
             "lineWidth": 2,
-            "fillOpacity": 10
+            "fillOpacity": 10,
+            "spanNulls": true
           }
         }
       }
     },
     {
-      "title": "Credential Validity",
-      "description": "Registry credentials that have failed validation",
+      "title": "Registry Credential Status",
+      "description": "All registry credentials tested by the checkers. Shows both valid and invalid so you always have visibility.",
       "type": "table",
       "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_credential_valid == 0",
+          "expr": "kube_image_credential_valid{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}",
           "format": "table",
-          "instant": true
+          "instant": true,
+          "refId": "A"
         }
       ],
       "fieldConfig": {
-        "defaults": { "custom": { "filterable": true } },
+        "defaults": {
+          "custom": { "filterable": true }
+        },
         "overrides": [
           {
             "matcher": { "id": "byName", "options": "Value" },
-            "properties": [{ "id": "custom.hidden", "value": true }]
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Status"
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "Invalid", "color": "red" },
+                      "1": { "text": "Valid", "color": "green" }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background", "mode": "basic" }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
           }
         ]
       },
-      "options": { "showHeader": true },
+      "options": { "showHeader": true, "footer": { "show": false } },
       "transformations": [
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Value": true, "__name__": true, "job": true, "instance": true },
+            "excludeByName": {
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "endpoint": true,
+              "cluster": true,
+              "container": true,
+              "pod": true,
+              "namespace": true,
+              "service": true
+            },
             "renameByName": {
-              "namespace": "Namespace",
-              "image": "Registry",
+              "exported_namespace": "Namespace",
+              "registry": "Registry",
               "secret_name": "Secret"
             }
           }
@@ -234,10 +341,84 @@
       ]
     }
   ],
+  "refresh": "30s",
   "schemaVersion": 39,
   "tags": ["kubernetes", "image-audit", "operator"],
-  "templating": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Datasource",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "queryValue": "",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": { "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\"}, exported_namespace)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Namespace",
+        "multi": true,
+        "name": "namespace",
+        "options": [],
+        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\"}, exported_namespace)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"}, registry)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Registry",
+        "multi": true,
+        "name": "registry",
+        "options": [],
+        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"}, registry)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Image",
+        "multi": true,
+        "name": "image_name",
+        "options": [],
+        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
   "time": { "from": "now-6h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["10s", "30s", "1m", "5m", "15m"] },
   "title": "Cluster Image Health",
   "uid": "image-audit",
   "version": 1

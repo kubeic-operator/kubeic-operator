@@ -70,7 +70,7 @@ grafanaDashboard:
   # release: kube-prometheus-stack
   annotations: {}
   # Annotations for folder targeting, e.g:
-  # grafana_folder: "Kubernetes"
+  # grafana-folder: "Kubernetes"
 
 # Prometheus alert rules (deployed as PrometheusRule)
 prometheusRule:
