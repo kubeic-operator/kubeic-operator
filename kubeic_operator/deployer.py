@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 
@@ -20,6 +21,33 @@ CHECKER_CPU_REQUEST = os.environ.get("CHECKER_CPU_REQUEST", "50m")
 CHECKER_MEMORY_REQUEST = os.environ.get("CHECKER_MEMORY_REQUEST", "64Mi")
 CHECKER_CPU_LIMIT = os.environ.get("CHECKER_CPU_LIMIT", "200m")
 CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
+
+
+def _parse_excluded_namespaces() -> set[str]:
+    raw = os.environ.get("EXCLUDED_NAMESPACES", "")
+    if not raw:
+        return set()
+    return {ns.strip() for ns in raw.split(",") if ns.strip()}
+
+
+def _parse_no_secret_namespaces() -> set[str]:
+    raw = os.environ.get("NO_SECRET_NAMESPACES", "")
+    if not raw:
+        return set()
+    return {ns.strip() for ns in raw.split(",") if ns.strip()}
+
+
+def _parse_namespace_secrets() -> dict[str, list[str]]:
+    raw = os.environ.get("NAMESPACE_SECRETS", "{}")
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+EXCLUDED_NAMESPACES = _parse_excluded_namespaces()
+NO_SECRET_NAMESPACES = _parse_no_secret_namespaces()
+NAMESPACE_SECRETS = _parse_namespace_secrets()
 
 
 def _selector_labels() -> dict[str, str]:
@@ -55,7 +83,29 @@ def _build_service_account(namespace: str) -> client.V1ServiceAccount:
     )
 
 
-def _build_role(namespace: str) -> client.V1Role:
+def _build_role(namespace: str, secret_names: list[str] | None = None) -> client.V1Role:
+    rules = [
+        client.V1PolicyRule(
+            api_groups=[""],
+            resources=["pods"],
+            verbs=["get", "list"],
+        ),
+    ]
+
+    if secret_names is None:
+        rules.append(client.V1PolicyRule(
+            api_groups=[""],
+            resources=["secrets"],
+            verbs=["get"],
+        ))
+    elif secret_names:
+        rules.append(client.V1PolicyRule(
+            api_groups=[""],
+            resources=["secrets"],
+            verbs=["get"],
+            resource_names=secret_names,
+        ))
+
     return client.V1Role(
         api_version="rbac.authorization.k8s.io/v1",
         kind="Role",
@@ -64,18 +114,7 @@ def _build_role(namespace: str) -> client.V1Role:
             namespace=namespace,
             labels=_common_labels(),
         ),
-        rules=[
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["pods"],
-                verbs=["get", "list"],
-            ),
-            client.V1PolicyRule(
-                api_groups=[""],
-                resources=["secrets"],
-                verbs=["get"],
-            ),
-        ],
+        rules=rules,
     )
 
 
@@ -201,11 +240,27 @@ def _build_deployment(
     )
 
 
+def get_secret_names_for_namespace(namespace: str) -> list[str] | None:
+    """Resolve the secret names config for a namespace.
+
+    Returns:
+        None  – full secret access (current default behavior)
+        []    – no secret access at all
+        [str] – restricted to specific secret names
+    """
+    if namespace in NAMESPACE_SECRETS:
+        return list(NAMESPACE_SECRETS[namespace])
+    if namespace in NO_SECRET_NAMESPACES:
+        return []
+    return None
+
+
 def deploy_checker(
     namespace: str,
     checker_image: str = CHECKER_IMAGE,
     check_interval_minutes: int = 30,
     credential_source: str = "pullSecret",
+    secret_names: list[str] | None = None,
 ) -> None:
     """Create SA, Role, RoleBinding, Service, and Deployment for the checker in a namespace."""
     v1 = client.CoreV1Api()
@@ -213,7 +268,7 @@ def deploy_checker(
     apps_v1 = client.AppsV1Api()
 
     sa = _build_service_account(namespace)
-    role = _build_role(namespace)
+    role = _build_role(namespace, secret_names=secret_names)
     rb = _build_role_binding(namespace)
     svc = _build_service(namespace)
     deploy = _build_deployment(namespace, checker_image, check_interval_minutes, credential_source)
