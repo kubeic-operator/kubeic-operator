@@ -4,14 +4,13 @@ from kubeic_operator.handlers.namespace import (
     _should_audit,
     on_namespace_create,
     on_namespace_delete,
-    EXCLUDED_NAMESPACES,
 )
 
 
 class TestShouldAudit:
-    def test_excludes_system_namespaces(self):
-        for ns in EXCLUDED_NAMESPACES:
-            assert _should_audit(ns, {}, {}) is False
+    @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-public"})
+    def test_excludes_configured_namespaces(self):
+        assert _should_audit("kube-public", {}, {}) is False
 
     def test_allows_normal_namespace(self):
         assert _should_audit("my-app", {}, {}) is True
@@ -32,9 +31,10 @@ class TestShouldAudit:
 
 
 class TestOnNamespaceCreate:
+    @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=None)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
     @patch("kubeic_operator.handlers.namespace.deploy_checker")
-    def test_deploys_checker_for_normal_namespace(self, mock_deploy, mock_policy):
+    def test_deploys_checker_for_normal_namespace(self, mock_deploy, mock_policy, mock_secrets):
         mock_policy.return_value = {}
         meta = MagicMock()
         meta.name = "my-app"
@@ -43,6 +43,7 @@ class TestOnNamespaceCreate:
         on_namespace_create(body={}, meta=meta)
         mock_deploy.assert_called_once()
 
+    @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-system"})
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
     @patch("kubeic_operator.handlers.namespace.deploy_checker")
     def test_skips_excluded_namespace(self, mock_deploy, mock_policy):
@@ -54,9 +55,10 @@ class TestOnNamespaceCreate:
         on_namespace_create(body={}, meta=meta)
         mock_deploy.assert_not_called()
 
+    @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=None)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
     @patch("kubeic_operator.handlers.namespace.deploy_checker")
-    def test_passes_policy_settings_to_deployer(self, mock_deploy, mock_policy):
+    def test_passes_policy_settings_to_deployer(self, mock_deploy, mock_policy, mock_secrets):
         mock_policy.return_value = {
             "availability": {"intervalMinutes": 60},
             "credentialSource": {"type": "workloadIdentity"},
@@ -70,6 +72,7 @@ class TestOnNamespaceCreate:
             namespace="my-app",
             check_interval_minutes=60,
             credential_source="workloadIdentity",
+            secret_names=None,
         )
 
 

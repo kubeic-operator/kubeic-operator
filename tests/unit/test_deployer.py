@@ -12,6 +12,7 @@ from kubeic_operator.deployer import (
     _common_labels,
     deploy_checker,
     teardown_checker,
+    get_secret_names_for_namespace,
     CHECKER_SERVICE_ACCOUNT,
     CHECKER_ROLE,
     CHECKER_ROLE_BINDING,
@@ -52,17 +53,44 @@ class TestBuildServiceAccount:
 
 
 class TestBuildRole:
-    def test_has_pod_and_secret_rules(self):
+    def test_default_has_pod_and_unrestricted_secret_rules(self):
         role = _build_role("my-ns")
         assert len(role.rules) == 2
         resources = {r.resources[0] for r in role.rules}
         assert "pods" in resources
         assert "secrets" in resources
-
-    def test_secrets_only_get(self):
-        role = _build_role("my-ns")
         secret_rule = next(r for r in role.rules if "secrets" in r.resources)
         assert secret_rule.verbs == ["get"]
+        assert secret_rule.resource_names is None
+
+    def test_empty_secret_names_omits_secret_rule(self):
+        role = _build_role("my-ns", secret_names=[])
+        assert len(role.rules) == 1
+        assert role.rules[0].resources == ["pods"]
+
+    def test_explicit_secret_names_restricts_access(self):
+        role = _build_role("my-ns", secret_names=["my-pull-secret", "other-secret"])
+        assert len(role.rules) == 2
+        secret_rule = next(r for r in role.rules if "secrets" in r.resources)
+        assert secret_rule.verbs == ["get"]
+        assert secret_rule.resource_names == ["my-pull-secret", "other-secret"]
+
+
+class TestGetSecretNamesForNamespace:
+    @patch("kubeic_operator.deployer.NAMESPACE_SECRETS", {"prod": ["secret-a"]})
+    @patch("kubeic_operator.deployer.NO_SECRET_NAMESPACES", {"kube-system"})
+    def test_returns_explicit_names_when_configured(self):
+        assert get_secret_names_for_namespace("prod") == ["secret-a"]
+
+    @patch("kubeic_operator.deployer.NAMESPACE_SECRETS", {})
+    @patch("kubeic_operator.deployer.NO_SECRET_NAMESPACES", {"kube-system"})
+    def test_returns_empty_for_no_secret_namespace(self):
+        assert get_secret_names_for_namespace("kube-system") == []
+
+    @patch("kubeic_operator.deployer.NAMESPACE_SECRETS", {})
+    @patch("kubeic_operator.deployer.NO_SECRET_NAMESPACES", set())
+    def test_returns_none_for_unconfigured_namespace(self):
+        assert get_secret_names_for_namespace("my-app") is None
 
 
 class TestBuildRoleBinding:
