@@ -65,7 +65,8 @@ def check_availability(
 
         for container in list(containers) + list(init_containers):
             image = container["image"]
-            available, error = _run_skopeo_inspect(image, auth_file)
+            inspect_image = image.split("@")[0] if "@" in image else image
+            available, error = _run_skopeo_inspect(inspect_image, auth_file)
             registry, image_name, _ = _parse_image(image)
 
             results.append(AvailabilityResult(
