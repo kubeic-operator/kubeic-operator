@@ -184,6 +184,15 @@ def _build_deployment(
                                 allow_privilege_escalation=False,
                                 capabilities=client.V1Capabilities(drop=["ALL"]),
                             ),
+                            volume_mounts=[
+                                client.V1VolumeMount(name="tmp", mount_path="/tmp"),
+                            ],
+                        ),
+                    ],
+                    volumes=[
+                        client.V1Volume(
+                            name="tmp",
+                            empty_dir=client.V1EmptyDirVolumeSource(),
                         ),
                     ],
                 ),
