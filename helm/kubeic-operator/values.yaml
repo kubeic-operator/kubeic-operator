@@ -12,6 +12,8 @@ operator:
     limits:
       cpu: 200m
       memory: 512Mi
+  podLabels: {}
+  podAnnotations: {}
 
 # Checker settings (applied to per-namespace checker deployments)
 checker:
@@ -26,6 +28,8 @@ checker:
     limits:
       cpu: 200m
       memory: 128Mi
+  podLabels: {}
+  podAnnotations: {}
 
   # Namespaces excluded from auditing entirely (no checker deployed)
   excludedNamespaces:

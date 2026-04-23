@@ -23,6 +23,18 @@ CHECKER_CPU_LIMIT = os.environ.get("CHECKER_CPU_LIMIT", "200m")
 CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
 
 
+def _parse_json_env(key: str, default: str = "{}") -> dict:
+    raw = os.environ.get(key, default)
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
+CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
+
+
 def _parse_excluded_namespaces() -> set[str]:
     raw = os.environ.get("EXCLUDED_NAMESPACES", "")
     if not raw:
@@ -68,6 +80,7 @@ def _common_labels() -> dict[str, str]:
         **_selector_labels(),
         "app.kubernetes.io/version": CHECKER_VERSION,
         "app.kubernetes.io/managed-by": OPERATOR_NAME,
+        **CHECKER_POD_LABELS,
     }
 
 
@@ -187,7 +200,7 @@ def _build_deployment(
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
                     labels=_common_labels(),
-                    annotations={},
+                    annotations=dict(CHECKER_POD_ANNOTATIONS),
                 ),
                 spec=client.V1PodSpec(
                     service_account_name=CHECKER_SERVICE_ACCOUNT,
@@ -318,7 +331,15 @@ def deploy_checker(
             raise
 
     try:
-        apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, namespace)
+        existing = apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, namespace)
+        existing_annotations = existing.spec.template.metadata.annotations or {}
+        desired_annotations = deploy.spec.template.metadata.annotations or {}
+        # Merge desired annotations with nulls for any stale keys so they get removed
+        final_annotations = dict(desired_annotations)
+        for key in existing_annotations:
+            if key not in final_annotations:
+                final_annotations[key] = None
+        deploy.spec.template.metadata.annotations = final_annotations
         apps_v1.patch_namespaced_deployment(CHECKER_DEPLOYMENT, namespace, deploy)
         logger.info("Updated checker Deployment in %s", namespace)
     except ApiException as e:

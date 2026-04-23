@@ -62,6 +62,12 @@ kube_image_total_unavailable = Gauge(
     ["namespace"],
 )
 
+kube_image_digest_match = Gauge(
+    "kube_image_digest_match",
+    "Whether the registry digest matches the pinned digest (1=match, 0=mismatch, absent=no digest pinned)",
+    ["image", "registry", "image_name", "namespace", "pod", "container"],
+)
+
 
 def update_prerelease_metrics(findings: list, violation_count: int = 0) -> None:
     """Update all pre-release Prometheus gauges from findings.
@@ -128,6 +134,7 @@ def update_availability_metrics(results: list, namespace: str = "") -> None:
         namespace: The namespace being checked (for the total label).
     """
     kube_image_available.clear()
+    kube_image_digest_match.clear()
 
     unavailable_count = 0
     for r in results:
@@ -138,5 +145,11 @@ def update_availability_metrics(results: list, namespace: str = "") -> None:
         ).set(value)
         if not r.available:
             unavailable_count += 1
+
+        if r.digest_match is not None:
+            kube_image_digest_match.labels(
+                image=r.image, registry=r.registry, image_name=r.image_name,
+                namespace=r.namespace, pod=r.pod, container=r.container,
+            ).set(1 if r.digest_match else 0)
 
     kube_image_total_unavailable.labels(namespace=namespace).set(unavailable_count)

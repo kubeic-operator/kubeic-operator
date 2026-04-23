@@ -15,10 +15,19 @@ class AvailabilityResult:
     container: str
     available: bool
     error: str | None = None
+    digest_match: bool | None = None  # None when image has no pinned digest
+    registry_digest: str | None = None
+    pinned_digest: str | None = None
 
 
-def _run_skopeo_inspect(image: str, auth_file: str | None = None) -> tuple[bool, str | None]:
-    """Run skopeo inspect against an image. Returns (success, error_message)."""
+def _run_skopeo_inspect(
+    image: str, auth_file: str | None = None,
+) -> tuple[bool, str | None, dict | None]:
+    """Run skopeo inspect against an image.
+
+    Returns (success, error_message, parsed_json).
+    parsed_json contains the full skopeo inspect output including the Digest field.
+    """
     cmd = ["skopeo", "inspect", "--retry-times", "2", f"docker://{image}"]
 
     if auth_file:
@@ -32,14 +41,18 @@ def _run_skopeo_inspect(image: str, auth_file: str | None = None) -> tuple[bool,
             timeout=30,
         )
         if result.returncode == 0:
-            return True, None
-        return False, result.stderr.strip() or f"skopeo exited with code {result.returncode}"
+            try:
+                inspect_data = json.loads(result.stdout)
+            except (json.JSONDecodeError, ValueError):
+                inspect_data = None
+            return True, None, inspect_data
+        return False, result.stderr.strip() or f"skopeo exited with code {result.returncode}", None
     except subprocess.TimeoutExpired:
-        return False, "skopeo inspect timed out after 30s"
+        return False, "skopeo inspect timed out after 30s", None
     except FileNotFoundError:
-        return False, "skopeo binary not found"
+        return False, "skopeo binary not found", None
     except Exception as exc:
-        return False, str(exc)
+        return False, str(exc), None
 
 
 def check_availability(
@@ -65,9 +78,21 @@ def check_availability(
 
         for container in list(containers) + list(init_containers):
             image = container["image"]
-            inspect_image = image.split("@")[0] if "@" in image else image
-            available, error = _run_skopeo_inspect(inspect_image, auth_file)
+            pinned_digest: str | None = None
+            if "@" in image:
+                inspect_image, pinned_digest = image.split("@", 1)
+            else:
+                inspect_image = image
+
+            available, error, inspect_data = _run_skopeo_inspect(inspect_image, auth_file)
             registry, image_name, _ = _parse_image(image)
+
+            digest_match: bool | None = None
+            registry_digest: str | None = None
+            if available and inspect_data and pinned_digest:
+                registry_digest = inspect_data.get("Digest")
+                if registry_digest:
+                    digest_match = registry_digest == pinned_digest
 
             results.append(AvailabilityResult(
                 image=image,
@@ -78,6 +103,9 @@ def check_availability(
                 container=container["name"],
                 available=available,
                 error=error,
+                digest_match=digest_match,
+                registry_digest=registry_digest,
+                pinned_digest=pinned_digest,
             ))
 
     return results

@@ -60,12 +60,33 @@ def _build_auth_file(creds: list[ResolvedCredential]) -> str | None:
     return path
 
 
-def _check_credential_validity(creds: list[ResolvedCredential], namespace: str) -> None:
-    """Test each resolved credential against its registry and emit a validity metric."""
+def _check_credential_validity(
+    creds: list[ResolvedCredential], namespace: str, pods: list[dict],
+) -> None:
+    """Test each credential against the actual images from pods that reference its secret."""
     from kubeic_checker.availability import _run_skopeo_inspect
+    from kubeic_checker.credentials import registry_from_image
 
     kube_image_credential_valid.clear()
     seen: set[str] = set()
+
+    # Build secret_name -> set of images used by pods that reference that secret
+    secret_images: dict[str, set[str]] = {}
+    for pod in pods:
+        pull_secrets = [
+            ref.get("name", "")
+            for ref in pod.get("spec", {}).get("imagePullSecrets", [])
+        ]
+        containers = list(pod.get("spec", {}).get("containers", [])) + list(
+            pod.get("spec", {}).get("initContainers", [])
+        )
+        images = {
+            c["image"].split("@")[0] if "@" in c["image"] else c["image"]
+            for c in containers
+        }
+        for secret_name in pull_secrets:
+            if secret_name:
+                secret_images.setdefault(secret_name, set()).update(images)
 
     for cred in creds:
         key = f"{namespace}/{cred.registry}/{cred.source}"
@@ -86,16 +107,25 @@ def _check_credential_validity(creds: list[ResolvedCredential], namespace: str) 
         auth_path = os.path.join(tempfile.gettempdir(), f"cred-check-{hash(key)}.json")
         write_auth_config(auth_data, auth_path)
 
-        if CREDENTIAL_TEST_IMAGE:
-            test_image = CREDENTIAL_TEST_IMAGE
-        elif "/" in cred.registry and ("." in cred.registry.split("/")[0] or ":" in cred.registry.split("/")[0]):
-            test_image = f"{cred.registry}/alpine:latest"
-        else:
-            test_image = f"{cred.registry}/library/alpine:latest"
-
-        valid, _ = _run_skopeo_inspect(test_image, auth_file=auth_path)
-
         secret_name = cred.source.split(":")[-1] if ":" in cred.source else cred.source
+
+        # Test against the actual images from pods that reference this secret
+        pod_images = secret_images.get(secret_name, set())
+        matching = [
+            img for img in pod_images if registry_from_image(img) == cred.registry
+        ]
+
+        if CREDENTIAL_TEST_IMAGE:
+            valid, _, _ = _run_skopeo_inspect(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+        elif matching:
+            # Credential is valid if it can inspect at least one of the actual images
+            valid = any(
+                _run_skopeo_inspect(img, auth_file=auth_path)[0]
+                for img in matching
+            )
+        else:
+            valid = False
+
         kube_image_credential_valid.labels(
             registry=cred.registry, namespace=namespace, secret_name=secret_name
         ).set(1 if valid else 0)
@@ -118,15 +148,23 @@ def run_check_loop():
                 auth_file = _build_auth_file(creds)
                 results = check_availability(pods, auth_file=auth_file)
                 update_availability_metrics(results, namespace=NAMESPACE)
-                _check_credential_validity(creds, NAMESPACE)
+                _check_credential_validity(creds, NAMESPACE, pods)
 
                 unavailable = [r for r in results if not r.available]
+                digest_mismatches = [r for r in results if r.digest_match is False]
                 if unavailable:
                     logger.warning(
                         "%d/%d images unavailable in %s",
                         len(unavailable), len(results), NAMESPACE,
                     )
-                else:
+                if digest_mismatches:
+                    for r in digest_mismatches:
+                        logger.warning(
+                            "Digest mismatch for %s in %s/%s: pinned=%s registry=%s",
+                            r.image, NAMESPACE, r.pod,
+                            r.pinned_digest, r.registry_digest,
+                        )
+                if not unavailable and not digest_mismatches:
                     logger.info("All %d images available in %s", len(results), NAMESPACE)
 
         except Exception:

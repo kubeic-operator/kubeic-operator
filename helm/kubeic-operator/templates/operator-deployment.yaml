@@ -14,6 +14,13 @@ spec:
     metadata:
       labels:
         {{- include "kubeic-operator.operatorLabels" . | nindent 8 }}
+        {{- with .Values.operator.podLabels }}
+        {{ toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.operator.podAnnotations }}
+      annotations:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "kubeic-operator.fullname" . }}
       securityContext:
@@ -47,6 +54,10 @@ spec:
               value: {{ .Values.checker.noSecretNamespaces | join "," | quote }}
             - name: NAMESPACE_SECRETS
               value: {{ .Values.checker.namespaceSecrets | toJson | quote }}
+            - name: CHECKER_POD_LABELS
+              value: {{ .Values.checker.podLabels | toJson | quote }}
+            - name: CHECKER_POD_ANNOTATIONS
+              value: {{ .Values.checker.podAnnotations | toJson | quote }}
           ports:
             - name: metrics
               containerPort: 9090
