@@ -148,10 +148,6 @@ def _build_deployment(
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
                     labels=_common_labels(),
-                    annotations={
-                        "prometheus.io/scrape": "true",
-                        "prometheus.io/port": "9090",
-                    },
                 ),
                 spec=client.V1PodSpec(
                     service_account_name=CHECKER_SERVICE_ACCOUNT,

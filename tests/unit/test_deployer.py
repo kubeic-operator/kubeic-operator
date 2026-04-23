@@ -115,11 +115,10 @@ class TestBuildDeployment:
         container = deploy.spec.template.spec.containers[0]
         assert container.ports[0].container_port == 9090
 
-    def test_prometheus_annotations(self):
+    def test_no_prometheus_scrape_annotations(self):
         deploy = _build_deployment("my-ns")
         annotations = deploy.spec.template.metadata.annotations
-        assert annotations["prometheus.io/scrape"] == "true"
-        assert annotations["prometheus.io/port"] == "9090"
+        assert annotations is None or "prometheus.io/scrape" not in (annotations or {})
 
     def test_resource_requests_and_limits_are_set(self):
         deploy = _build_deployment("my-ns")

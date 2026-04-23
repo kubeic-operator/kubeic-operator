@@ -14,9 +14,6 @@ spec:
     metadata:
       labels:
         {{- include "kubeic-operator.operatorLabels" . | nindent 8 }}
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
     spec:
       serviceAccountName: {{ include "kubeic-operator.fullname" . }}
       securityContext:
