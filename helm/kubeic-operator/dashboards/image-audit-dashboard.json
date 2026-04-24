@@ -292,7 +292,6 @@
               "pod": true,
               "namespace": true,
               "service": true,
-              "image_name": true,
               "image": true
             },
             "renameByName": {
