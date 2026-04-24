@@ -206,6 +206,28 @@ class TestIsPrereleaseTag:
     def test_component_prerelease_with_platform(self):
         assert is_prerelease_tag("agent/v2.0.0-rc.1-slim") is True
 
+    # --- Custom stable suffixes ---
+
+    def test_custom_suffix_is_prerelease_by_default(self):
+        # "thick" is not in the default list → prerelease
+        assert is_prerelease_tag("v4.2.1-thick") is True
+
+    def test_custom_suffix_stable_when_configured(self):
+        assert is_prerelease_tag("v4.2.1-thick", stable_suffixes=["alpine", "slim", "thick"]) is False
+
+    def test_custom_suffix_per_namespace_via_check_prerelease(self):
+        pods = [
+            {
+                "metadata": {"name": "pod", "namespace": "kube-system", "creationTimestamp": "2024-01-01T00:00:00Z"},
+                "status": {"startTime": "2024-01-01T00:00:00Z"},
+                "spec": {"containers": [{"name": "main", "image": "multus:v4.2.1-thick"}]},
+            },
+        ]
+        # Without custom suffix → prerelease
+        assert len(check_prerelease(pods)) == 1
+        # With custom suffix → stable
+        assert len(check_prerelease(pods, stable_suffixes=["alpine", "slim", "thick"])) == 0
+
 
 class TestCheckPrerelease:
     def test_finds_prerelease_images(self):

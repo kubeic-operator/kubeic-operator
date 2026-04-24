@@ -135,10 +135,10 @@ def _run_cluster_audit() -> None:
 
     policy = _get_default_policy()
     max_age_days = policy.get("prerelease", {}).get("maxAgeDays", 7)
-    patterns = policy.get("prerelease", {}).get("patterns")
+    stable_suffixes = policy.get("prerelease", {}).get("stableSuffixes")
     spread_threshold = policy.get("versionSpread", {}).get("threshold", 3)
 
-    prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, patterns=patterns)
+    prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, stable_suffixes=stable_suffixes)
     violations = filter_violations(prerelease_findings, max_age_days=max_age_days)
     update_prerelease_metrics(prerelease_findings, violation_count=len(violations))
     if violations:

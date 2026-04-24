@@ -29,20 +29,34 @@ spec:
                       type: integer
                       minimum: 1
                       default: 7
-                    patterns:
+                    stableSuffixes:
                       type: array
                       items:
                         type: string
+                      description: >-
+                        Tag suffixes that indicate a stable platform variant
+                        (e.g. alpine, slim, ubuntu). Tags with only these
+                        suffixes after the version are considered stable.
                       default:
-                        - alpha
-                        - beta
-                        - rc
-                        - dev
-                        - nightly
-                        - snapshot
-                        - canary
-                        - unstable
-                        - latest
+                        - alpine
+                        - slim
+                        - ubuntu
+                        - debian
+                        - bookworm
+                        - bullseye
+                        - buster
+                        - stretch
+                        - jessie
+                        - focal
+                        - jammy
+                        - noble
+                        - bionic
+                        - xenial
+                        - centos
+                        - rhel
+                        - ubi
+                        - windowsservercore
+                        - nanoserver
                 versionSpread:
                   type: object
                   properties:

@@ -1,0 +1,25 @@
+apiVersion: imageaudit.kubeic.io/v1alpha1
+kind: ImageAuditPolicy
+metadata:
+  name: cluster-defaults
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.labels" . | nindent 4 }}
+spec:
+  prerelease:
+    maxAgeDays: {{ .Values.policy.prerelease.maxAgeDays }}
+    {{- with .Values.policy.prerelease.stableSuffixes }}
+    stableSuffixes:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  versionSpread:
+    threshold: {{ .Values.policy.versionSpread.threshold }}
+  availability:
+    enabled: {{ .Values.policy.availability.enabled }}
+    intervalMinutes: {{ .Values.policy.availability.intervalMinutes }}
+  {{- with .Values.policy.namespaceSelector }}
+  namespaceSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  credentialSource:
+    type: {{ .Values.policy.credentialSource.type }}

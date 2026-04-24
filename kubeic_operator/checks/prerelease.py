@@ -2,26 +2,40 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-# Platform/distro variant suffixes that are NOT pre-release identifiers.
-# These are stripped from the end of a semver tag's suffix before deciding
-# if the remaining portion is a pre-release marker.
-_STABLE_PLATFORM_SUFFIXES = [
-    r"alpine[\d.]*",
-    r"slim(?:-[\w]+)?",             # slim, slim-bookworm
-    r"ubuntu[\d.]*",
-    r"debian[\d.]*",
-    r"bookworm|bullseye|buster|stretch|jessie",
-    r"focal|jammy|noble|bionic|xenial",
-    r"centos[\d.]*",
-    r"rhel[\d.]*",
-    r"ubi[\d.]*",
-    r"windowsservercore[\d.]*|nanoserver[\d.]*",
+# Default platform/distro suffixes used when none are provided.
+# These are intentionally minimal — the full default list comes from
+# Helm values via the ImageAuditPolicy CRD.
+_DEFAULT_STABLE_SUFFIXES = [
+    "alpine",
+    "slim",
+    "ubuntu",
+    "debian",
+    "bookworm",
+    "bullseye",
+    "buster",
+    "stretch",
+    "jessie",
+    "focal",
+    "jammy",
+    "noble",
+    "bionic",
+    "xenial",
+    "centos",
+    "rhel",
+    "ubi",
+    "windowsservercore",
+    "nanoserver",
 ]
 
-_PLATFORM_SUFFIX_RE = re.compile(
-    r"(?:[.\-_])?(" + "|".join(_STABLE_PLATFORM_SUFFIXES) + r")$",
-    re.IGNORECASE,
-)
+
+def _build_platform_suffix_re(suffixes: list[str]) -> re.Pattern:
+    """Build a regex that matches any of the given platform suffixes at the end of a string."""
+    escaped = [re.escape(s) for s in suffixes]
+    return re.compile(
+        r"(?:[.\-_]?)(" + "|".join(escaped) + r")[\d.]*$",
+        re.IGNORECASE,
+    )
+
 
 # Matches a version string: optional v prefix, numeric version, optional suffix.
 # Supports component/ prefixes like "server/v1.2.3" or "client/1.0.0-alpha".
@@ -109,41 +123,48 @@ def _parse_image(image_str: str) -> tuple[str, str, str]:
     return registry, image_name, "latest"
 
 
-def is_prerelease_tag(tag: str, patterns: list[str] | None = None) -> bool:
+def is_prerelease_tag(
+    tag: str,
+    patterns: list[str] | None = None,
+    stable_suffixes: list[str] | None = None,
+) -> bool:
     """Check if a tag is pre-release using semver-structural analysis.
 
     1. Digest-pinned tags (sha256:...) are stable — they reference an immutable build.
     2. Strip any component prefix (e.g. "server/" in "server/v1.2.3").
     3. If the version part is numeric (MAJOR.MINOR.PATCH with optional suffix):
-       - Strip known platform suffixes from the end (alpine, slim, etc.)
+       - Strip known platform suffixes from the end
        - If anything remains in the suffix → pre-release
        - If nothing remains or no suffix → stable
     4. If the tag is not numeric at all → pre-release (e.g. "latest", "canary").
 
-    The `patterns` parameter is accepted for API compatibility but is no longer
-    used for matching. Classification is purely structural.
+    Args:
+        tag: The image tag to classify.
+        patterns: Deprecated. Accepted for API compatibility but unused.
+        stable_suffixes: List of suffix strings (without separators or version
+            numbers) that indicate a stable platform variant (e.g. "alpine",
+            "slim", "ubuntu"). If None, uses _DEFAULT_STABLE_SUFFIXES.
     """
     if tag.startswith("sha256:"):
         return False
 
     match = _VERSION_RE.match(tag)
     if not match:
-        # Not a versioned tag at all → pre-release
         return True
 
     _component, _version, suffix = match.groups()
 
     if suffix is None:
-        # Numeric version with no suffix → stable
         return False
 
-    # Strip known platform suffixes from the end, repeatedly
-    # e.g. "alpha.1-slim-bookworm" → strip "bookworm" → strip "slim" → "alpha.1"
+    suffixes = stable_suffixes or _DEFAULT_STABLE_SUFFIXES
+    platform_re = _build_platform_suffix_re(suffixes)
+
     remaining = suffix
     prev = None
     while remaining != prev:
         prev = remaining
-        remaining = _PLATFORM_SUFFIX_RE.sub("", remaining)
+        remaining = platform_re.sub("", remaining)
 
     # If anything remains after stripping platforms → pre-release
     return bool(remaining)
@@ -160,6 +181,7 @@ def check_prerelease(
     pods: list[dict],
     max_age_days: float = 7,
     patterns: list[str] | None = None,
+    stable_suffixes: list[str] | None = None,
 ) -> list[PrereleaseFinding]:
     """Scan pods and return findings for pre-release tagged images.
 
@@ -186,7 +208,7 @@ def check_prerelease(
             for container in container_list:
                 image_str = container["image"]
                 registry, image_name, tag = _parse_image(image_str)
-                is_pre = is_prerelease_tag(tag, patterns)
+                is_pre = is_prerelease_tag(tag, stable_suffixes=stable_suffixes)
 
                 if is_pre:
                     findings.append(PrereleaseFinding(
