@@ -8,7 +8,8 @@ Kubernetes operator that audits running pod images for availability, pre-release
 | Check | Component | Description |
 | --- | --- | --- |
 | Image availability | Per-namespace checker | Verifies images are still reachable in their registry using `skopeo inspect` |
-| Credential validity | Per-namespace checker | Tests that imagePullSecrets can authenticate against their registry |
+| Digest verification | Per-namespace checker | Confirms pinned SHA digests match the registry manifest |
+| Credential validity | Per-namespace checker | Tests that imagePullSecrets can authenticate against their registry using `skopeo list-tags` |
 | Pre-release age | Operator (cluster-wide) | Detects alpha/beta/rc/dev/latest/etc. images running beyond a configurable threshold |
 | Version spread | Operator (cluster-wide) | Alerts when too many distinct versions of the same image base are running simultaneously |
 
@@ -21,8 +22,9 @@ Operator (cluster-scoped)          Per-namespace Checkers
  - watches namespaces               - reads pods in own namespace
  - deploys/tears down checkers      - reads imagePullSecrets (own ns only)
  - pre-release age checks           - skopeo inspect for availability
- - version spread checks            - credential validation
- - exposes /metrics                  - exposes /metrics
+ - version spread checks            - skopeo list-tags for credential validation
+ - exposes /metrics                  - digest verification
+                                    - exposes /metrics
 ```
 
 ## Installation
@@ -43,7 +45,6 @@ The operator is configured via `ImageAuditPolicy` CRDs. A cluster-wide default i
 policy:
   prerelease:
     maxAgeDays: 7
-    patterns: [alpha, beta, rc, dev, nightly, snapshot, canary, unstable, latest]
   versionSpread:
     threshold: 3
   availability:
@@ -53,6 +54,28 @@ policy:
       audit: disabled
   credentialSource:
     type: pullSecret  # or workloadIdentity
+
+# Operator settings
+operator:
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/operator
+    tag: "0.0.1-alpha.8"
+  podLabels: {}
+  podAnnotations: {}
+
+# Checker settings (per-namespace deployments)
+checker:
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/checker
+    tag: "0.0.1-alpha.8"
+  podLabels: {}
+  podAnnotations: {}
+  excludedNamespaces: [kube-public, kube-node-lease]
+  noSecretNamespaces: [kube-system]
+  namespaceSecrets: {}
+  # namespaceSecrets:
+  #   kube-system:
+  #     - my-pull-secret
 ```
 
 Per-namespace overrides:
@@ -81,17 +104,31 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
   --set grafanaDashboard.labels.release=kube-prometheus-stack
 ```
 
+### Additional configuration
+
+| Value | Description | Default |
+| --- | --- | --- |
+| `serviceMonitor.enabled` | Deploy a ServiceMonitor for checker pods | `true` |
+| `serviceMonitor.interval` | Scrape interval | `30s` |
+| `serviceMonitor.labels` | Labels for ServiceMonitor discovery | `{}` |
+| `grafanaDashboard.enabled` | Deploy Grafana dashboard ConfigMap | `true` |
+| `grafanaDashboard.labels` | Labels for Grafana sidecar discovery | `{}` |
+| `prometheusRule.enabled` | Deploy Prometheus alert rules | `true` |
+| `prometheusRule.labels` | Labels for PrometheusRule selection | `{}` |
+| `networkPolicy.enabled` | Deploy network policy for checker pods | `true` |
+| `crds.install` | Install CRDs with the chart | `true` |
+
 ## Prometheus metrics
 
 ### Operator metrics (cluster-wide, port 9090)
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `kube_image_is_prerelease` | Gauge | image, image_base, tag, namespace, pod, container |
-| `kube_image_prerelease_age_days` | Gauge | image, image_base, tag, namespace, pod, container |
-| `kube_image_version_count` | Gauge | image_base |
-| `kube_image_version_pod_count` | Gauge | image_base, tag, namespace |
-| `kube_image_version_spread_violation` | Gauge | image_base |
+| `kube_image_is_prerelease` | Gauge | image, registry, image_name, tag, namespace, pod, container |
+| `kube_image_prerelease_age_days` | Gauge | image, registry, image_name, tag, namespace, pod, container |
+| `kube_image_version_count` | Gauge | registry, image_name |
+| `kube_image_version_pod_count` | Gauge | registry, image_name, tag, namespace |
+| `kube_image_version_spread_violation` | Gauge | registry, image_name |
 | `kube_image_total_prerelease_violations` | Gauge | - |
 | `kube_image_total_spread_violations` | Gauge | - |
 
@@ -99,7 +136,8 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `kube_image_available` | Gauge | image, image_base, namespace, pod, container |
+| `kube_image_available` | Gauge | image, registry, image_name, namespace, pod, container |
+| `kube_image_digest_match` | Gauge | image, registry, image_name, namespace, pod, container |
 | `kube_image_credential_valid` | Gauge | registry, namespace, secret_name |
 | `kube_image_total_unavailable` | Gauge | namespace |
 
