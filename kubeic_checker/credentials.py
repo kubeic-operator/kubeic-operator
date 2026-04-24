@@ -1,6 +1,9 @@
 import base64
 import json
+import logging
 from dataclasses import dataclass
+
+logger = logging.getLogger("image-audit-checker.credentials")
 
 
 @dataclass
@@ -74,7 +77,10 @@ def resolve_all_credentials(
                     auth=creds.get("auth"),
                     source=f"pod:imagePullSecret:{secret_name}",
                 ))
-        except Exception:
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("Failed to decode secret %s in %s: %s", secret_name, namespace, e)
+        except Exception as e:
+            logger.warning("Failed to read secret %s in %s: %s", secret_name, namespace, type(e).__name__)
             continue
 
     return credentials
