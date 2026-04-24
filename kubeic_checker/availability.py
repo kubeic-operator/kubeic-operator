@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -198,5 +199,6 @@ def write_auth_config(secrets: dict[str, dict], path: str) -> None:
             auths[registry] = {"auth": token}
 
     config = {"auths": auths}
-    with open(path, "w") as f:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f)

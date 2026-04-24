@@ -58,7 +58,8 @@ def _build_auth_file(creds: list[ResolvedCredential]) -> str | None:
     if not all_creds:
         return None
 
-    path = os.path.join(tempfile.gettempdir(), "image-audit-auth.json")
+    fd, path = tempfile.mkstemp(suffix=".json", prefix="image-audit-auth-")
+    os.close(fd)
     write_auth_config(all_creds, path)
     return path
 
@@ -113,45 +114,52 @@ def _check_credential_validity(
         else:
             continue
 
-        auth_path = os.path.join(tempfile.gettempdir(), f"cred-check-{hash(key)}.json")
-        write_auth_config(auth_data, auth_path)
+        auth_fd, auth_path = tempfile.mkstemp(suffix=".json", prefix="cred-check-")
+        os.close(auth_fd)
+        try:
+            write_auth_config(auth_data, auth_path)
 
-        secret_name = cred.source.split(":")[-1] if ":" in cred.source else cred.source
+            secret_name = cred.source.split(":")[-1] if ":" in cred.source else cred.source
 
-        # Find a matching image from pods to get the repo path
-        pod_images = secret_images.get(secret_name, set())
-        cred_host = cred.registry.split("/")[0]
-        matching = [
-            img for img in pod_images if registry_from_image(img) == cred_host
-        ]
+            # Find a matching image from pods to get the repo path
+            pod_images = secret_images.get(secret_name, set())
+            cred_host = cred.registry.split("/")[0]
+            matching = [
+                img for img in pod_images if registry_from_image(img) == cred_host
+            ]
 
-        if CREDENTIAL_TEST_IMAGE:
-            # Fallback: use configured test image
-            ok, _, err_class = _run_skopeo_list_tags(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
-            if err_class == "auth_failure":
-                valid = False
-            elif ok:
-                valid = True
+            if CREDENTIAL_TEST_IMAGE:
+                # Fallback: use configured test image
+                ok, _, err_class = _run_skopeo_list_tags(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+                if err_class == "auth_failure":
+                    valid = False
+                elif ok:
+                    valid = True
+                else:
+                    # Can't determine from list-tags, fall back to inspect
+                    _, _, _, inspect_err = _run_skopeo_inspect(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+                    valid = inspect_err != "auth_failure"
+            elif matching:
+                # Use list-tags on the repo to verify credential access
+                ok, _, err_class = _run_skopeo_list_tags(matching[0], auth_file=auth_path)
+                if err_class == "auth_failure":
+                    valid = False
+                elif ok:
+                    valid = True
+                else:
+                    # Network/unknown error from list-tags — fall back to inspect
+                    # to try to determine if it's an auth issue
+                    valid = any(
+                        _run_skopeo_inspect(img, auth_file=auth_path)[3] != "auth_failure"
+                        for img in matching
+                    )
             else:
-                # Can't determine from list-tags, fall back to inspect
-                _, _, _, inspect_err = _run_skopeo_inspect(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
-                valid = inspect_err != "auth_failure"
-        elif matching:
-            # Use list-tags on the repo to verify credential access
-            ok, _, err_class = _run_skopeo_list_tags(matching[0], auth_file=auth_path)
-            if err_class == "auth_failure":
                 valid = False
-            elif ok:
-                valid = True
-            else:
-                # Network/unknown error from list-tags — fall back to inspect
-                # to try to determine if it's an auth issue
-                valid = any(
-                    _run_skopeo_inspect(img, auth_file=auth_path)[3] != "auth_failure"
-                    for img in matching
-                )
-        else:
-            valid = False
+        finally:
+            try:
+                os.unlink(auth_path)
+            except OSError:
+                pass
 
         kube_image_credential_valid.labels(
             registry=cred.registry, namespace=namespace, secret_name=secret_name
@@ -173,7 +181,14 @@ def run_check_loop():
             else:
                 creds = resolve_all_credentials(pods, secrets_client, CREDENTIAL_SOURCE)
                 auth_file = _build_auth_file(creds)
-                results = check_availability(pods, auth_file=auth_file)
+                try:
+                    results = check_availability(pods, auth_file=auth_file)
+                finally:
+                    if auth_file:
+                        try:
+                            os.unlink(auth_file)
+                        except OSError:
+                            pass
                 update_availability_metrics(results, namespace=NAMESPACE)
                 _check_credential_validity(creds, NAMESPACE, pods)
 
@@ -194,8 +209,8 @@ def run_check_loop():
                 if not unavailable and not digest_mismatches:
                     logger.info("All %d images available in %s", len(results), NAMESPACE)
 
-        except Exception:
-            logger.exception("Check cycle failed")
+        except Exception as e:
+            logger.error("Check cycle failed: %s", e)
 
         time.sleep(CHECK_INTERVAL)
 
