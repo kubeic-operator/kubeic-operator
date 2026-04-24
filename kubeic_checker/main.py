@@ -44,7 +44,10 @@ def _build_auth_file(creds: list[ResolvedCredential]) -> str | None:
     """Build a Docker auth config file from resolved credentials."""
     all_creds: dict[str, dict] = {}
     for cred in creds:
-        all_creds[cred.registry] = {
+        # Normalize registry to hostname only — skopeo matches by hostname,
+        # but docker configs from GitLab/GHCR may include paths (e.g. ghcr.io/org).
+        host = cred.registry.split("/")[0]
+        all_creds[host] = {
             k: v for k, v in {
                 "username": cred.username,
                 "password": cred.password,
