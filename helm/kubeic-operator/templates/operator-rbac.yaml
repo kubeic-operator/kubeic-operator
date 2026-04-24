@@ -58,7 +58,7 @@ rules:
     verbs: ["get", "list", "create"]
   - apiGroups: [""]
     resources: ["services"]
-    resourceNames: ["kubeic-checker-metrics"]
+    resourceNames: ["{{ .Values.checker.serviceName }}"]
     verbs: ["update", "patch", "delete"]
   - apiGroups: ["imageaudit.kubeic.io"]
     resources: ["imageauditpolicies"]

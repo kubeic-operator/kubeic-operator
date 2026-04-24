@@ -36,6 +36,8 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: CHECKER_IMAGE
               value: {{ include "kubeic-operator.checkerImage" . | quote }}
+            - name: CHECKER_SERVICE
+              value: {{ .Values.checker.serviceName | quote }}
             - name: RELEASE_NAME
               value: {{ .Release.Name | quote }}
             - name: CHECKER_VERSION

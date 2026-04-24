@@ -11,7 +11,7 @@ CHECKER_SERVICE_ACCOUNT = "kubeic-checker"
 CHECKER_ROLE = "kubeic-checker"
 CHECKER_ROLE_BINDING = "kubeic-checker"
 CHECKER_DEPLOYMENT = "kubeic-checker"
-CHECKER_SERVICE = "kubeic-checker-metrics"
+CHECKER_SERVICE = os.environ.get("CHECKER_SERVICE", "kubeic-checker-metrics")
 OPERATOR_NAME = "kubeic-operator"
 
 CHECKER_IMAGE = os.environ.get("CHECKER_IMAGE", "kubeic-checker:latest")
