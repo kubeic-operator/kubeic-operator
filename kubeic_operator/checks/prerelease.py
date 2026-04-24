@@ -2,35 +2,34 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-DEFAULT_PRERELEASE_PATTERNS = [
-    "alpha",
-    "beta",
-    "rc",
-    "dev",
-    "nightly",
-    "snapshot",
-    "canary",
-    "unstable",
-    "latest",
+# Platform/distro variant suffixes that are NOT pre-release identifiers.
+# These are stripped from the end of a semver tag's suffix before deciding
+# if the remaining portion is a pre-release marker.
+_STABLE_PLATFORM_SUFFIXES = [
+    r"alpine[\d.]*",
+    r"slim(?:-[\w]+)?",             # slim, slim-bookworm
+    r"ubuntu[\d.]*",
+    r"debian[\d.]*",
+    r"bookworm|bullseye|buster|stretch|jessie",
+    r"focal|jammy|noble|bionic|xenial",
+    r"centos[\d.]*",
+    r"rhel[\d.]*",
+    r"ubi[\d.]*",
+    r"windowsservercore[\d.]*|nanoserver[\d.]*",
 ]
 
-# OS/distro variant suffixes that are stripped from the end of a tag before
-# pre-release pattern matching. This prevents stable distribution variants
-# like "1.2.3-alpine" or "1.2.3-ubuntu22.04" from being misclassified.
-# The suffix must be preceded by a separator and appear at the end of the tag.
-_STABLE_OS_SUFFIX_RE = re.compile(
-    r"[.\-_]("
-    r"alpine[\d.]*"
-    r"|slim"
-    r"|ubuntu[\d.]*"
-    r"|debian[\d.]*"
-    r"|bookworm|bullseye|buster|stretch|jessie"
-    r"|focal|jammy|noble|bionic|xenial"
-    r"|centos[\d.]*"
-    r"|rhel[\d.]*"
-    r"|ubi[\d.]*"
-    r"|windowsservercore[\d.]*|nanoserver[\d.]*"
-    r")$",
+_PLATFORM_SUFFIX_RE = re.compile(
+    r"(?:[.\-_])?(" + "|".join(_STABLE_PLATFORM_SUFFIXES) + r")$",
+    re.IGNORECASE,
+)
+
+# Matches a version string: optional v prefix, numeric version, optional suffix.
+# Supports component/ prefixes like "server/v1.2.3" or "client/1.0.0-alpha".
+_VERSION_RE = re.compile(
+    r"^(?:(.+)/)?"           # optional component prefix (e.g. "server/")
+    r"v?"                    # optional v prefix
+    r"(\d+(?:\.\d+)*)"       # numeric version: 1, 1.2, 1.2.3
+    r"(?:-(.+))?$",          # optional suffix after hyphen
     re.IGNORECASE,
 )
 
@@ -111,26 +110,43 @@ def _parse_image(image_str: str) -> tuple[str, str, str]:
 
 
 def is_prerelease_tag(tag: str, patterns: list[str] | None = None) -> bool:
-    """Check if a tag matches any pre-release pattern."""
-    if patterns is None:
-        patterns = DEFAULT_PRERELEASE_PATTERNS
+    """Check if a tag is pre-release using semver-structural analysis.
 
-    # Strip leading 'v' and trailing OS/distro variant suffix before checking.
-    # e.g. "1.2.3-alpine" -> "1.2.3", "1.0.0-rc.alpine" -> "1.0.0-rc"
-    check_tag = _STABLE_OS_SUFFIX_RE.sub("", tag.lstrip("v").lower())
+    1. Digest-pinned tags (sha256:...) are stable — they reference an immutable build.
+    2. Strip any component prefix (e.g. "server/" in "server/v1.2.3").
+    3. If the version part is numeric (MAJOR.MINOR.PATCH with optional suffix):
+       - Strip known platform suffixes from the end (alpine, slim, etc.)
+       - If anything remains in the suffix → pre-release
+       - If nothing remains or no suffix → stable
+    4. If the tag is not numeric at all → pre-release (e.g. "latest", "canary").
 
-    for pattern in patterns:
-        # Match pattern as a word boundary segment in the tag
-        # e.g. "alpha" matches "1.0-alpha", "1.0alpha1", "alpha", but not "alphabet"
-        regex = rf"(?:^|[.\-_+]){re.escape(pattern)}(?:[.\-_+]|$|\d+)"
-        if re.search(regex, check_tag, re.IGNORECASE):
-            return True
+    The `patterns` parameter is accepted for API compatibility but is no longer
+    used for matching. Classification is purely structural.
+    """
+    if tag.startswith("sha256:"):
+        return False
 
-    # Also match if tag IS exactly the pattern
-    if check_tag in [p.lower() for p in patterns]:
+    match = _VERSION_RE.match(tag)
+    if not match:
+        # Not a versioned tag at all → pre-release
         return True
 
-    return False
+    _component, _version, suffix = match.groups()
+
+    if suffix is None:
+        # Numeric version with no suffix → stable
+        return False
+
+    # Strip known platform suffixes from the end, repeatedly
+    # e.g. "alpha.1-slim-bookworm" → strip "bookworm" → strip "slim" → "alpha.1"
+    remaining = suffix
+    prev = None
+    while remaining != prev:
+        prev = remaining
+        remaining = _PLATFORM_SUFFIX_RE.sub("", remaining)
+
+    # If anything remains after stripping platforms → pre-release
+    return bool(remaining)
 
 
 def calculate_age_days(pod_start_time: str) -> float:

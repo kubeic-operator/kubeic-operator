@@ -6,7 +6,6 @@ from kubeic_operator.checks.prerelease import (
     is_prerelease_tag,
     check_prerelease,
     filter_violations,
-    DEFAULT_PRERELEASE_PATTERNS,
 )
 
 
@@ -92,14 +91,53 @@ class TestParseImage:
 
 
 class TestIsPrereleaseTag:
-    @staticmethod
-    def _make_pod(image, name="test-pod", namespace="default", start_offset_days=5):
-        ts = (datetime.now(timezone.utc) - timedelta(days=start_offset_days)).isoformat()
-        return {
-            "metadata": {"name": name, "namespace": namespace, "creationTimestamp": ts},
-            "status": {"startTime": ts, "phase": "Running"},
-            "spec": {"containers": [{"name": "main", "image": image}]},
-        }
+    # --- Stable: numeric version with no suffix ---
+
+    def test_full_semver_stable(self):
+        assert is_prerelease_tag("1.25.3") is False
+
+    def test_v_prefix_stable(self):
+        assert is_prerelease_tag("v1.25.3") is False
+
+    def test_major_minor_only(self):
+        assert is_prerelease_tag("1.25") is False
+
+    def test_major_only(self):
+        assert is_prerelease_tag("1") is False
+
+    def test_v_prefix_major_minor(self):
+        assert is_prerelease_tag("v2") is False
+
+    def test_date_tag_stable(self):
+        assert is_prerelease_tag("20240101") is False
+
+    def test_digest_pinned_stable(self):
+        assert is_prerelease_tag("sha256:abc123def456") is False
+
+    # --- Stable: numeric version with platform suffix only ---
+
+    def test_alpine_suffix(self):
+        assert is_prerelease_tag("1.2.3-alpine") is False
+
+    def test_alpine_versioned_suffix(self):
+        assert is_prerelease_tag("1.2.3-alpine3.18") is False
+
+    def test_ubuntu_suffix(self):
+        assert is_prerelease_tag("1.2.3-ubuntu22.04") is False
+
+    def test_slim_suffix(self):
+        assert is_prerelease_tag("1.2.3-slim") is False
+
+    def test_debian_codename(self):
+        assert is_prerelease_tag("1.2.3-bookworm") is False
+
+    def test_slim_bookworm(self):
+        assert is_prerelease_tag("1.2.3-slim-bookworm") is False
+
+    def test_major_minor_with_platform(self):
+        assert is_prerelease_tag("1.25-alpine") is False
+
+    # --- Pre-release: numeric version with non-platform suffix ---
 
     def test_alpha_tag(self):
         assert is_prerelease_tag("1.0.0-alpha.1") is True
@@ -110,64 +148,63 @@ class TestIsPrereleaseTag:
     def test_rc_tag(self):
         assert is_prerelease_tag("v3.0.0-rc.1") is True
 
-    def test_latest_tag(self):
-        assert is_prerelease_tag("latest") is True
+    def test_custom_suffix(self):
+        assert is_prerelease_tag("1.2.3-custom-build") is True
 
-    def test_dev_tag(self):
-        assert is_prerelease_tag("dev") is True
+    def test_preview_suffix(self):
+        assert is_prerelease_tag("1.0-preview") is True
 
-    def test_nightly_tag(self):
+    def test_prerelease_with_platform_suffix(self):
+        # alpha.1 remains after stripping slim
+        assert is_prerelease_tag("1.0.0-alpha.1-slim") is True
+
+    def test_rc_with_alpine_suffix(self):
+        # rc.1 remains after stripping alpine
+        assert is_prerelease_tag("1.0.0-rc.1-alpine") is True
+
+    def test_nightly_with_date_version(self):
+        # Version is 20240101, suffix is nightly (not a platform)
         assert is_prerelease_tag("20240101-nightly") is True
 
-    def test_stable_semver(self):
-        assert is_prerelease_tag("1.25.3") is False
+    # --- Pre-release: non-numeric tags ---
 
-    def test_stable_with_v_prefix(self):
-        assert is_prerelease_tag("v1.25.3") is False
+    def test_latest(self):
+        assert is_prerelease_tag("latest") is True
 
-    def test_snapshot_tag(self):
-        assert is_prerelease_tag("snapshot-20240101") is True
+    def test_dev(self):
+        assert is_prerelease_tag("dev") is True
 
-    def test_canary_tag(self):
+    def test_canary(self):
         assert is_prerelease_tag("canary") is True
 
-    def test_unstable_tag(self):
+    def test_unstable(self):
         assert is_prerelease_tag("unstable") is True
 
-    def test_custom_patterns(self):
-        assert is_prerelease_tag("1.0-custom", patterns=["custom"]) is True
+    def test_snapshot(self):
+        assert is_prerelease_tag("snapshot-20240101") is True
 
-    def test_empty_custom_patterns(self):
-        assert is_prerelease_tag("alpha", patterns=[]) is False
+    def test_bookword_non_versioned(self):
+        assert is_prerelease_tag("bookworm") is True
 
-    def test_does_not_match_substring(self):
-        assert is_prerelease_tag("alphabet") is False
+    def test_sha_tag(self):
+        assert is_prerelease_tag("sha-abc123") is True
 
-    # OS/distro variant suffixes — must NOT be classified as pre-release
-    def test_alpine_suffix_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-alpine") is False
+    def test_branch_name(self):
+        assert is_prerelease_tag("main") is True
 
-    def test_alpine_versioned_suffix_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-alpine3.18") is False
+    # --- Component prefix ---
 
-    def test_ubuntu_suffix_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-ubuntu22.04") is False
+    def test_component_stable(self):
+        assert is_prerelease_tag("server/v1.2.3") is False
 
-    def test_slim_suffix_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-slim") is False
+    def test_component_with_platform(self):
+        assert is_prerelease_tag("server/v1.2.3-alpine") is False
 
-    def test_debian_codename_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-bookworm") is False
+    def test_component_prerelease(self):
+        assert is_prerelease_tag("client/v1.2.3-alpha") is True
 
-    def test_slim_bookworm_not_prerelease(self):
-        assert is_prerelease_tag("1.2.3-slim-bookworm") is False
-
-    # OS suffix after a real pre-release keyword — must STILL be classified
-    def test_rc_with_alpine_suffix_is_prerelease(self):
-        assert is_prerelease_tag("1.0.0-rc.alpine") is True
-
-    def test_alpha_with_slim_suffix_is_prerelease(self):
-        assert is_prerelease_tag("1.0.0-alpha-slim") is True
+    def test_component_prerelease_with_platform(self):
+        assert is_prerelease_tag("agent/v2.0.0-rc.1-slim") is True
 
 
 class TestCheckPrerelease:
@@ -212,7 +249,8 @@ class TestCheckPrerelease:
         assert len(findings) == 1
         assert findings[0].container == "init"
 
-    def test_custom_patterns(self):
+    def test_suffix_based_detection(self):
+        # 1.0-preview has a non-platform suffix → prerelease
         pods = [
             {
                 "metadata": {"name": "pod-d", "namespace": "default", "creationTimestamp": "2024-01-01T00:00:00Z"},
@@ -220,7 +258,7 @@ class TestCheckPrerelease:
                 "spec": {"containers": [{"name": "main", "image": "myapp:1.0-preview"}]},
             },
         ]
-        findings = check_prerelease(pods, patterns=["preview"])
+        findings = check_prerelease(pods)
         assert len(findings) == 1
 
 
