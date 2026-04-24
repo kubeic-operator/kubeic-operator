@@ -147,7 +147,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0)",
+          "expr": "sum(kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -276,13 +276,12 @@
           }
         ]
       },
-      "options": { "showHeader": true, "footer": { "show": false } },
+      "options": { "showHeader": true, "footer": { "show": false }, "sortBy": [{ "displayName": "Age (days)", "desc": true }] },
       "transformations": [
         {
           "id": "organize",
           "options": {
             "excludeByName": {
-              "Value": true,
               "Time": true,
               "__name__": true,
               "job": true,
@@ -293,7 +292,6 @@
               "pod": true,
               "namespace": true,
               "service": true,
-              "registry": true,
               "image_name": true,
               "image": true
             },
@@ -301,6 +299,7 @@
               "exported_namespace": "Namespace",
               "exported_pod": "Pod",
               "exported_container": "Container",
+              "registry": "Registry",
               "image_name": "Image",
               "tag": "Tag",
               "Value": "Age (days)"
@@ -426,7 +425,7 @@
           }
         ]
       },
-      "options": { "showHeader": true, "footer": { "show": false } },
+      "options": { "showHeader": true, "footer": { "show": false }, "sortBy": [{ "displayName": "Status", "desc": false }] },
       "transformations": [
         {
           "id": "organize",
@@ -454,7 +453,7 @@
     },
     {
       "title": "Digest Pin Status",
-      "description": "Images checked for digest pin drift. Match = running digest matches registry, Mismatch = image has been repushed or replaced.",
+      "description": "Images pinned by digest (image@sha256:...). Shows whether the running pod's digest still matches the current registry digest. Mismatch means the image has been repushed or replaced.",
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -502,19 +501,19 @@
           }
         ]
       },
-      "options": { "showHeader": true, "footer": { "show": false } },
+      "options": { "showHeader": true, "footer": { "show": false }, "sortBy": [{ "displayName": "Digest Status", "desc": false }] },
       "transformations": [
         {
           "id": "organize",
           "options": {
             "excludeByName": {
               "Time": true,
-              "Value": true,
               "__name__": true,
               "job": true,
               "instance": true,
               "endpoint": true,
               "cluster": true,
+              "container": true,
               "namespace": true,
               "service": true,
               "registry": true,
@@ -524,7 +523,8 @@
               "exported_namespace": "Namespace",
               "exported_pod": "Pod",
               "exported_container": "Container",
-              "image": "Image"
+              "image": "Image",
+              "Value": "Digest Status"
             }
           }
         }
