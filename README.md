@@ -29,6 +29,16 @@ Operator (cluster-scoped)          Per-namespace Checkers
 
 ## Installation
 
+### CRD pre-install (required)
+
+The `ImageAuditPolicy` CRD must exist in the cluster before installing or running `helm diff`. It is not managed by the chart by default.
+
+```bash
+kubectl apply -f config/crd/imageauditpolicy.yaml
+```
+
+To have the chart install the CRD automatically, set `crds.install: true`. This works for installs and upgrades but will cause `helm diff` to fail on a bare cluster (the CRD must already exist for Helm to validate the `cluster-defaults` policy instance).
+
 ### Helm
 
 ```bash
@@ -116,7 +126,7 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | `prometheusRule.enabled` | Deploy Prometheus alert rules | `true` |
 | `prometheusRule.labels` | Labels for PrometheusRule selection | `{}` |
 | `networkPolicy.enabled` | Deploy network policy for checker pods | `true` |
-| `crds.install` | Install CRDs with the chart | `true` |
+| `crds.install` | Install CRDs with the chart | `false` |
 
 ## Prometheus metrics
 

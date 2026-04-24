@@ -117,9 +117,9 @@ prometheusRule:
 networkPolicy:
   enabled: true
 
-# CRD installation
+# CRD installation (default off — manage the CRD manually or pre-install before helm diff)
 crds:
-  install: true
+  install: false
 
 # Image pull secrets (for private registries)
 imagePullSecrets: []
