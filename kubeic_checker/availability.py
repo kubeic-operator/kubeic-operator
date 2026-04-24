@@ -21,20 +21,36 @@ class AvailabilityResult:
     pinned_digest: str | None = None
 
 
+def _classify_error(stderr: str | None, returncode: int | None = None) -> str:
+    """Classify a skopeo error into auth_failure, not_found, or network."""
+    msg = (stderr or "").lower()
+    if any(s in msg for s in ("unauthorized", "authentication required", "access denied", "401", "403")):
+        return "auth_failure"
+    if any(s in msg for s in ("not found", "manifest unknown", "unknown blob", "404")):
+        return "not_found"
+    if any(s in msg for s in ("timed out", "timeout", "connection refused", "i/o timeout", "no route to host", "no such host")):
+        return "network"
+    return "unknown"
+
+
 def _run_skopeo_inspect(
     image: str, auth_file: str | None = None, retries: int = 3,
-) -> tuple[bool, str | None, dict | None]:
-    """Run skopeo inspect against an image with exponential backoff retry.
+    backoff_delays: list[float] | None = None,
+) -> tuple[bool, str | None, dict | None, str]:
+    """Run skopeo inspect against an image with retry.
 
-    Returns (success, error_message, parsed_json).
-    parsed_json contains the full skopeo inspect output including the Digest field.
+    Returns (success, error_message, parsed_json, error_class).
     """
+    if backoff_delays is None:
+        backoff_delays = [0, 10, 30]
+
     cmd = ["skopeo", "inspect", "--retry-times", "2", f"docker://{image}"]
 
     if auth_file:
         cmd.extend(["--authfile", auth_file])
 
     last_error: str | None = None
+    last_error_class: str = "unknown"
     for attempt in range(retries):
         try:
             result = subprocess.run(
@@ -48,19 +64,50 @@ def _run_skopeo_inspect(
                     inspect_data = json.loads(result.stdout)
                 except (json.JSONDecodeError, ValueError):
                     inspect_data = None
-                return True, None, inspect_data
+                return True, None, inspect_data, ""
             last_error = result.stderr.strip() or f"skopeo exited with code {result.returncode}"
+            last_error_class = _classify_error(last_error, result.returncode)
+            if last_error_class == "auth_failure":
+                return False, last_error, None, last_error_class
         except subprocess.TimeoutExpired:
             last_error = "skopeo inspect timed out after 30s"
+            last_error_class = "network"
         except FileNotFoundError:
-            return False, "skopeo binary not found", None
+            return False, "skopeo binary not found", None, "unknown"
         except Exception as exc:
             last_error = str(exc)
+            last_error_class = "unknown"
 
-        if attempt < retries - 1:
-            time.sleep(2 ** attempt)
+        if attempt < retries - 1 and attempt < len(backoff_delays):
+            time.sleep(backoff_delays[attempt])
 
-    return False, last_error, None
+    return False, last_error, None, last_error_class
+
+
+def _run_skopeo_list_tags(
+    image: str, auth_file: str | None = None,
+) -> tuple[bool, str | None, str]:
+    """Run skopeo list-tags to test repo-level access.
+
+    Returns (success, error_message, error_class).
+    """
+    repo = image.split("@")[0].split(":")[0]
+    cmd = ["skopeo", "list-tags", f"docker://{repo}"]
+    if auth_file:
+        cmd.extend(["--authfile", auth_file])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0:
+            return True, None, ""
+        error = result.stderr.strip() or f"skopeo list-tags exited with code {result.returncode}"
+        return False, error, _classify_error(error, result.returncode)
+    except subprocess.TimeoutExpired:
+        return False, "skopeo list-tags timed out after 30s", "network"
+    except FileNotFoundError:
+        return False, "skopeo binary not found", "unknown"
+    except Exception as exc:
+        return False, str(exc), "unknown"
 
 
 def check_availability(
@@ -82,7 +129,7 @@ def check_availability(
     results: list[AvailabilityResult] = []
 
     # Inspect each unique image once
-    seen_images: dict[str, tuple[bool, str | None, dict | None]] = {}
+    seen_images: dict[str, tuple[bool, str | None, dict | None, str]] = {}
     for pod in pods:
         containers = pod.get("spec", {}).get("containers", [])
         init_containers = pod.get("spec", {}).get("initContainers", [])
@@ -104,7 +151,7 @@ def check_availability(
             if "@" in image:
                 _, pinned_digest = image.split("@", 1)
 
-            available, error, inspect_data = seen_images[image]
+            available, error, inspect_data, _ = seen_images[image]
             registry, image_name, _ = _parse_image(image)
 
             digest_match: bool | None = None
