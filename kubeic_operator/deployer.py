@@ -25,9 +25,12 @@ CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
 
 def _parse_json_env(key: str, default: str = "{}") -> dict:
     raw = os.environ.get(key, default)
+    if raw == default:
+        return json.loads(default)
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse env %s as JSON, falling back to empty dict", key)
         return {}
 
 
@@ -52,9 +55,22 @@ def _parse_no_secret_namespaces() -> set[str]:
 def _parse_namespace_secrets() -> dict[str, list[str]]:
     raw = os.environ.get("NAMESPACE_SECRETS", "{}")
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse NAMESPACE_SECRETS as JSON, falling back to empty dict")
         return {}
+
+    if not isinstance(parsed, dict):
+        logger.warning("NAMESPACE_SECRETS must be a JSON object, got %s", type(parsed).__name__)
+        return {}
+
+    validated: dict[str, list[str]] = {}
+    for ns, names in parsed.items():
+        if isinstance(names, list) and all(isinstance(n, str) for n in names):
+            validated[ns] = names
+        else:
+            logger.warning("NAMESPACE_SECRETS[%s] must be a list of strings, skipping", ns)
+    return validated
 
 
 EXCLUDED_NAMESPACES = _parse_excluded_namespaces()
