@@ -7,11 +7,11 @@ operator:
   replicas: 1
   resources:
     requests:
-      cpu: 50m
-      memory: 256Mi
+      cpu: 15m
+      memory: 175Mi
     limits:
-      cpu: 200m
-      memory: 512Mi
+      cpu: 80m
+      memory: 256Mi
   podLabels: {}
   podAnnotations: {}
 
@@ -25,10 +25,10 @@ checker:
     pullPolicy: IfNotPresent
   resources:
     requests:
-      cpu: 50m
+      cpu: 15m
       memory: 64Mi
     limits:
-      cpu: 200m
+      cpu: 30m
       memory: 128Mi
   podLabels: {}
   podAnnotations: {}
