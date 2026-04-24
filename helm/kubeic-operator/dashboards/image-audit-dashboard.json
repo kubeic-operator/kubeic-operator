@@ -517,6 +517,7 @@
               "namespace": true,
               "service": true,
               "registry": true,
+              "pod": true,
               "image_name": true
             },
             "renameByName": {
