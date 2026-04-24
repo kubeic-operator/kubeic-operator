@@ -66,8 +66,12 @@ def _build_auth_file(creds: list[ResolvedCredential]) -> str | None:
 def _check_credential_validity(
     creds: list[ResolvedCredential], namespace: str, pods: list[dict],
 ) -> None:
-    """Test each credential against the actual images from pods that reference its secret."""
-    from kubeic_checker.availability import _run_skopeo_inspect
+    """Test each credential using repo-level list-tags to verify auth access.
+
+    Only marks credentials invalid on authentication failures.
+    Missing images or network errors do not affect credential validity.
+    """
+    from kubeic_checker.availability import _run_skopeo_list_tags, _run_skopeo_inspect
     from kubeic_checker.credentials import registry_from_image
 
     kube_image_credential_valid.clear()
@@ -99,11 +103,13 @@ def _check_credential_validity(
 
         auth_data = {}
         if cred.auth:
-            auth_data[cred.registry] = {"auth": cred.auth}
+            host = cred.registry.split("/")[0]
+            auth_data[host] = {"auth": cred.auth}
         elif cred.username and cred.password:
             import base64
             token = base64.b64encode(f"{cred.username}:{cred.password}".encode()).decode()
-            auth_data[cred.registry] = {"auth": token}
+            host = cred.registry.split("/")[0]
+            auth_data[host] = {"auth": token}
         else:
             continue
 
@@ -112,7 +118,7 @@ def _check_credential_validity(
 
         secret_name = cred.source.split(":")[-1] if ":" in cred.source else cred.source
 
-        # Test against the actual images from pods that reference this secret
+        # Find a matching image from pods to get the repo path
         pod_images = secret_images.get(secret_name, set())
         cred_host = cred.registry.split("/")[0]
         matching = [
@@ -120,13 +126,30 @@ def _check_credential_validity(
         ]
 
         if CREDENTIAL_TEST_IMAGE:
-            valid, _, _ = _run_skopeo_inspect(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+            # Fallback: use configured test image
+            ok, _, err_class = _run_skopeo_list_tags(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+            if err_class == "auth_failure":
+                valid = False
+            elif ok:
+                valid = True
+            else:
+                # Can't determine from list-tags, fall back to inspect
+                _, _, _, inspect_err = _run_skopeo_inspect(CREDENTIAL_TEST_IMAGE, auth_file=auth_path)
+                valid = inspect_err != "auth_failure"
         elif matching:
-            # Credential is valid if it can inspect at least one of the actual images
-            valid = any(
-                _run_skopeo_inspect(img, auth_file=auth_path)[0]
-                for img in matching
-            )
+            # Use list-tags on the repo to verify credential access
+            ok, _, err_class = _run_skopeo_list_tags(matching[0], auth_file=auth_path)
+            if err_class == "auth_failure":
+                valid = False
+            elif ok:
+                valid = True
+            else:
+                # Network/unknown error from list-tags — fall back to inspect
+                # to try to determine if it's an auth issue
+                valid = any(
+                    _run_skopeo_inspect(img, auth_file=auth_path)[3] != "auth_failure"
+                    for img in matching
+                )
         else:
             valid = False
 
