@@ -1,6 +1,6 @@
 {
   "annotations": { "list": [] },
-  "description": "Cluster-wide image health audit — availability, pre-release age, version spread, and credential validity",
+  "description": "Cluster-wide image health audit — availability, pre-release age, version spread, credential validity, and digest pinning",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -11,11 +11,44 @@
       "title": "Unavailable Images",
       "description": "Total images that cannot be reached in their registry. Cluster-wide — not affected by namespace filter.",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_total_unavailable{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"})",
+          "expr": "sum(kube_image_total_unavailable{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
+      "title": "Invalid Credentials",
+      "description": "Registry credentials that failed authentication testing. Zero is healthy.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(kube_image_credential_valid{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0)",
           "refId": "A"
         }
       ],
@@ -44,11 +77,11 @@
       "title": "Pre-release Violations",
       "description": "Pre-release images (alpha, beta, rc, dev, latest, etc.) running beyond the max age threshold. Cluster-wide total.",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_prerelease_violations{job=\"kubic-operator-kubeic-operator\"})",
+          "expr": "max(kube_image_total_prerelease_violations{job=\"__KUBEIC_OPERATOR_JOB__\", cluster=~\"$cluster\"})",
           "refId": "A"
         }
       ],
@@ -77,11 +110,11 @@
       "title": "Spread Violations",
       "description": "Image bases running more distinct versions than the configured threshold. Cluster-wide total.",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_spread_violations{job=\"kubic-operator-kubeic-operator\"})",
+          "expr": "max(kube_image_total_spread_violations{job=\"__KUBEIC_OPERATOR_JOB__\", cluster=~\"$cluster\"})",
           "refId": "A"
         }
       ],
@@ -107,6 +140,39 @@
       }
     },
     {
+      "title": "Digest Mismatches",
+      "description": "Images where the running pod's pinned digest no longer matches the registry digest. Zero is healthy.",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "sum(kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto",
+        "wideLayout": true
+      }
+    },
+    {
       "title": "Unavailable Images",
       "description": "Pods with images that failed skopeo inspect — no longer reachable in their registry",
       "type": "table",
@@ -114,7 +180,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"} == 0",
+          "expr": "kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} == 0",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -138,6 +204,7 @@
           "options": {
             "excludeByName": {
               "Value": true,
+              "Time": true,
               "__name__": true,
               "job": true,
               "instance": true,
@@ -161,42 +228,86 @@
       ]
     },
     {
-      "title": "Pre-release Image Age (days)",
-      "description": "Pre-release images running for more than 0 days. Green < 3d, Yellow >= 3d, Red >= 7d.",
-      "type": "barchart",
+      "title": "Pre-release Images",
+      "description": "Pre-release images currently running. Tag shown separately. Age column color: green < 3d, yellow >= 3d, red >= 7d.",
+      "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_prerelease_age_days{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"} > 0",
-          "format": "instant",
+          "expr": "kube_image_prerelease_age_days{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} > 0",
+          "format": "table",
           "instant": true,
-          "legendFormat": "{{exported_namespace}}/{{image_name}}:{{tag}}",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "decimals": 1,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 3 },
-              { "color": "red", "value": 7 }
+          "custom": { "filterable": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Age (days)" },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 3 },
+                    { "color": "red", "value": 7 }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background", "mode": "basic" }
+              },
+              {
+                "id": "unit",
+                "value": "d"
+              }
             ]
-          },
-          "unit": "d"
-        }
+          }
+        ]
       },
-      "options": {
-        "orientation": "horizontal",
-        "xTickLabelRotation": 0,
-        "groupWidth": 0.7,
-        "barWidth": 0.5,
-        "stacking": "none",
-        "tooltip": { "mode": "single" }
-      }
+      "options": { "showHeader": true, "footer": { "show": false } },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Value": true,
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "endpoint": true,
+              "cluster": true,
+              "container": true,
+              "pod": true,
+              "namespace": true,
+              "service": true,
+              "registry": true,
+              "image_name": true,
+              "image": true
+            },
+            "renameByName": {
+              "exported_namespace": "Namespace",
+              "exported_pod": "Pod",
+              "exported_container": "Container",
+              "image_name": "Image",
+              "tag": "Tag",
+              "Value": "Age (days)"
+            }
+          }
+        }
+      ]
     },
     {
       "title": "Distinct Versions per Image",
@@ -206,7 +317,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_version_count{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"}",
+          "expr": "kube_image_version_count{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}",
           "format": "instant",
           "instant": true,
           "legendFormat": "{{image_name}}",
@@ -242,7 +353,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_version_count{job=\"kubic-operator-kubeic-operator\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\"}",
+          "expr": "kube_image_version_count{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}",
           "legendFormat": "{{image_name}}",
           "refId": "A"
         }
@@ -269,11 +380,11 @@
       "title": "Registry Credential Status",
       "description": "All registry credentials tested by the checkers. Shows both valid and invalid so you always have visibility.",
       "type": "table",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "kube_image_credential_valid{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}",
+          "expr": "kube_image_credential_valid{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", cluster=~\"$cluster\"}",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -321,6 +432,7 @@
           "id": "organize",
           "options": {
             "excludeByName": {
+              "Time": true,
               "__name__": true,
               "job": true,
               "instance": true,
@@ -335,6 +447,84 @@
               "exported_namespace": "Namespace",
               "registry": "Registry",
               "secret_name": "Secret"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Digest Pin Status",
+      "description": "Images checked for digest pin drift. Match = running digest matches registry, Mismatch = image has been repushed or replaced.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "targets": [
+        {
+          "expr": "kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}",
+          "format": "table",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "filterable": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": "Digest Status"
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": { "text": "Mismatch", "color": "red" },
+                      "1": { "text": "Match", "color": "green" }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background", "mode": "basic" }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          }
+        ]
+      },
+      "options": { "showHeader": true, "footer": { "show": false } },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "endpoint": true,
+              "cluster": true,
+              "namespace": true,
+              "service": true,
+              "registry": true,
+              "image_name": true
+            },
+            "renameByName": {
+              "exported_namespace": "Namespace",
+              "exported_pod": "Pod",
+              "exported_container": "Container",
+              "image": "Image"
             }
           }
         }
@@ -364,7 +554,25 @@
       {
         "current": { "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\"}, exported_namespace)",
+        "definition": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\"}, cluster)",
+        "hide": 0,
+        "includeAll": true,
+        "allValue": ".*",
+        "label": "Cluster",
+        "multi": true,
+        "name": "cluster",
+        "options": [],
+        "query": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\"}, cluster)",
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": { "text": "All", "value": "$__all" },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\"}, exported_namespace)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -372,7 +580,7 @@
         "multi": true,
         "name": "namespace",
         "options": [],
-        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\"}, exported_namespace)",
+        "query": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\"}, exported_namespace)",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
@@ -382,7 +590,7 @@
       {
         "current": { "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"}, registry)",
+        "definition": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\", exported_namespace=~\"$namespace\"}, registry)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -390,7 +598,7 @@
         "multi": true,
         "name": "registry",
         "options": [],
-        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\"}, registry)",
+        "query": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\", exported_namespace=~\"$namespace\"}, registry)",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,
@@ -400,7 +608,7 @@
       {
         "current": { "text": "All", "value": "$__all" },
         "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "definition": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
+        "definition": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
         "hide": 0,
         "includeAll": true,
         "allValue": ".*",
@@ -408,7 +616,7 @@
         "multi": true,
         "name": "image_name",
         "options": [],
-        "query": "label_values(kube_image_available{job=\"kubeic-checker-metrics\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
+        "query": "label_values(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", cluster=~\"$cluster\", exported_namespace=~\"$namespace\", registry=~\"$registry\"}, image_name)",
         "refresh": 2,
         "regex": "",
         "skipUrlSync": false,

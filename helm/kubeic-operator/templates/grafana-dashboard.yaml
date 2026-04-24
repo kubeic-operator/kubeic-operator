@@ -16,5 +16,10 @@ metadata:
   {{- end }}
 data:
   image-audit-dashboard.json: |-
-    {{- .Files.Get "dashboards/image-audit-dashboard.json" | nindent 4 }}
+    {{- $dashboard := .Files.Get "dashboards/image-audit-dashboard.json" }}
+    {{- $operatorJob := include "kubeic-operator.fullname" . }}
+    {{- $checkerJob := .Values.checker.serviceName }}
+    {{- $dashboard = replace "__KUBEIC_OPERATOR_JOB__" $operatorJob $dashboard }}
+    {{- $dashboard = replace "__KUBEIC_CHECKER_JOB__" $checkerJob $dashboard }}
+    {{- $dashboard | nindent 4 }}
 {{- end }}
