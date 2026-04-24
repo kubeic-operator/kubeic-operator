@@ -93,11 +93,6 @@ spec:
                         - workloadIdentity
                       default: pullSecret
               # Allow empty spec (all defaults apply)
-            status:
-              type: object
-              x-kubernetes-preserve-unknown-fields: true
-      subresources:
-        status: {}
       additionalPrinterColumns:
         - name: Pre-release Max Age
           type: string
