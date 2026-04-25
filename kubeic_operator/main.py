@@ -123,6 +123,7 @@ def _run_cluster_audit() -> None:
                 "name": pod.metadata.name,
                 "namespace": pod.metadata.namespace,
                 "creationTimestamp": pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else "",
+                "annotations": pod.metadata.annotations or {},
             },
             "status": {
                 "startTime": pod.status.start_time.isoformat() if pod.status.start_time else "",
@@ -136,15 +137,16 @@ def _run_cluster_audit() -> None:
     policy = _get_default_policy()
     max_age_days = policy.get("prerelease", {}).get("maxAgeDays", 7)
     stable_suffixes = policy.get("prerelease", {}).get("stableSuffixes")
+    skip_annotation = policy.get("skipAnnotation") or None
     spread_threshold = policy.get("versionSpread", {}).get("threshold", 3)
 
-    prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, stable_suffixes=stable_suffixes)
+    prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, stable_suffixes=stable_suffixes, skip_annotation=skip_annotation)
     violations = filter_violations(prerelease_findings, max_age_days=max_age_days)
     update_prerelease_metrics(prerelease_findings, violation_count=len(violations))
     if violations:
         logger.warning("Found %d pre-release violations (max_age=%dd)", len(violations), max_age_days)
 
-    spread_findings = aggregate_version_spread(pod_list, threshold=spread_threshold)
+    spread_findings = aggregate_version_spread(pod_list, threshold=spread_threshold, skip_annotation=skip_annotation)
     update_spread_metrics(spread_findings)
     spread_violations = [f for f in spread_findings if f.violates_threshold]
     if spread_violations:

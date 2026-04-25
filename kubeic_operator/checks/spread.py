@@ -1,7 +1,7 @@
 from collections import defaultdict
 from dataclasses import dataclass
 
-from kubeic_operator.checks.prerelease import _parse_image
+from kubeic_operator.checks.prerelease import _parse_image, should_skip
 
 
 @dataclass
@@ -19,6 +19,7 @@ class VersionSpreadFinding:
 def aggregate_version_spread(
     pods: list[dict],
     threshold: int = 3,
+    skip_annotation: str | None = None,
 ) -> list[VersionSpreadFinding]:
     """Group running pods by image (registry + image_name) and detect version spread violations.
 
@@ -30,6 +31,9 @@ def aggregate_version_spread(
     )
 
     for pod in pods:
+        if skip_annotation and should_skip(pod, skip_annotation, "spread"):
+            continue
+
         namespace = pod["metadata"]["namespace"]
         containers = pod.get("spec", {}).get("containers", [])
         init_containers = pod.get("spec", {}).get("initContainers", [])

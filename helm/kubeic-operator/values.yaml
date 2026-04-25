@@ -84,6 +84,10 @@ policy:
       audit: disabled
   credentialSource:
     type: pullSecret
+  # Pod annotation key to skip audit checks.
+  # Annotation value can be "true" (skip all) or comma-separated check types:
+  # prerelease, spread, availability, digest, credentials
+  skipAnnotation: "audit.kubeic.io/skip"
 
 # Prometheus ServiceMonitor
 serviceMonitor:

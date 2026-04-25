@@ -9,6 +9,7 @@ from prometheus_client import start_http_server
 from kubeic_checker.availability import check_availability, write_auth_config
 from kubeic_checker.credentials import resolve_all_credentials, ResolvedCredential
 from kubeic_operator.metrics import update_availability_metrics, kube_image_credential_valid
+from kubeic_operator.checks.prerelease import should_skip
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,6 +22,7 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_MINUTES", "30")) * 60
 CREDENTIAL_SOURCE = os.environ.get("CREDENTIAL_SOURCE", "pullSecret")
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9090"))
 CREDENTIAL_TEST_IMAGE = os.environ.get("CREDENTIAL_TEST_IMAGE", "")
+SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
 
 
 def _get_pods(namespace: str) -> list[dict]:
@@ -30,7 +32,7 @@ def _get_pods(namespace: str) -> list[dict]:
     result = []
     for pod in pods.items:
         result.append({
-            "metadata": {"name": pod.metadata.name, "namespace": namespace},
+            "metadata": {"name": pod.metadata.name, "namespace": namespace, "annotations": pod.metadata.annotations or {}},
             "spec": {
                 "containers": [{"name": c.name, "image": c.image} for c in (pod.spec.containers or [])],
                 "initContainers": [{"name": c.name, "image": c.image} for c in (pod.spec.init_containers or [])],
@@ -179,10 +181,19 @@ def run_check_loop():
             if not pods:
                 logger.info("No pods found in %s", NAMESPACE)
             else:
-                creds = resolve_all_credentials(pods, secrets_client, CREDENTIAL_SOURCE)
+                # Filter out pods annotated to skip availability/digest/credentials
+                if SKIP_ANNOTATION:
+                    auditable_pods = [
+                        p for p in pods
+                        if not should_skip(p, SKIP_ANNOTATION, "availability")
+                    ]
+                else:
+                    auditable_pods = pods
+
+                creds = resolve_all_credentials(auditable_pods, secrets_client, CREDENTIAL_SOURCE)
                 auth_file = _build_auth_file(creds)
                 try:
-                    results = check_availability(pods, auth_file=auth_file)
+                    results = check_availability(auditable_pods, auth_file=auth_file)
                 finally:
                     if auth_file:
                         try:
@@ -190,7 +201,7 @@ def run_check_loop():
                         except OSError:
                             pass
                 update_availability_metrics(results, namespace=NAMESPACE)
-                _check_credential_validity(creds, NAMESPACE, pods)
+                _check_credential_validity(creds, NAMESPACE, auditable_pods)
 
                 unavailable = [r for r in results if not r.available]
                 digest_mismatches = [r for r in results if r.digest_match is False]

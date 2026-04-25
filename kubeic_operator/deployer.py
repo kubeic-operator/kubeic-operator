@@ -21,6 +21,7 @@ CHECKER_CPU_REQUEST = os.environ.get("CHECKER_CPU_REQUEST", "50m")
 CHECKER_MEMORY_REQUEST = os.environ.get("CHECKER_MEMORY_REQUEST", "64Mi")
 CHECKER_CPU_LIMIT = os.environ.get("CHECKER_CPU_LIMIT", "200m")
 CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
+SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
 
 
 def _parse_json_env(key: str, default: str = "{}") -> dict:
@@ -232,6 +233,7 @@ def _build_deployment(
                                 client.V1EnvVar(name="NAMESPACE", value=namespace),
                                 client.V1EnvVar(name="CHECK_INTERVAL_MINUTES", value=str(check_interval_minutes)),
                                 client.V1EnvVar(name="CREDENTIAL_SOURCE", value=credential_source),
+                                client.V1EnvVar(name="SKIP_ANNOTATION", value=SKIP_ANNOTATION),
                             ],
                             ports=[
                                 client.V1ContainerPort(container_port=9090, name="metrics"),

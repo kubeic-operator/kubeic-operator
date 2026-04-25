@@ -23,3 +23,6 @@ spec:
   {{- end }}
   credentialSource:
     type: {{ .Values.policy.credentialSource.type }}
+  {{- with .Values.policy.skipAnnotation }}
+  skipAnnotation: {{ . | quote }}
+  {{- end }}

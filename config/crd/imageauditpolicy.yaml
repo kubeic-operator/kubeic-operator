@@ -83,6 +83,14 @@ spec:
                         type: string
                       default:
                         audit: disabled
+                skipAnnotation:
+                  type: string
+                  description: >-
+                    Pod annotation key used to skip audit checks. The annotation
+                    value can be "true" (skip all), or a comma-separated list of
+                    check types: prerelease, spread, availability, digest,
+                    credentials. Example: audit.kubeic.io/skip
+                  default: ""
                 credentialSource:
                   type: object
                   properties:

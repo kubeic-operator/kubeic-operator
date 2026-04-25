@@ -177,11 +177,29 @@ def calculate_age_days(pod_start_time: str) -> float:
     return (now - start).total_seconds() / 86400
 
 
+def should_skip(pod: dict, annotation_key: str, check_type: str) -> bool:
+    """Check if a pod is annotated to skip a specific check type.
+
+    The annotation value can be:
+      "true" or "*"  → skip all checks
+      "prerelease"   → skip only prerelease checks
+      "prerelease,spread" → skip prerelease and spread checks
+    """
+    annotations = pod.get("metadata", {}).get("annotations") or {}
+    value = annotations.get(annotation_key, "").strip().lower()
+    if not value:
+        return False
+    if value in ("true", "*"):
+        return True
+    return check_type in [v.strip().lower() for v in value.split(",")]
+
+
 def check_prerelease(
     pods: list[dict],
     max_age_days: float = 7,
     patterns: list[str] | None = None,
     stable_suffixes: list[str] | None = None,
+    skip_annotation: str | None = None,
 ) -> list[PrereleaseFinding]:
     """Scan pods and return findings for pre-release tagged images.
 
@@ -192,6 +210,9 @@ def check_prerelease(
     findings: list[PrereleaseFinding] = []
 
     for pod in pods:
+        if skip_annotation and should_skip(pod, skip_annotation, "prerelease"):
+            continue
+
         pod_name = pod["metadata"]["name"]
         namespace = pod["metadata"]["namespace"]
         start_time = pod.get("status", {}).get("startTime") or pod["metadata"].get("creationTimestamp", "")
