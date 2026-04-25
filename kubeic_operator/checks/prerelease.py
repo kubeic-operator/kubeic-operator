@@ -37,6 +37,15 @@ def _build_platform_suffix_re(suffixes: list[str]) -> re.Pattern:
     )
 
 
+def _build_platform_prefix_re(suffixes: list[str]) -> re.Pattern:
+    """Build a regex that matches <platform>-v<version> (e.g. alpine-v18.3.1)."""
+    escaped = [re.escape(s) for s in suffixes]
+    return re.compile(
+        r"^(?:(.+)/)?(" + "|".join(escaped) + r")[.\-_]?v?(\d+(?:\.\d+)*)$",
+        re.IGNORECASE,
+    )
+
+
 # Matches a version string: optional v prefix, numeric version, optional suffix.
 # Supports component/ prefixes like "server/v1.2.3" or "client/1.0.0-alpha".
 _VERSION_RE = re.compile(
@@ -136,7 +145,9 @@ def is_prerelease_tag(
        - Strip known platform suffixes from the end
        - If anything remains in the suffix → pre-release
        - If nothing remains or no suffix → stable
-    4. If the tag is not numeric at all → pre-release (e.g. "latest", "canary").
+    4. Tags with a known platform prefix followed by a version are stable
+       (e.g. "alpine-v18.3.1", "ubuntu-22.04").
+    5. If the tag is not numeric at all → pre-release (e.g. "latest", "canary").
 
     Args:
         tag: The image tag to classify.
@@ -150,6 +161,9 @@ def is_prerelease_tag(
 
     match = _VERSION_RE.match(tag)
     if not match:
+        suffixes = stable_suffixes or _DEFAULT_STABLE_SUFFIXES
+        if _build_platform_prefix_re(suffixes).match(tag):
+            return False
         return True
 
     _component, _version, suffix = match.groups()

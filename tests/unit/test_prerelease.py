@@ -192,6 +192,24 @@ class TestIsPrereleaseTag:
     def test_branch_name(self):
         assert is_prerelease_tag("main") is True
 
+    # --- Platform prefix pattern (<platform>-v<version>) ---
+
+    def test_platform_prefix_with_v(self):
+        assert is_prerelease_tag("alpine-v18.3.1") is False
+
+    def test_platform_prefix_without_v(self):
+        assert is_prerelease_tag("alpine-18.3.1") is False
+
+    def test_platform_prefix_ubuntu(self):
+        assert is_prerelease_tag("ubuntu-22.04") is False
+
+    def test_platform_prefix_slim(self):
+        assert is_prerelease_tag("slim-v2.1.0") is False
+
+    def test_platform_prefix_unknown_still_prerelease(self):
+        # "custom" is not a known platform suffix → still prerelease
+        assert is_prerelease_tag("custom-v1.0.0") is True
+
     # --- Component prefix ---
 
     def test_component_stable(self):
