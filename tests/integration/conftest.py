@@ -43,9 +43,10 @@ def test_namespace(kubectl):
     kubectl("delete", "namespace", name, check=False, timeout=30)
 
 
-def get_operator_pod_name(kubectl, namespace=OPERATOR_NS):
+@pytest.fixture(scope="session")
+def operator_pod(kubectl, operator_namespace):
     result = kubectl(
-        "get", "pods", "-n", namespace,
+        "get", "pods", "-n", operator_namespace,
         "-l", OPERATOR_SELECTOR,
         "-o", "jsonpath={.items[0].metadata.name}",
     )
