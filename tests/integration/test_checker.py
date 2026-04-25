@@ -1,13 +1,27 @@
 import time
 
+import pytest
+
 CHECKER_DEPLOYMENT = "kubeic-checker"
 
 
 def _wait_for_checker(kubectl, namespace, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = kubectl(
+            "get", "deployment", CHECKER_DEPLOYMENT,
+            "-n", namespace, check=False, timeout=10,
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(3)
+    else:
+        pytest.fail(f"Checker deployment never appeared in {namespace} after {timeout}s")
+
     kubectl(
         "wait", "--for=condition=available",
         f"deployment/{CHECKER_DEPLOYMENT}",
-        "-n", namespace, f"--timeout={timeout}s",
+        "-n", namespace, "--timeout=60s",
     )
 
 
