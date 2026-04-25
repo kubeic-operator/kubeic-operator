@@ -2,8 +2,8 @@ apiVersion: v2
 name: kubeic-operator
 description: Kubernetes operator that audits running pod images for availability, pre-release age, and version spread
 type: application
-version: 0.1.0-alpha.3
-appVersion: "0.1.0-alpha.3"
+version: 0.1.0-alpha.4
+appVersion: "0.1.0-alpha.4"
 maintainers:
   - name: kubeic-operator
 keywords:
