@@ -9,10 +9,11 @@ OPERATOR_SELECTOR = "app.kubernetes.io/component=operator"
 
 @pytest.fixture(scope="session")
 def kubectl():
-    def _kubectl(*args, check=True, timeout=60):
+    def _kubectl(*args, check=True, timeout=60, input=None):
         result = subprocess.run(
             ["kubectl"] + list(args),
             capture_output=True, text=True, timeout=timeout,
+            input=input,
         )
         if check and result.returncode != 0:
             pytest.fail(f"kubectl {' '.join(args)} failed:\n{result.stderr}")
