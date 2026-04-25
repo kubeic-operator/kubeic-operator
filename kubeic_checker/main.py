@@ -164,7 +164,7 @@ def _check_credential_validity(
                 pass
 
         kube_image_credential_valid.labels(
-            registry=cred.registry, namespace=namespace, secret_name=secret_name
+            registry=cred.registry.split("/")[0], namespace=namespace, secret_name=secret_name
         ).set(1 if valid else 0)
 
 
