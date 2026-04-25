@@ -33,6 +33,6 @@ spec:
     readback = kubectl(
         "get", "imageauditpolicy", "test-policy",
         "-n", test_namespace,
-        "-o", "jsonpath={{.spec.prerelease.maxAgeDays}}",
+        "-o", "jsonpath={.spec.prerelease.maxAgeDays}",
     )
     assert readback.stdout.strip() == "30"
