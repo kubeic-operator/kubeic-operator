@@ -180,6 +180,12 @@ def is_prerelease_tag(
         prev = remaining
         remaining = platform_re.sub("", remaining)
 
+    # Purely numeric remainders are secondary component versions, not
+    # pre-release markers (e.g. "4.0.1" in "4.0.0-4.0.1-ubuntu22.04",
+    # or "0" in "3.5.16-0").
+    if remaining and re.match(r"^\d+(\.\d+)*$", remaining):
+        return False
+
     # If anything remains after stripping platforms → pre-release
     return bool(remaining)
 

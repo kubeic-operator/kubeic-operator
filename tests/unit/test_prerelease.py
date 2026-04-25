@@ -210,6 +210,24 @@ class TestIsPrereleaseTag:
         # "custom" is not a known platform suffix → still prerelease
         assert is_prerelease_tag("custom-v1.0.0") is True
 
+    # --- Numeric remainder after platform stripping ---
+
+    def test_numeric_remainder_secondary_version(self):
+        # 4.0.1 is a component version, not a prerelease marker
+        assert is_prerelease_tag("4.0.0-4.0.1-ubuntu22.04") is False
+
+    def test_numeric_remainder_k8s_patch(self):
+        # "-0" is a Kubernetes patch number
+        assert is_prerelease_tag("3.5.16-0") is False
+
+    def test_numeric_remainder_with_real_prerelease(self):
+        # "alpha" survives stripping → still prerelease
+        assert is_prerelease_tag("1.2.3-alpha-ubuntu") is True
+
+    def test_numeric_remainder_rc_not_numeric(self):
+        # "rc.1" is not a pure numeric version → still prerelease
+        assert is_prerelease_tag("1.2.3-rc.1-slim") is True
+
     # --- Component prefix ---
 
     def test_component_stable(self):
