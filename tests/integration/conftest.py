@@ -40,7 +40,7 @@ def test_namespace(kubectl):
     name = f"test-{int(time.time())}"
     kubectl("create", "namespace", name)
     yield name
-    kubectl("delete", "namespace", name, check=False, timeout=30)
+    kubectl("delete", "namespace", name, "--wait=false", check=False, timeout=10)
 
 
 @pytest.fixture(scope="session")
