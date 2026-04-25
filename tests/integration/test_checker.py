@@ -47,8 +47,13 @@ def test_checker_deployed_on_new_namespace(kubectl, test_namespace):
 
 def test_excluded_namespace_no_checker(kubectl):
     ns = "excluded-test-ns"
-    kubectl("create", "namespace", ns, check=False)
-    kubectl("label", "namespace", ns, "audit=disabled", check=False)
+    kubectl("apply", "-f", "-", input=f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+  labels:
+    audit: disabled
+""")
     time.sleep(15)
 
     result = kubectl(
@@ -57,4 +62,4 @@ def test_excluded_namespace_no_checker(kubectl):
     )
     assert result.returncode != 0, f"Checker should NOT exist in excluded namespace {ns}"
 
-    kubectl("delete", "namespace", ns, check=False, timeout=30)
+    kubectl("delete", "namespace", ns, "--wait=false", check=False, timeout=10)
