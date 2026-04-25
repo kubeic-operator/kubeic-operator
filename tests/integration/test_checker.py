@@ -1,13 +1,27 @@
 import time
 
+import pytest
+
 CHECKER_DEPLOYMENT = "kubeic-checker"
 
 
 def _wait_for_checker(kubectl, namespace, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        result = kubectl(
+            "get", "deployment", CHECKER_DEPLOYMENT,
+            "-n", namespace, check=False, timeout=10,
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(3)
+    else:
+        pytest.fail(f"Checker deployment never appeared in {namespace} after {timeout}s")
+
     kubectl(
         "wait", "--for=condition=available",
         f"deployment/{CHECKER_DEPLOYMENT}",
-        "-n", namespace, f"--timeout={timeout}s",
+        "-n", namespace, "--timeout=60s",
     )
 
 
@@ -33,8 +47,13 @@ def test_checker_deployed_on_new_namespace(kubectl, test_namespace):
 
 def test_excluded_namespace_no_checker(kubectl):
     ns = "excluded-test-ns"
-    kubectl("create", "namespace", ns, check=False)
-    kubectl("label", "namespace", ns, "audit=disabled", check=False)
+    kubectl("apply", "-f", "-", input=f"""apiVersion: v1
+kind: Namespace
+metadata:
+  name: {ns}
+  labels:
+    audit: disabled
+""")
     time.sleep(15)
 
     result = kubectl(
@@ -43,4 +62,4 @@ def test_excluded_namespace_no_checker(kubectl):
     )
     assert result.returncode != 0, f"Checker should NOT exist in excluded namespace {ns}"
 
-    kubectl("delete", "namespace", ns, check=False, timeout=30)
+    kubectl("delete", "namespace", ns, "--wait=false", check=False, timeout=10)

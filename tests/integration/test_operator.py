@@ -1,4 +1,4 @@
-from conftest import get_operator_pod_name, OPERATOR_NS, OPERATOR_SELECTOR
+OPERATOR_SELECTOR = "app.kubernetes.io/component=operator"
 
 
 def test_operator_deployment_available(kubectl, operator_namespace):
@@ -19,13 +19,11 @@ def test_operator_pod_running(kubectl, operator_namespace):
     assert result.stdout.strip() == "Running"
 
 
-def test_operator_logs_show_startup(kubectl, operator_namespace):
-    pod = get_operator_pod_name(kubectl, operator_namespace)
-    logs = kubectl("logs", pod, "-n", operator_namespace)
+def test_operator_logs_show_startup(kubectl, operator_namespace, operator_pod):
+    logs = kubectl("logs", operator_pod, "-n", operator_namespace)
     assert "Prometheus metrics server started on port 9090" in logs.stdout
 
 
-def test_operator_logs_show_bootstrap(kubectl, operator_namespace):
-    pod = get_operator_pod_name(kubectl, operator_namespace)
-    logs = kubectl("logs", pod, "-n", operator_namespace)
+def test_operator_logs_show_bootstrap(kubectl, operator_namespace, operator_pod):
+    logs = kubectl("logs", operator_pod, "-n", operator_namespace)
     assert "Bootstrapped checker in namespace" in logs.stdout

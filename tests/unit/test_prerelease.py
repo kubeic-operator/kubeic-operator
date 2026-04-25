@@ -1,4 +1,3 @@
-from datetime import datetime, timezone, timedelta
 
 from kubeic_operator.checks.prerelease import (
     _parse_image,
