@@ -1,4 +1,4 @@
-from conftest import get_operator_pod_name, OPERATOR_NS, OPERATOR_SELECTOR
+from conftest import get_operator_pod_name, OPERATOR_SELECTOR
 
 
 def test_operator_deployment_available(kubectl, operator_namespace):

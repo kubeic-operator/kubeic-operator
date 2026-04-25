@@ -1,4 +1,4 @@
-from conftest import get_operator_pod_name, OPERATOR_NS
+from conftest import get_operator_pod_name
 
 
 def test_operator_metrics_endpoint(kubectl, operator_namespace):

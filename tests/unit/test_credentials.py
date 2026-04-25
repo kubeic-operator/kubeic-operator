@@ -1,12 +1,11 @@
 import base64
 import json
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 from kubeic_checker.credentials import (
     _decode_docker_secret,
     resolve_all_credentials,
     registry_from_image,
-    ResolvedCredential,
 )
 
 
