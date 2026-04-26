@@ -1,0 +1,138 @@
+# Operator settings
+operator:
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/operator
+    tag: "0.1.0-alpha.9"
+    pullPolicy: IfNotPresent
+  replicas: 1
+  resources:
+    requests:
+      cpu: 15m
+      memory: 175Mi
+    limits:
+      cpu: 80m
+      memory: 256Mi
+  podLabels: {}
+  podAnnotations: {}
+
+# Checker settings (applied to per-namespace checker deployments)
+checker:
+  # Service name for checker metrics — must match across dashboard, RBAC, and operator code
+  serviceName: kubeic-checker-metrics
+  image:
+    repository: ghcr.io/kubeic-operator/kubeic-operator/checker
+    tag: "0.1.0-alpha.9"
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 15m
+      memory: 64Mi
+    limits:
+      cpu: 30m
+      memory: 128Mi
+  podLabels: {}
+  podAnnotations: {}
+
+  # Namespaces excluded from auditing entirely (no checker deployed)
+  excludedNamespaces:
+    - kube-public
+    - kube-node-lease
+
+  # Namespaces where checkers get restricted or no secret RBAC
+  noSecretNamespaces:
+    - kube-system
+
+  # Explicit secret names per namespace (grants get secrets restricted to these names only)
+  namespaceSecrets: {}
+    # kube-system:
+    #   - my-pull-secret
+
+# Default audit policy (applied as cluster-defaults ImageAuditPolicy)
+policy:
+  prerelease:
+    maxAgeDays: 7
+    # Tag suffixes that indicate a stable platform/variant build.
+    # Tags with only these suffixes after the version are considered stable.
+    # Add project-specific suffixes here (e.g. thick, distroless, debug).
+    stableSuffixes:
+      - alpine
+      - slim
+      - ubuntu
+      - debian
+      - bookworm
+      - bullseye
+      - buster
+      - stretch
+      - jessie
+      - focal
+      - jammy
+      - noble
+      - bionic
+      - xenial
+      - centos
+      - rhel
+      - ubi
+      - windowsservercore
+      - nanoserver
+  versionSpread:
+    threshold: 3
+  availability:
+    enabled: true
+    intervalMinutes: 30
+  namespaceSelector:
+    excludeLabels:
+      audit: disabled
+  credentialSource:
+    type: pullSecret
+  # Pod annotation key to skip audit checks.
+  # Annotation value can be "true" (skip all) or comma-separated check types:
+  # prerelease, spread, availability, digest, credentials
+  skipAnnotation: "audit.kubeic.io/skip"
+
+# Prometheus ServiceMonitor
+serviceMonitor:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+  # Additional labels for ServiceMonitor discovery, e.g:
+  # release: prometheus
+  clusterName: ""
+  # Cluster name injected as a "cluster" label on all scraped metrics via relabelings.
+  # e.g: cluster1, prod-west
+
+# Grafana dashboard (deployed as ConfigMap for sidecar discovery)
+grafanaDashboard:
+  enabled: true
+  labels: {}
+  # For kube-prometheus-stack, the sidecar uses grafana_dashboard: "1" (included by default).
+  # If the sidecar is configured to filter by release, add:
+  # release: kube-prometheus-stack
+  annotations: {}
+  # Annotations for folder targeting, e.g:
+  # grafana-folder: "Kubernetes"
+
+# Prometheus alert rules (deployed as PrometheusRule)
+prometheusRule:
+  enabled: true
+  labels: {}
+  # For kube-prometheus-stack, Prometheus selects rules by release label.
+  # Set this to the release name of your kube-prometheus-stack install:
+  # release: kube-prometheus-stack
+
+# Network policy
+networkPolicy:
+  enabled: true
+
+# Reconciliation and audit scan interval (seconds)
+scanIntervalSeconds: 300
+
+# CRD installation (default off — manage the CRD manually or pre-install before helm diff)
+crds:
+  install: false
+
+# Image pull secrets (for private registries)
+imagePullSecrets: []
+
+# Additional labels applied to all resources
+additionalLabels: {}

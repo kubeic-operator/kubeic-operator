@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  push:
+    branches: [main, alpha]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  get-version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release: ${{ steps.release.outputs.would_release }}
+      version: ${{ steps.release.outputs.version }}
+      prerelease: ${{ steps.prerelease-check.outputs.is_prerelease }}
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release \
+            @semantic-release/commit-analyzer \
+            @semantic-release/release-notes-generator \
+            @semantic-release/git \
+            @semantic-release/github \
+            @at-blacknight/semantic-release-ci-output@0.1.0
+
+      - name: Dry-run semantic-release
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: semantic-release --dry-run
+
+      - name: Check if pre-release
+        id: prerelease-check
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-operator:
+    name: Build Operator Image
+    runs-on: ubuntu-latest
+    needs: [get-version, update-python-version]
+    if: needs.get-version.outputs.release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: python-version-file
+          path: artifacts/python-version-file
+
+      - name: Restore versioned pyproject.toml
+        run: cp artifacts/python-version-file/pyproject.toml pyproject.toml
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/operator
+          tags: |
+            type=raw,value=${{ needs.get-version.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.get-version.outputs.prerelease == 'false' }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: kubeic_operator/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  build-checker:
+    name: Build Checker Image
+    runs-on: ubuntu-latest
+    needs: [get-version, update-python-version]
+    if: needs.get-version.outputs.release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: python-version-file
+          path: artifacts/python-version-file
+
+      - name: Restore versioned pyproject.toml
+        run: cp artifacts/python-version-file/pyproject.toml pyproject.toml
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/checker
+          tags: |
+            type=raw,value=${{ needs.get-version.outputs.version }}
+            type=raw,value=latest,enable=${{ needs.get-version.outputs.prerelease == 'false' }}
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: kubeic_checker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  publish-helm:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: get-version
+    if: needs.get-version.outputs.release == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: "v3.20.2"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update versions and package chart
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+        run: |
+          REPO_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          sed -i "s/tag: \".*\"/tag: \"${VERSION}\"/g" helm/kubeic-operator/values.yaml
+          sed -i "s/appVersion: \".*\"/appVersion: \"${VERSION}\"/" helm/kubeic-operator/Chart.yaml
+          sed -i "s/^version: .*/version: ${VERSION}/" helm/kubeic-operator/Chart.yaml
+
+          helm package helm/kubeic-operator \
+            --destination .
+
+          helm push "kubeic-operator-${VERSION}.tgz" \
+            oci://${{ env.REGISTRY }}/${REPO_LOWER}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: helm-chart-files
+          path: |
+            helm/kubeic-operator/Chart.yaml
+            helm/kubeic-operator/values.yaml
+
+  update-python-version:
+    name: Update Python Version
+    runs-on: ubuntu-latest
+    needs: get-version
+    if: needs.get-version.outputs.release == 'true'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Update pyproject.toml version
+        env:
+          VERSION: ${{ needs.get-version.outputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" pyproject.toml
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-version-file
+          path: pyproject.toml
+
+  semantic-release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    needs: [build-operator, build-checker, publish-helm, update-python-version]
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          pattern: "{helm-chart-files,python-version-file}"
+
+      - name: Restore versioned files
+        run: |
+          cp artifacts/helm-chart-files/Chart.yaml helm/kubeic-operator/Chart.yaml
+          cp artifacts/helm-chart-files/values.yaml helm/kubeic-operator/values.yaml
+          cp artifacts/python-version-file/pyproject.toml pyproject.toml
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release \
+            @semantic-release/commit-analyzer \
+            @semantic-release/release-notes-generator \
+            @semantic-release/git \
+            @semantic-release/github \
+            @at-blacknight/semantic-release-ci-output@0.1.0-alpha.2
+
+      - name: Run semantic-release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: semantic-release

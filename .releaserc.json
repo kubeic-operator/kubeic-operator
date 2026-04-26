@@ -1,0 +1,27 @@
+{
+  "branches": [
+    "main",
+    {
+      "name": "alpha",
+      "prerelease": "alpha"
+    }
+  ],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["pyproject.toml", "helm/kubeic-operator/Chart.yaml", "helm/kubeic-operator/values.yaml"],
+        "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ],
+    [
+      "@semantic-release/github",
+      {
+        "assets": []
+      }
+    ],
+    "@at-blacknight/semantic-release-ci-output"
+  ]
+}

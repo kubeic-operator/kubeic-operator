@@ -1,0 +1,138 @@
+{{- if .Values.crds.install }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: imageauditpolicies.imageaudit.kubeic.io
+  labels:
+    {{- include "kubeic-operator.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  group: imageaudit.kubeic.io
+  scope: Namespaced
+  names:
+    plural: imageauditpolicies
+    singular: imageauditpolicy
+    kind: ImageAuditPolicy
+    shortNames:
+      - iap
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                prerelease:
+                  type: object
+                  properties:
+                    maxAgeDays:
+                      type: integer
+                      minimum: 1
+                      default: 7
+                    stableSuffixes:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Tag suffixes that indicate a stable platform variant
+                        (e.g. alpine, slim, ubuntu). Tags with only these
+                        suffixes after the version are considered stable.
+                      default:
+                        - alpine
+                        - slim
+                        - ubuntu
+                        - debian
+                        - bookworm
+                        - bullseye
+                        - buster
+                        - stretch
+                        - jessie
+                        - focal
+                        - jammy
+                        - noble
+                        - bionic
+                        - xenial
+                        - centos
+                        - rhel
+                        - ubi
+                        - windowsservercore
+                        - nanoserver
+                versionSpread:
+                  type: object
+                  properties:
+                    threshold:
+                      type: integer
+                      minimum: 1
+                      default: 3
+                availability:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    intervalMinutes:
+                      type: integer
+                      minimum: 1
+                      default: 30
+                namespaceSelector:
+                  type: object
+                  properties:
+                    excludeLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      default:
+                        audit: disabled
+                skipAnnotation:
+                  type: string
+                  description: >-
+                    Pod annotation key used to skip audit checks. The annotation
+                    value can be "true" (skip all), or a comma-separated list of
+                    check types: prerelease, spread, availability, digest,
+                    credentials. Example: audit.kubeic.io/skip
+                  default: ""
+                credentialSource:
+                  type: object
+                  properties:
+                    type:
+                      type: string
+                      enum:
+                        - pullSecret
+                        - workloadIdentity
+                      default: pullSecret
+            status:
+              type: object
+              properties:
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+                namespaces:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      deployed:
+                        type: boolean
+                      reason:
+                        type: string
+                  description: >-
+                    Per-namespace checker state. Keys are namespace names.
+                    Each value indicates whether a checker is deployed and why.
+      additionalPrinterColumns:
+        - name: Pre-release Max Age
+          type: string
+          jsonPath: .spec.prerelease.maxAgeDays
+        - name: Spread Threshold
+          type: string
+          jsonPath: .spec.versionSpread.threshold
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+{{- end }}

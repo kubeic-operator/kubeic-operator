@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["kubeic-checker"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles"]
+    resourceNames: ["kubeic-checker"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    resourceNames: ["kubeic-checker"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    resourceNames: ["kubeic-checker"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "create"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["{{ .Values.checker.serviceName }}"]
+    verbs: ["update", "patch", "delete"]
+  - apiGroups: ["imageaudit.kubeic.io"]
+    resources: ["imageauditpolicies"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["imageaudit.kubeic.io"]
+    resources: ["imageauditpolicies/status"]
+    verbs: ["patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubeic-operator.fullname" . }}
+  labels:
+    {{- include "kubeic-operator.operatorLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kubeic-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubeic-operator.fullname" . }}
+    namespace: {{ .Release.Namespace }}

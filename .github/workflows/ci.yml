@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, alpha]
+
+jobs:
+  lint-and-unit:
+    name: Lint and Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - run: pip install -e ".[dev]"
+
+      - run: ruff check kubeic_operator/ kubeic_checker/ tests/
+
+      - run: pytest tests/unit/ -v --tb=short
+
+  integration:
+    name: Integration Tests (kind)
+    runs-on: ubuntu-latest
+    needs: lint-and-unit
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - run: pip install pytest
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+
+      - uses: azure/setup-helm@v5
+        with:
+          version: "v3.20.2"
+
+      - name: Create kind cluster
+        run: kind create cluster --name kubeic-ci --config kind-config.yaml --wait 120s
+
+      - name: Build images
+        run: |
+          docker build -t kubeic-operator:ci -f kubeic_operator/Dockerfile .
+          docker build -t kubeic-checker:ci -f kubeic_checker/Dockerfile .
+
+      - name: Load images into kind
+        run: |
+          kind load docker-image kubeic-operator:ci --name kubeic-ci
+          kind load docker-image kubeic-checker:ci --name kubeic-ci
+
+      - name: Install CRD
+        run: kubectl apply -f config/crd/imageauditpolicy.yaml
+
+      - name: Install Helm chart
+        run: |
+          helm install kubeic-operator ./helm/kubeic-operator \
+            --namespace kubeic-operator --create-namespace \
+            --set operator.image.repository=kubeic-operator \
+            --set operator.image.tag=ci \
+            --set operator.image.pullPolicy=Never \
+            --set checker.image.repository=kubeic-checker \
+            --set checker.image.tag=ci \
+            --set checker.image.pullPolicy=Never \
+            --set serviceMonitor.enabled=false \
+            --set grafanaDashboard.enabled=false \
+            --set prometheusRule.enabled=false \
+            --set networkPolicy.enabled=false \
+            --set policy.availability.intervalMinutes=1 \
+            --set scanIntervalSeconds=15
+
+      - name: Run integration tests
+        run: pytest tests/integration/ -v --tb=short -x
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+      - name: Collect diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== Operator logs ==="
+          kubectl logs -n kubeic-operator -l app.kubernetes.io/component=operator --tail=100 || true
+          echo "=== All pods ==="
+          kubectl get pods -A || true
+          echo "=== Checker pods ==="
+          kubectl get pods -A -l app.kubernetes.io/component=checker || true
+          echo "=== Events ==="
+          kubectl get events -A --sort-by='.lastTimestamp' || true
+
+      - name: Tear down kind cluster
+        if: always()
+        run: kind delete cluster --name kubeic-ci
