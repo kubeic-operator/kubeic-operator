@@ -136,11 +136,10 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | --- | --- | --- |
 | `kube_image_is_prerelease` | Gauge | image, registry, image_name, tag, namespace, pod, container |
 | `kube_image_prerelease_age_days` | Gauge | image, registry, image_name, tag, namespace, pod, container |
+| `kube_image_prerelease_violation` | Gauge | registry, image_name, namespace, pod, container |
 | `kube_image_version_count` | Gauge | registry, image_name |
 | `kube_image_version_pod_count` | Gauge | registry, image_name, tag, namespace |
 | `kube_image_version_spread_violation` | Gauge | registry, image_name |
-| `kube_image_total_prerelease_violations` | Gauge | - |
-| `kube_image_total_spread_violations` | Gauge | - |
 
 ### Checker metrics (per-namespace, port 9090)
 
@@ -149,7 +148,6 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | `kube_image_available` | Gauge | image, registry, image_name, namespace, pod, container |
 | `kube_image_digest_match` | Gauge | image, registry, image_name, namespace, pod, container |
 | `kube_image_credential_valid` | Gauge | registry, namespace, secret_name |
-| `kube_image_total_unavailable` | Gauge | namespace |
 
 ## Alert rules
 

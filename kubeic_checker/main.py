@@ -200,7 +200,7 @@ def run_check_loop():
                             os.unlink(auth_file)
                         except OSError:
                             pass
-                update_availability_metrics(results, namespace=NAMESPACE)
+                update_availability_metrics(results)
                 _check_credential_validity(creds, NAMESPACE, auditable_pods)
 
                 unavailable = [r for r in results if not r.available]

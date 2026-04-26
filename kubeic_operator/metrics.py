@@ -14,6 +14,12 @@ kube_image_prerelease_age_days = Gauge(
     ["image", "registry", "image_name", "tag", "namespace", "pod", "container"],
 )
 
+kube_image_prerelease_violation = Gauge(
+    "kube_image_prerelease_violation",
+    "Whether this pre-release image exceeds the max age threshold (0 or 1)",
+    ["registry", "image_name", "namespace", "pod", "container"],
+)
+
 kube_image_version_count = Gauge(
     "kube_image_version_count",
     "Number of distinct versions running for an image",
@@ -32,16 +38,6 @@ kube_image_version_spread_violation = Gauge(
     ["registry", "image_name"],
 )
 
-kube_image_total_prerelease_violations = Gauge(
-    "kube_image_total_prerelease_violations",
-    "Total number of pre-release images exceeding their max age threshold",
-)
-
-kube_image_total_spread_violations = Gauge(
-    "kube_image_total_spread_violations",
-    "Total number of image bases exceeding version spread threshold",
-)
-
 # --- Checker metrics (per-namespace) ---
 
 kube_image_available = Gauge(
@@ -56,12 +52,6 @@ kube_image_credential_valid = Gauge(
     ["registry", "namespace", "secret_name"],
 )
 
-kube_image_total_unavailable = Gauge(
-    "kube_image_total_unavailable",
-    "Total number of images that are unreachable in the registry",
-    ["namespace"],
-)
-
 kube_image_digest_match = Gauge(
     "kube_image_digest_match",
     "Whether the registry digest matches the pinned digest (1=match, 0=mismatch, absent=no digest pinned)",
@@ -69,15 +59,16 @@ kube_image_digest_match = Gauge(
 )
 
 
-def update_prerelease_metrics(findings: list, violation_count: int = 0) -> None:
+def update_prerelease_metrics(findings: list, violations: list = None) -> None:
     """Update all pre-release Prometheus gauges from findings.
 
     Args:
         findings: List of PrereleaseFinding objects.
-        violation_count: Number of findings exceeding the max age threshold.
+        violations: List of PrereleaseFinding objects exceeding the max age threshold.
     """
     kube_image_is_prerelease.clear()
     kube_image_prerelease_age_days.clear()
+    kube_image_prerelease_violation.clear()
 
     for f in findings:
         labels = {
@@ -92,7 +83,11 @@ def update_prerelease_metrics(findings: list, violation_count: int = 0) -> None:
         kube_image_is_prerelease.labels(**labels).set(1)
         kube_image_prerelease_age_days.labels(**labels).set(f.age_days)
 
-    kube_image_total_prerelease_violations.set(violation_count)
+    for v in violations or []:
+        kube_image_prerelease_violation.labels(
+            registry=v.registry, image_name=v.image_name,
+            namespace=v.namespace, pod=v.pod, container=v.container,
+        ).set(1)
 
 
 def update_spread_metrics(findings: list) -> None:
@@ -105,7 +100,6 @@ def update_spread_metrics(findings: list) -> None:
     kube_image_version_pod_count.clear()
     kube_image_version_spread_violation.clear()
 
-    violation_count = 0
     for f in findings:
         kube_image_version_count.labels(
             registry=f.registry, image_name=f.image_name,
@@ -113,8 +107,6 @@ def update_spread_metrics(findings: list) -> None:
         kube_image_version_spread_violation.labels(
             registry=f.registry, image_name=f.image_name,
         ).set(1 if f.violates_threshold else 0)
-        if f.violates_threshold:
-            violation_count += 1
 
         for tag, ns_counts in f.version_pod_counts.items():
             for ns, count in ns_counts.items():
@@ -123,33 +115,25 @@ def update_spread_metrics(findings: list) -> None:
                     tag=tag, namespace=ns,
                 ).set(count)
 
-    kube_image_total_spread_violations.set(violation_count)
 
-
-def update_availability_metrics(results: list, namespace: str = "") -> None:
+def update_availability_metrics(results: list) -> None:
     """Update availability Prometheus gauges from check results.
 
     Args:
         results: List of AvailabilityResult objects.
-        namespace: The namespace being checked (for the total label).
     """
     kube_image_available.clear()
     kube_image_digest_match.clear()
 
-    unavailable_count = 0
     for r in results:
         value = 1 if r.available else 0
         kube_image_available.labels(
             image=r.image, registry=r.registry, image_name=r.image_name,
             namespace=r.namespace, pod=r.pod, container=r.container,
         ).set(value)
-        if not r.available:
-            unavailable_count += 1
 
         if r.digest_match is not None:
             kube_image_digest_match.labels(
                 image=r.image, registry=r.registry, image_name=r.image_name,
                 namespace=r.namespace, pod=r.pod, container=r.container,
             ).set(1 if r.digest_match else 0)
-
-    kube_image_total_unavailable.labels(namespace=namespace).set(unavailable_count)

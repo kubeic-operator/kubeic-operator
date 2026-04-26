@@ -226,7 +226,7 @@ def _run_cluster_audit() -> None:
 
     prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, stable_suffixes=stable_suffixes, skip_annotation=skip_annotation)
     violations = filter_violations(prerelease_findings, max_age_days=max_age_days)
-    update_prerelease_metrics(prerelease_findings, violation_count=len(violations))
+    update_prerelease_metrics(prerelease_findings, violations=violations)
     if violations:
         logger.warning("Found %d pre-release violations (max_age=%dd)", len(violations), max_age_days)
 
