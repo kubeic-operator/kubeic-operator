@@ -29,7 +29,6 @@ jobs:
       - run: pytest tests/unit/ -v --tb=short --cov=kubeic_operator --cov=kubeic_checker --cov-report=term-missing --cov-report=xml --cov-fail-under=70
 
       - name: Coverage comment
-        if: github.event_name == 'pull_request'
         uses: py-cov-action/python-coverage-comment-action@v3
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
