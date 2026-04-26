@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main, alpha]
   workflow_run:
-    workflows: ["Sync main to alpha"]
+    workflows: ["Sync main to alpha", "Release"]
     types: [completed]
 
 jobs:
