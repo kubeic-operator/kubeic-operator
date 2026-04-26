@@ -3,7 +3,7 @@
 
 ![CI](https://github.com/kubeic-operator/kubeic-operator/actions/workflows/ci.yml/badge.svg)
 ![Release](https://img.shields.io/github/v/release/kubeic-operator/kubeic-operator?color=brightgreen)
-![Coverage](https://raw.githubusercontent.com/kubeic-operator/kubeic-operator/python-coverage-comment-action/badge.svg)
+![Coverage](https://raw.githubusercontent.com/kubeic-operator/kubeic-operator/python-coverage-comment-action-data/badge.svg)
 
 Kubernetes operator that audits running pod images for availability, pre-release age, and version spread. Surfaces findings as Prometheus metrics for Grafana dashboards and alerting.
 
