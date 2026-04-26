@@ -72,22 +72,23 @@ class TestUpdatePrereleaseMetrics:
     def setup_method(self):
         metrics.kube_image_is_prerelease.clear()
         metrics.kube_image_prerelease_age_days.clear()
-        metrics.kube_image_total_prerelease_violations.set(0)
+        metrics.kube_image_prerelease_violation.clear()
 
     def teardown_method(self):
         metrics.kube_image_is_prerelease.clear()
         metrics.kube_image_prerelease_age_days.clear()
-        metrics.kube_image_total_prerelease_violations.set(0)
+        metrics.kube_image_prerelease_violation.clear()
 
-    def test_empty_findings_sets_violation_count_to_zero(self):
-        metrics.update_prerelease_metrics([], violation_count=0)
+    def test_empty_findings_clears_gauges(self):
+        metrics.update_prerelease_metrics([])
 
-        value = REGISTRY.get_sample_value("kube_image_total_prerelease_violations")
-        assert value == 0
+        is_pre_samples = list(REGISTRY.get_sample_value("kube_image_is_prerelease", labels) for labels in [{}])
+        # No labels set, so the gauge should have no samples
+        assert is_pre_samples[0] is None
 
     def test_findings_set_prerelease_and_age_days(self):
         f = _make_prerelease_finding(age_days=15)
-        metrics.update_prerelease_metrics([f], violation_count=2)
+        metrics.update_prerelease_metrics([f])
 
         labels = {
             "image": f.image,
@@ -100,11 +101,23 @@ class TestUpdatePrereleaseMetrics:
         }
         is_pre = REGISTRY.get_sample_value("kube_image_is_prerelease", labels)
         age = REGISTRY.get_sample_value("kube_image_prerelease_age_days", labels)
-        violations = REGISTRY.get_sample_value("kube_image_total_prerelease_violations")
 
         assert is_pre == 1
         assert age == 15
-        assert violations == 2
+
+    def test_violations_set_prerelease_violation_gauge(self):
+        v = _make_prerelease_finding(age_days=45)
+        metrics.update_prerelease_metrics([], violations=[v])
+
+        viol_labels = {
+            "registry": v.registry,
+            "image_name": v.image_name,
+            "namespace": v.namespace,
+            "pod": v.pod,
+            "container": v.container,
+        }
+        viol = REGISTRY.get_sample_value("kube_image_prerelease_violation", viol_labels)
+        assert viol == 1
 
 
 class TestUpdateSpreadMetrics:
@@ -112,13 +125,11 @@ class TestUpdateSpreadMetrics:
         metrics.kube_image_version_count.clear()
         metrics.kube_image_version_pod_count.clear()
         metrics.kube_image_version_spread_violation.clear()
-        metrics.kube_image_total_spread_violations.set(0)
 
     def teardown_method(self):
         metrics.kube_image_version_count.clear()
         metrics.kube_image_version_pod_count.clear()
         metrics.kube_image_version_spread_violation.clear()
-        metrics.kube_image_total_spread_violations.set(0)
 
     def test_findings_set_version_count_violation_and_pod_counts(self):
         pod_counts = {
@@ -156,9 +167,6 @@ class TestUpdateSpreadMetrics:
         )
         assert pc2 == 1
 
-        total = REGISTRY.get_sample_value("kube_image_total_spread_violations")
-        assert total == 1
-
     def test_no_violations_sets_violation_gauge_to_zero(self):
         f = _make_spread_finding(
             version_count=2,
@@ -172,24 +180,19 @@ class TestUpdateSpreadMetrics:
         )
         assert violation == 0
 
-        total = REGISTRY.get_sample_value("kube_image_total_spread_violations")
-        assert total == 0
-
 
 class TestUpdateAvailabilityMetrics:
     def setup_method(self):
         metrics.kube_image_available.clear()
         metrics.kube_image_digest_match.clear()
-        metrics.kube_image_total_unavailable.clear()
 
     def teardown_method(self):
         metrics.kube_image_available.clear()
         metrics.kube_image_digest_match.clear()
-        metrics.kube_image_total_unavailable.clear()
 
     def test_available_images_set_available_to_one(self):
         r = _make_availability_result(available=True)
-        metrics.update_availability_metrics([r], namespace="default")
+        metrics.update_availability_metrics([r])
 
         labels = {
             "image": r.image,
@@ -202,14 +205,9 @@ class TestUpdateAvailabilityMetrics:
         avail = REGISTRY.get_sample_value("kube_image_available", labels)
         assert avail == 1
 
-        total = REGISTRY.get_sample_value(
-            "kube_image_total_unavailable", {"namespace": "default"},
-        )
-        assert total == 0
-
     def test_unavailable_images_set_available_to_zero(self):
         r = _make_availability_result(available=False)
-        metrics.update_availability_metrics([r], namespace="monitoring")
+        metrics.update_availability_metrics([r])
 
         labels = {
             "image": r.image,
@@ -222,14 +220,9 @@ class TestUpdateAvailabilityMetrics:
         avail = REGISTRY.get_sample_value("kube_image_available", labels)
         assert avail == 0
 
-        total = REGISTRY.get_sample_value(
-            "kube_image_total_unavailable", {"namespace": "monitoring"},
-        )
-        assert total == 1
-
     def test_digest_match_true(self):
         r = _make_availability_result(available=True, digest_match=True)
-        metrics.update_availability_metrics([r], namespace="default")
+        metrics.update_availability_metrics([r])
 
         labels = {
             "image": r.image,
@@ -244,7 +237,7 @@ class TestUpdateAvailabilityMetrics:
 
     def test_digest_match_false(self):
         r = _make_availability_result(available=True, digest_match=False)
-        metrics.update_availability_metrics([r], namespace="default")
+        metrics.update_availability_metrics([r])
 
         labels = {
             "image": r.image,
@@ -259,7 +252,7 @@ class TestUpdateAvailabilityMetrics:
 
     def test_digest_match_none_omits_gauge(self):
         r = _make_availability_result(available=True, digest_match=None)
-        metrics.update_availability_metrics([r], namespace="default")
+        metrics.update_availability_metrics([r])
 
         labels = {
             "image": r.image,
