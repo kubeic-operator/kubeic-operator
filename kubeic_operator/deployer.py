@@ -255,7 +255,7 @@ def _build_deployment(
                                 capabilities=client.V1Capabilities(drop=["ALL"]),
                             ),
                             volume_mounts=[
-                                client.V1VolumeMount(name="tmp", mount_path="/tmp"),
+                                client.V1VolumeMount(name="tmp", mount_path="/tmp"),  # nosec B108
                             ],
                         ),
                     ],

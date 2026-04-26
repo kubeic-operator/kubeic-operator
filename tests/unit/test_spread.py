@@ -96,3 +96,34 @@ class TestAggregateVersionSpread:
         assert len(findings) == 1
         assert findings[0].registry == "myregistry.corp.com:5000"
         assert findings[0].image_name == "app"
+
+    def test_skip_annotation_excludes_pod(self):
+        pods = [
+            _make_pod("pod-1", "default", "nginx:1.25"),
+            {
+                "metadata": {
+                    "name": "pod-2",
+                    "namespace": "default",
+                    "annotations": {"kubeic.io/skip": "spread"},
+                },
+                "spec": {"containers": [{"name": "main", "image": "nginx:1.26"}]},
+            },
+        ]
+        findings = aggregate_version_spread(pods, skip_annotation="kubeic.io/skip")
+        assert len(findings) == 0
+
+    def test_skip_annotation_none_includes_all(self):
+        pods = [
+            _make_pod("pod-1", "default", "nginx:1.25"),
+            {
+                "metadata": {
+                    "name": "pod-2",
+                    "namespace": "default",
+                    "annotations": {"kubeic.io/skip": "spread"},
+                },
+                "spec": {"containers": [{"name": "main", "image": "nginx:1.26"}]},
+            },
+        ]
+        findings = aggregate_version_spread(pods, skip_annotation=None)
+        assert len(findings) == 1
+        assert findings[0].version_count == 2

@@ -5,6 +5,7 @@ from kubeic_operator.checks.prerelease import (
     is_prerelease_tag,
     check_prerelease,
     filter_violations,
+    should_skip,
 )
 
 
@@ -317,6 +318,111 @@ class TestCheckPrerelease:
         ]
         findings = check_prerelease(pods)
         assert len(findings) == 1
+
+
+class TestShouldSkip:
+    def _make_pod(self, annotations=None):
+        return {"metadata": {"annotations": annotations}}
+
+    def test_no_annotation(self):
+        assert should_skip({"metadata": {}}, "kubeic.io/skip", "prerelease") is False
+
+    def test_empty_annotation_value(self):
+        pod = self._make_pod({"kubeic.io/skip": ""})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is False
+
+    def test_skip_all_with_true(self):
+        pod = self._make_pod({"kubeic.io/skip": "true"})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "spread") is True
+
+    def test_skip_all_with_star(self):
+        pod = self._make_pod({"kubeic.io/skip": "*"})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "spread") is True
+
+    def test_skip_specific_check_type(self):
+        pod = self._make_pod({"kubeic.io/skip": "prerelease"})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "spread") is False
+
+    def test_skip_comma_separated_check_types(self):
+        pod = self._make_pod({"kubeic.io/skip": "prerelease,spread"})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "spread") is True
+
+    def test_skip_is_case_insensitive(self):
+        pod = self._make_pod({"kubeic.io/skip": "Prerelease"})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+
+    def test_skip_with_whitespace(self):
+        pod = self._make_pod({"kubeic.io/skip": " prerelease , spread "})
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "spread") is True
+
+    def test_different_annotation_key(self):
+        pod = self._make_pod({"custom.io/opt-out": "true"})
+        assert should_skip(pod, "custom.io/opt-out", "prerelease") is True
+        assert should_skip(pod, "kubeic.io/skip", "prerelease") is False
+
+
+class TestCheckPrereleaseSkipAnnotation:
+    def test_skips_annotated_pods(self):
+        pods = [
+            {
+                "metadata": {
+                    "name": "pod-a",
+                    "namespace": "default",
+                    "annotations": {"kubeic.io/skip": "prerelease"},
+                    "creationTimestamp": "2024-01-01T00:00:00Z",
+                },
+                "status": {"startTime": "2024-01-01T00:00:00Z"},
+                "spec": {"containers": [{"name": "main", "image": "myapp:1.0.0-alpha"}]},
+            },
+        ]
+        findings = check_prerelease(pods, skip_annotation="kubeic.io/skip")
+        assert len(findings) == 0
+
+    def test_includes_unannotated_pods(self):
+        pods = [
+            {
+                "metadata": {
+                    "name": "pod-a",
+                    "namespace": "default",
+                    "creationTimestamp": "2024-01-01T00:00:00Z",
+                },
+                "status": {"startTime": "2024-01-01T00:00:00Z"},
+                "spec": {"containers": [{"name": "main", "image": "myapp:1.0.0-alpha"}]},
+            },
+        ]
+        findings = check_prerelease(pods, skip_annotation="kubeic.io/skip")
+        assert len(findings) == 1
+
+    def test_mixed_annotated_and_unannotated(self):
+        pods = [
+            {
+                "metadata": {
+                    "name": "pod-skip",
+                    "namespace": "default",
+                    "annotations": {"kubeic.io/skip": "true"},
+                    "creationTimestamp": "2024-01-01T00:00:00Z",
+                },
+                "status": {"startTime": "2024-01-01T00:00:00Z"},
+                "spec": {"containers": [{"name": "main", "image": "myapp:1.0.0-alpha"}]},
+            },
+            {
+                "metadata": {
+                    "name": "pod-include",
+                    "namespace": "default",
+                    "creationTimestamp": "2024-01-01T00:00:00Z",
+                },
+                "status": {"startTime": "2024-01-01T00:00:00Z"},
+                "spec": {"containers": [{"name": "main", "image": "myapp:1.0.0-beta"}]},
+            },
+        ]
+        findings = check_prerelease(pods, skip_annotation="kubeic.io/skip")
+        assert len(findings) == 1
+        assert findings[0].pod == "pod-include"
 
 
 class TestFilterViolations:
