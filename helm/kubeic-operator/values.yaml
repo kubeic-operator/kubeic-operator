@@ -121,6 +121,9 @@ prometheusRule:
 networkPolicy:
   enabled: true
 
+# Reconciliation and audit scan interval (seconds)
+scanIntervalSeconds: 300
+
 # CRD installation (default off — manage the CRD manually or pre-install before helm diff)
 crds:
   install: false

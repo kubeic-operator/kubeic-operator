@@ -73,7 +73,8 @@ jobs:
             --set grafanaDashboard.enabled=false \
             --set prometheusRule.enabled=false \
             --set networkPolicy.enabled=false \
-            --set policy.availability.intervalMinutes=1
+            --set policy.availability.intervalMinutes=1 \
+            --set scanIntervalSeconds=15
 
       - name: Run integration tests
         run: pytest tests/integration/ -v --tb=short -x

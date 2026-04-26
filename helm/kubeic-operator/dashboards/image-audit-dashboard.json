@@ -15,7 +15,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_total_unavailable{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "sum(kube_image_total_unavailable{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -48,7 +48,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_credential_valid{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
+          "expr": "sum(kube_image_credential_valid{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -81,7 +81,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_prerelease_violations{job=\"__KUBEIC_OPERATOR_JOB__\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "max(kube_image_total_prerelease_violations{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -114,7 +114,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_spread_violations{job=\"__KUBEIC_OPERATOR_JOB__\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "max(kube_image_total_spread_violations{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -147,7 +147,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
+          "expr": "sum(kube_image_digest_match{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
           "refId": "A"
         }
       ],
