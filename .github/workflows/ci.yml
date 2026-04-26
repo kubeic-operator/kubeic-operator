@@ -21,7 +21,9 @@ jobs:
 
       - run: ruff check kubeic_operator/ kubeic_checker/ tests/
 
-      - run: pytest tests/unit/ -v --tb=short
+      - run: bandit -r kubeic_operator/ kubeic_checker/
+
+      - run: pytest tests/unit/ -v --tb=short --cov=kubeic_operator --cov=kubeic_checker --cov-report=term-missing --cov-fail-under=70
 
   integration:
     name: Integration Tests (kind)
