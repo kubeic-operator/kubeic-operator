@@ -97,6 +97,9 @@ serviceMonitor:
   labels: {}
   # Additional labels for ServiceMonitor discovery, e.g:
   # release: prometheus
+  clusterName: ""
+  # Cluster name injected as a "cluster" label on all scraped metrics via relabelings.
+  # e.g: cluster1, prod-west
 
 # Grafana dashboard (deployed as ConfigMap for sidecar discovery)
 grafanaDashboard:
