@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timezone
 
 import kopf
 from kubernetes import client, config as k8s_config
@@ -108,6 +109,89 @@ def _bootstrap_checkers() -> None:
             logger.error("Failed to bootstrap checker in %s: %s", name, exc)
 
 
+def _reconcile_checkers() -> dict:
+    """Ensure checker state matches desired state for all namespaces.
+
+    Returns a dict of namespace -> {deployed, reason} for status reporting.
+    """
+    from kubeic_operator.deployer import (
+        CHECKER_DEPLOYMENT, deploy_checker, teardown_checker, get_secret_names_for_namespace,
+    )
+    from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
+
+    v1 = client.CoreV1Api()
+    apps_v1 = client.AppsV1Api()
+    try:
+        namespaces = v1.list_namespace().items
+    except client.ApiException as exc:
+        logger.error("Failed to list namespaces during reconcile: %s", exc)
+        return {}
+
+    namespace_status = {}
+    for ns in namespaces:
+        name = ns.metadata.name
+        labels = ns.metadata.labels or {}
+        policy = _get_effective_policy(name)
+        should = _should_audit(name, labels, policy)
+
+        checker_exists = False
+        try:
+            apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, name)
+            checker_exists = True
+        except client.ApiException as e:
+            if e.status != 404:
+                raise
+
+        if should and not checker_exists:
+            interval = policy.get("availability", {}).get("intervalMinutes", 30)
+            cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
+            try:
+                deploy_checker(namespace=name, check_interval_minutes=interval,
+                               credential_source=cred_source,
+                               secret_names=get_secret_names_for_namespace(name))
+                logger.info("Reconciled: deployed checker in %s", name)
+            except Exception as exc:
+                logger.error("Failed to deploy checker in %s: %s", name, exc)
+            namespace_status[name] = {"deployed": True}
+        elif not should and checker_exists:
+            try:
+                teardown_checker(name)
+                logger.info("Reconciled: removed checker from %s", name)
+            except Exception as exc:
+                logger.error("Failed to teardown checker in %s: %s", name, exc)
+            reason = "excluded"
+            excluded_ns = policy.get("namespaceSelector", {}).get("excludeLabels", {})
+            for k, v in excluded_ns.items():
+                if labels.get(k) == v:
+                    reason = f"excluded by label {k}={v}"
+                    break
+            namespace_status[name] = {"deployed": False, "reason": reason}
+        elif should:
+            namespace_status[name] = {"deployed": True}
+
+    return namespace_status
+
+
+def _write_iap_status(namespace_status: dict) -> None:
+    """Patch the cluster-defaults IAP status with reconcile results."""
+    operator_ns = os.environ.get("OPERATOR_NAMESPACE", "kubeic-operator")
+    api = client.CustomObjectsApi()
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    body = {
+        "status": {
+            "lastReconcileTime": now,
+            "namespaces": namespace_status,
+        },
+    }
+    try:
+        api.patch_namespaced_custom_object_status(
+            "imageaudit.kubeic.io", "v1alpha1", operator_ns,
+            "imageauditpolicies", "cluster-defaults", body,
+        )
+    except client.ApiException as exc:
+        logger.warning("Failed to write IAP status: %s", exc)
+
+
 def _run_cluster_audit() -> None:
     v1 = client.CoreV1Api()
     try:
@@ -142,7 +226,7 @@ def _run_cluster_audit() -> None:
 
     prerelease_findings = check_prerelease(pod_list, max_age_days=max_age_days, stable_suffixes=stable_suffixes, skip_annotation=skip_annotation)
     violations = filter_violations(prerelease_findings, max_age_days=max_age_days)
-    update_prerelease_metrics(prerelease_findings, violation_count=len(violations))
+    update_prerelease_metrics(prerelease_findings, violations=violations)
     if violations:
         logger.warning("Found %d pre-release violations (max_age=%dd)", len(violations), max_age_days)
 
@@ -163,6 +247,12 @@ def _audit_loop() -> None:
             _run_cluster_audit()
         except Exception:
             logger.exception("Cluster audit failed")
+        try:
+            namespace_status = _reconcile_checkers()
+            if namespace_status:
+                _write_iap_status(namespace_status)
+        except Exception:
+            logger.exception("Checker reconciliation failed")
 
 
 @kopf.on.startup()
@@ -183,3 +273,6 @@ def on_startup(settings: kopf.OperatorSettings, **kwargs):
         k8s_config.load_kube_config()
     threading.Thread(target=_audit_loop, daemon=True, name="audit-loop").start()
     _bootstrap_checkers()
+    namespace_status = _reconcile_checkers()
+    if namespace_status:
+        _write_iap_status(namespace_status)

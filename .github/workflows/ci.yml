@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, alpha]
   pull_request:
     branches: [main, alpha]
 
@@ -60,6 +58,9 @@ jobs:
           kind load docker-image kubeic-operator:ci --name kubeic-ci
           kind load docker-image kubeic-checker:ci --name kubeic-ci
 
+      - name: Install CRD
+        run: kubectl apply -f config/crd/imageauditpolicy.yaml
+
       - name: Install Helm chart
         run: |
           helm install kubeic-operator ./helm/kubeic-operator \
@@ -70,12 +71,12 @@ jobs:
             --set checker.image.repository=kubeic-checker \
             --set checker.image.tag=ci \
             --set checker.image.pullPolicy=Never \
-            --set crds.install=true \
             --set serviceMonitor.enabled=false \
             --set grafanaDashboard.enabled=false \
             --set prometheusRule.enabled=false \
             --set networkPolicy.enabled=false \
-            --set policy.availability.intervalMinutes=1
+            --set policy.availability.intervalMinutes=1 \
+            --set scanIntervalSeconds=15
 
       - name: Run integration tests
         run: pytest tests/integration/ -v --tb=short -x

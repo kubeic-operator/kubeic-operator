@@ -9,10 +9,11 @@ OPERATOR_SELECTOR = "app.kubernetes.io/component=operator"
 
 @pytest.fixture(scope="session")
 def kubectl():
-    def _kubectl(*args, check=True, timeout=60):
+    def _kubectl(*args, check=True, timeout=60, input=None):
         result = subprocess.run(
             ["kubectl"] + list(args),
             capture_output=True, text=True, timeout=timeout,
+            input=input,
         )
         if check and result.returncode != 0:
             pytest.fail(f"kubectl {' '.join(args)} failed:\n{result.stderr}")
@@ -40,12 +41,13 @@ def test_namespace(kubectl):
     name = f"test-{int(time.time())}"
     kubectl("create", "namespace", name)
     yield name
-    kubectl("delete", "namespace", name, check=False, timeout=30)
+    kubectl("delete", "namespace", name, "--wait=false", check=False, timeout=10)
 
 
-def get_operator_pod_name(kubectl, namespace=OPERATOR_NS):
+@pytest.fixture(scope="session")
+def operator_pod(kubectl, operator_namespace):
     result = kubectl(
-        "get", "pods", "-n", namespace,
+        "get", "pods", "-n", operator_namespace,
         "-l", OPERATOR_SELECTOR,
         "-o", "jsonpath={.items[0].metadata.name}",
     )

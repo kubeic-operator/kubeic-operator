@@ -22,6 +22,12 @@ spec:
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics
+      {{- if .Values.serviceMonitor.clusterName }}
+      relabelings:
+        - action: replace
+          targetLabel: cluster
+          replacement: {{ .Values.serviceMonitor.clusterName | quote }}
+      {{- end }}
 ---
 # Service for the operator so the ServiceMonitor can discover it
 apiVersion: v1
@@ -64,4 +70,10 @@ spec:
       interval: {{ .Values.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
       path: /metrics
+      {{- if .Values.serviceMonitor.clusterName }}
+      relabelings:
+        - action: replace
+          targetLabel: cluster
+          replacement: {{ .Values.serviceMonitor.clusterName | quote }}
+      {{- end }}
 {{- end }}

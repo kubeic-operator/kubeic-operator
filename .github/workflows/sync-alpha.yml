@@ -1,0 +1,31 @@
+name: Sync main to alpha
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Create sync PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Create pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="sync/main-to-alpha-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH" origin/main
+          git push origin "$BRANCH"
+          gh pr create \
+            --base alpha \
+            --head "$BRANCH" \
+            --title "chore: sync main into alpha" \
+            --body "Automated PR to keep alpha up to date with main after the latest release."

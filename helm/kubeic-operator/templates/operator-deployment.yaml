@@ -60,6 +60,8 @@ spec:
               value: {{ .Values.checker.podLabels | toJson | quote }}
             - name: CHECKER_POD_ANNOTATIONS
               value: {{ .Values.checker.podAnnotations | toJson | quote }}
+            - name: SCAN_INTERVAL_SECONDS
+              value: {{ .Values.scanIntervalSeconds | default 300 | quote }}
             - name: SKIP_ANNOTATION
               value: {{ .Values.policy.skipAnnotation | default "" | quote }}
           ports:
