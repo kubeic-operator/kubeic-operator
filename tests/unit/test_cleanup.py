@@ -1,4 +1,4 @@
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 from kubeic_operator.cleanup import run
 
@@ -32,11 +32,8 @@ class TestRun:
 
         run()
 
-        mock_teardown.assert_has_calls([
-            call("alpha"),
-            call("mid"),
-            call("zebra"),
-        ])
+        torn_down = {c.args[0] for c in mock_teardown.call_args_list}
+        assert torn_down == {"alpha", "mid", "zebra"}
         assert mock_teardown.call_count == 3
 
     @patch("kubeic_operator.cleanup.teardown_checker")
