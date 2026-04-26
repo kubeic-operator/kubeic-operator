@@ -11,7 +11,7 @@ _mock_kopf.on.delete.side_effect = lambda *a, **kw: lambda f: f
 _mock_kopf.Meta = MagicMock
 sys.modules.setdefault("kopf", _mock_kopf)
 
-from kubeic_operator.handlers.policy import (
+from kubeic_operator.handlers.policy import (  # noqa: E402
     _reconcile_after_policy_change,
     on_policy_change,
     on_policy_delete,
