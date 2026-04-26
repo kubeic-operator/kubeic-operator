@@ -1,6 +1,6 @@
 import json
 import os
-import subprocess
+import subprocess  # nosec B404
 import time
 from dataclasses import dataclass
 
@@ -54,7 +54,7 @@ def _run_skopeo_inspect(
     last_error_class: str = "unknown"
     for attempt in range(retries):
         try:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603
                 cmd,
                 capture_output=True,
                 text=True,
@@ -98,7 +98,7 @@ def _run_skopeo_list_tags(
         cmd.extend(["--authfile", auth_file])
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)  # nosec B603
         if result.returncode == 0:
             return True, None, ""
         error = result.stderr.strip() or f"skopeo list-tags exited with code {result.returncode}"
