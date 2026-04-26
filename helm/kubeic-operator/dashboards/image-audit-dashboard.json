@@ -75,13 +75,13 @@
     },
     {
       "title": "Pre-release Violations",
-      "description": "Pre-release images (alpha, beta, rc, dev, latest, etc.) running beyond the max age threshold. Cluster-wide total.",
+      "description": "Pre-release images (alpha, beta, rc, dev, latest, etc.) currently running.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_prerelease_violations{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "count(kube_image_is_prerelease{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} == 1) or on() vector(0)",
           "refId": "A"
         }
       ],
@@ -108,13 +108,13 @@
     },
     {
       "title": "Spread Violations",
-      "description": "Image bases running more distinct versions than the configured threshold. Cluster-wide total.",
+      "description": "Image bases running more distinct versions than the configured threshold.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "max(kube_image_total_spread_violations{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "count(kube_image_version_spread_violation{job=\"__KUBEIC_OPERATOR_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} == 1) or on() vector(0)",
           "refId": "A"
         }
       ],
