@@ -2,9 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, alpha]
   pull_request:
     branches: [main, alpha]
+  workflow_run:
+    workflows: ["Sync main to alpha"]
+    types: [completed]
 
 jobs:
   lint-and-unit:
@@ -29,6 +32,7 @@ jobs:
       - run: pytest tests/unit/ -v --tb=short --cov=kubeic_operator --cov=kubeic_checker --cov-report=term-missing --cov-report=xml --cov-fail-under=70
 
       - name: Coverage comment
+        if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
         uses: py-cov-action/python-coverage-comment-action@v3
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
