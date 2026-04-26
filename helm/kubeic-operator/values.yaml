@@ -2,7 +2,7 @@
 operator:
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/operator
-    tag: "0.1.1"
+    tag: "0.1.2-alpha.1"
     pullPolicy: IfNotPresent
   replicas: 1
   resources:
@@ -21,7 +21,7 @@ checker:
   serviceName: kubeic-checker-metrics
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/checker
-    tag: "0.1.1"
+    tag: "0.1.2-alpha.1"
     pullPolicy: IfNotPresent
   resources:
     requests:
