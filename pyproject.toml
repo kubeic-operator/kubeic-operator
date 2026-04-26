@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kubeic-operator"
-version = "0.1.0"
+version = "0.1.0-alpha.10"
 description = "Kubernetes Image Audit Operator - detects silent image failure risks"
 requires-python = ">=3.11"
 dependencies = [
@@ -30,3 +30,6 @@ include = ["kubeic_operator*", "kubeic_checker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+relative_files = true

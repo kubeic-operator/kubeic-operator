@@ -1,5 +1,10 @@
 from unittest.mock import patch, MagicMock
+import os
+import stat
 import subprocess
+import sys
+
+import pytest
 
 from kubeic_checker.availability import (
     check_availability, write_auth_config,
@@ -71,6 +76,56 @@ class TestCheckAvailability:
         results = check_availability(pods)
         assert len(results) == 2
 
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_digest_match_when_digests_match(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"Digest": "sha256:abc123"}',
+        )
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        assert results[0].digest_match is True
+        assert results[0].registry_digest == "sha256:abc123"
+        assert results[0].pinned_digest == "sha256:abc123"
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_digest_mismatch_detected(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"Digest": "sha256:deadbeef"}',
+        )
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        assert results[0].digest_match is False
+        assert results[0].registry_digest == "sha256:deadbeef"
+        assert results[0].pinned_digest == "sha256:abc123"
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_no_digest_pinned_gives_none(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].digest_match is None
+        assert results[0].pinned_digest is None
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_digest_unavailable_gives_none(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{}',
+        )
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        assert results[0].digest_match is None
+        assert results[0].pinned_digest == "sha256:abc123"
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_failed_inspect_gives_none_digest(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="not found")
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        assert results[0].digest_match is None
+
 
 class TestWriteAuthConfig:
     def test_writes_auth_from_user_pass(self, tmp_path):
@@ -103,6 +158,15 @@ class TestWriteAuthConfig:
             config = json.load(f)
 
         assert config["auths"]["registry.corp.com"]["auth"] == auth
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix file permissions not supported on Windows")
+    def test_writes_file_with_0600_permissions(self, tmp_path):
+        secrets = {"r.io": {"username": "u", "password": "p"}}
+        path = str(tmp_path / "config.json")
+        write_auth_config(secrets, path)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
 
 
 class TestClassifyError:

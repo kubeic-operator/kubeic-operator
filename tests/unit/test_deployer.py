@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import MagicMock, patch
 
 from kubernetes.client import ApiException as K8sApiException
@@ -10,6 +11,7 @@ from kubeic_operator.deployer import (
     _build_deployment,
     _selector_labels,
     _common_labels,
+    _parse_json_env,
     deploy_checker,
     teardown_checker,
     get_secret_names_for_namespace,
@@ -258,3 +260,85 @@ class TestTeardownChecker:
 
         teardown_checker("test-ns")
         mock_v1.delete_namespaced_service.assert_called_once()
+
+
+class TestParseJsonEnv:
+    def test_returns_default_when_env_not_set(self):
+        result = _parse_json_env("NONEXISTENT_TEST_KEY_12345")
+        assert result == {}
+
+    def test_parses_valid_json(self):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value='{"key": "value"}'):
+            result = _parse_json_env("TEST_KEY")
+        assert result == {"key": "value"}
+
+    def test_returns_empty_dict_and_logs_warning_on_invalid_json(self, caplog):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="not-json"):
+            with caplog.at_level(logging.WARNING, logger="kubeic-operator.deployer"):
+                result = _parse_json_env("TEST_KEY")
+        assert result == {}
+        assert "Failed to parse env TEST_KEY as JSON" in caplog.text
+
+
+class TestAnnotationMerge:
+    @patch("kubeic_operator.deployer._build_deployment")
+    @patch("kubeic_operator.deployer.client")
+    def test_stale_annotations_set_to_none_on_patch(self, mock_client, mock_build):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        desired_deploy = MagicMock()
+        desired_deploy.spec.template.metadata.annotations = {"keep-me": "value"}
+        mock_build.return_value = desired_deploy
+
+        existing = MagicMock()
+        existing.spec.template.metadata.annotations = {
+            "keep-me": "value",
+            "stale-annotation": "should-be-removed",
+        }
+        mock_apps.read_namespaced_deployment.return_value = existing
+
+        deploy_checker("test-ns")
+
+        patch_call = mock_apps.patch_namespaced_deployment.call_args
+        patched = patch_call[0][2]
+        annotations = patched.spec.template.metadata.annotations
+
+        assert annotations["keep-me"] == "value"
+        assert annotations["stale-annotation"] is None
+
+    @patch("kubeic_operator.deployer._build_deployment")
+    @patch("kubeic_operator.deployer.client")
+    def test_all_existing_annotations_cleaned_when_desired_is_empty(self, mock_client, mock_build):
+        mock_v1 = MagicMock()
+        mock_rbac = MagicMock()
+        mock_apps = MagicMock()
+
+        mock_client.CoreV1Api.return_value = mock_v1
+        mock_client.RbacAuthorizationV1Api.return_value = mock_rbac
+        mock_client.AppsV1Api.return_value = mock_apps
+
+        desired_deploy = MagicMock()
+        desired_deploy.spec.template.metadata.annotations = {}
+        mock_build.return_value = desired_deploy
+
+        existing = MagicMock()
+        existing.spec.template.metadata.annotations = {
+            "old-1": "a",
+            "old-2": "b",
+        }
+        mock_apps.read_namespaced_deployment.return_value = existing
+
+        deploy_checker("test-ns")
+
+        patch_call = mock_apps.patch_namespaced_deployment.call_args
+        patched = patch_call[0][2]
+        annotations = patched.spec.template.metadata.annotations
+
+        assert annotations["old-1"] is None
+        assert annotations["old-2"] is None

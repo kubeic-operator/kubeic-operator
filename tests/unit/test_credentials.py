@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 from unittest.mock import MagicMock
 
 from kubeic_checker.credentials import (
@@ -47,6 +48,23 @@ class TestDecodeDockerSecret:
 
     def test_returns_empty_on_invalid_json(self):
         result = _decode_docker_secret({".dockerconfigjson": base64.b64encode(b"not json").decode()})
+        assert result == {}
+
+    def test_returns_empty_on_none_value(self):
+        result = _decode_docker_secret({".dockerconfigjson": None})
+        assert result == {}
+
+    def test_skips_non_base64_auth_content(self):
+        config = json.dumps({"auths": {"r.io": {"auth": "not-valid-base64!!!"}}})
+        data = {".dockerconfigjson": base64.b64encode(config.encode()).decode()}
+        result = _decode_docker_secret(data)
+        assert result == {}
+
+    def test_skips_auth_without_colon_separator(self):
+        token = base64.b64encode(b"no_colon_here").decode()
+        config = json.dumps({"auths": {"r.io": {"auth": token}}})
+        data = {".dockerconfigjson": base64.b64encode(config.encode()).decode()}
+        result = _decode_docker_secret(data)
         assert result == {}
 
 
@@ -111,6 +129,16 @@ class TestResolveAllCredentials:
         resolve_all_credentials([_make_pod(["regcred"])], mock_client)
 
         mock_client.read_namespaced_secret.assert_called_once_with("regcred", "default")
+
+    def test_logs_warning_on_unavailable_secret(self, caplog):
+        mock_client = MagicMock()
+        mock_client.read_namespaced_secret.side_effect = Exception("not found")
+
+        with caplog.at_level(logging.WARNING, logger="image-audit-checker.credentials"):
+            creds = resolve_all_credentials([_make_pod(["missing-secret"])], mock_client)
+
+        assert creds == []
+        assert "Failed to read secret missing-secret" in caplog.text
 
 
 class TestRegistryFromImage:
