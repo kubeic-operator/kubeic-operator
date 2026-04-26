@@ -1,4 +1,15 @@
+import sys
 from unittest.mock import patch, MagicMock
+
+# Mock kopf before importing the policy module to prevent decorator side-effects
+# in environments where kopf's runtime isn't fully initialised (e.g. CI).
+# Decorators pass through the original function unchanged.
+_mock_kopf = MagicMock()
+_mock_kopf.on.create.side_effect = lambda *a, **kw: lambda f: f
+_mock_kopf.on.update.side_effect = lambda *a, **kw: lambda f: f
+_mock_kopf.on.delete.side_effect = lambda *a, **kw: lambda f: f
+_mock_kopf.Meta = MagicMock
+sys.modules.setdefault("kopf", _mock_kopf)
 
 from kubeic_operator.handlers.policy import (
     _reconcile_all_namespaces,
