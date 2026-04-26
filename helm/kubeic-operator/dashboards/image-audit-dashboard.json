@@ -15,7 +15,7 @@
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "targets": [
         {
-          "expr": "sum(kube_image_total_unavailable{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"}) or on() vector(0)",
+          "expr": "sum(kube_image_available{job=\"__KUBEIC_CHECKER_JOB__\", exported_namespace=~\"$namespace\", registry=~\"$registry\", image_name=~\"$image_name\", cluster=~\"$cluster\"} == 0) or on() vector(0)",
           "refId": "A"
         }
       ],
