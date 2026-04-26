@@ -1,5 +1,10 @@
 from unittest.mock import patch, MagicMock
+import os
+import stat
 import subprocess
+import sys
+
+import pytest
 
 from kubeic_checker.availability import (
     check_availability, write_auth_config,
@@ -153,6 +158,15 @@ class TestWriteAuthConfig:
             config = json.load(f)
 
         assert config["auths"]["registry.corp.com"]["auth"] == auth
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="Unix file permissions not supported on Windows")
+    def test_writes_file_with_0600_permissions(self, tmp_path):
+        secrets = {"r.io": {"username": "u", "password": "p"}}
+        path = str(tmp_path / "config.json")
+        write_auth_config(secrets, path)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        assert mode == 0o600
 
 
 class TestClassifyError:
