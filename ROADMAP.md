@@ -1,49 +1,32 @@
 # kubeic-operator Roadmap
 
-## Reassess: IAP Status Subresource
+## Next: CI Quality Gates (partial)
 
-The `status` subresource was removed from the `ImageAuditPolicy` CRD because it was declared but never written to. Re-adding it is worth reconsidering — writing `lastAuditTime`, `namespacesChecked`, and audit summaries to `.status` would give users visibility into the operator's activity directly via `kubectl get iap`.
+The CI workflow (`.github/workflows/ci.yml`) runs on PRs to `main` and `alpha` and already includes:
+- `ruff check` — linting
+- `pytest tests/unit/` — unit tests
+- `pytest tests/integration/` — kind-based integration tests
 
-The original concern was around RBAC: the operator already uses `_NoWriteProgressStorage` and disables finalizers to avoid needing namespace-level patch permissions. However, patching an IAP object's status subresource is a different operation — the operator controls the IAP CRD and already has cluster-scope permissions to manage it. The per-namespace checker pods don't interact with IAP objects at all (they check images and expose metrics), so there's no delegation issue.
-
-This is unlike the secrets RBAC situation where the operator's ClusterRole grants `get secrets` cluster-wide. With secrets, the operator isn't reading them directly — it creates per-namespace Roles that grant checker SAs access. The operator holding that permission is for future use, not current need. With IAP status, the operator itself would be the writer, which is a clean fit.
-
-If re-added:
-- Add `subresources: status: {}` back to the CRD schema
-- Add `status` field with typed properties (no `x-kubernetes-preserve-unknown-fields`)
-- Add `update`/`patch` on `imageauditpolicies/status` to operator RBAC
-- Write status updates in the policy/namespace handlers after each audit cycle
+**Still missing:**
+- `bandit -r kubeic_operator/ kubeic_checker/` — security-focused static analysis
+- Optionally `mypy` or `pyright` for type checking
+- pytest-cov coverage reporting (`pytest-cov` is a dev dependency but not wired into CI)
+- Quality gates on the **release** workflow (`.github/workflows/release.yml`) — currently builds and publishes with no checks. A merge to `main` that bypasses PR review publishes untested code.
 
 ---
 
-## Next: Test Coverage
+## Next: Expand Test Coverage
 
-### Integration/E2E tests
-No tests verify actual API interactions, CRD application, or checker pod deployment.
+### Modules without direct unit tests
+- `kubeic_operator/metrics.py` — only tested indirectly via integration `test_metrics.py`
+- `kubeic_operator/cleanup.py` — **zero tests** (not unit, not integration)
+- `kubeic_operator/handlers/policy.py` — **zero direct tests** (only tested implicitly via integration)
+- `kubeic_checker/main.py` — **zero unit tests** (integration tests verify the deployed checker works, but the main loop logic and `_check_credential_validity` are not isolated)
 
-**Next steps:**
-- Add `tests/integration/` with tests using `kind` in CI
-- Cover: CRD install, policy creation, checker pod deployment, RBAC verification
-- Add a CI workflow step to run integration tests before build/publish
-
-### Unit tests for core modules
-`deployer.py`, `credentials.py`, and `availability.py` now have dedicated test files but coverage could be expanded:
+### Expansion areas for existing tests
 - `test_deployer.py` — env var validation warnings, annotation merge/cleanup logic
 - `test_credentials.py` — edge cases in `_decode_docker_secret`, warning log verification
 - `test_availability.py` — `write_auth_config` file permissions (verify `0o600`)
-
----
-
-## Next: CI Quality Gates
-
-The release workflow (`.github/workflows/release.yml`) builds and publishes without any automated quality checks.
-
-**Recommended additions:**
-- `ruff check` — linting
-- `pytest tests/unit/` — unit tests
-- `bandit -r kubeic_operator/ kubeic_checker/` — security-focused static analysis
-- Optionally `mypy` or `pyright` for type checking
-- Add `[tool.ruff]` config to `pyproject.toml`
 
 ---
 
@@ -82,6 +65,15 @@ When using `serviceAccountToken` auth, the checker may not need `secrets` `get` 
 
 ## Future: Polish
 
-- Audit daemon thread graceful shutdown via `threading.Event` (`kubeic_operator/main.py`)
-- Implement Kubernetes event emission or remove `events` RBAC permissions (`helm/kubeic-operator/templates/operator-rbac.yaml`)
+- Audit daemon thread graceful shutdown via `threading.Event` (`kubeic_operator/main.py`) — currently uses `while True: time.sleep()` on a daemon thread with no interruption between cycles
+- Implement Kubernetes event emission or remove unused `events` RBAC permissions (`helm/kubeic-operator/templates/operator-rbac.yaml`) — permissions exist but no code creates events
 - Add `py.typed` markers to `kubeic_operator/` and `kubeic_checker/` packages
+
+---
+
+## Completed
+
+- ~~IAP Status Subresource~~ — CRD has typed status schema (`lastReconcileTime`, `namespaces`), RBAC grants `update/patch` on status, operator writes via `patch_namespaced_custom_object_status()` from audit loop, startup, and policy handlers
+- ~~Integration/E2E tests~~ — 5 integration test files using `kind` in CI covering CRD, operator deployment, metrics, checker deployment/RBAC, and reconciliation
+- ~~Unit tests for core modules~~ — `deployer`, `credentials`, `availability`, `prerelease`, `spread`, `namespace_handler` all have dedicated test files
+- ~~CI linting and testing~~ — `ruff check` + `pytest unit/integration` running on PRs via `.github/workflows/ci.yml`
