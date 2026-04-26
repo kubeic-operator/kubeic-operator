@@ -30,3 +30,6 @@ include = ["kubeic_operator*", "kubeic_checker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+relative_files = true
