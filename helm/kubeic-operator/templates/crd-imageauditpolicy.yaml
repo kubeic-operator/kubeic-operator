@@ -20,6 +20,8 @@ spec:
     - name: v1alpha1
       served: true
       storage: true
+      subresources:
+        status: {}
       schema:
         openAPIV3Schema:
           type: object
@@ -105,6 +107,24 @@ spec:
                         - pullSecret
                         - workloadIdentity
                       default: pullSecret
+            status:
+              type: object
+              properties:
+                lastReconcileTime:
+                  type: string
+                  format: date-time
+                namespaces:
+                  type: object
+                  additionalProperties:
+                    type: object
+                    properties:
+                      deployed:
+                        type: boolean
+                      reason:
+                        type: string
+                  description: >-
+                    Per-namespace checker state. Keys are namespace names.
+                    Each value indicates whether a checker is deployed and why.
       additionalPrinterColumns:
         - name: Pre-release Max Age
           type: string
