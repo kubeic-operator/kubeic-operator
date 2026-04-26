@@ -8,6 +8,9 @@ jobs:
   lint-and-unit:
     name: Lint and Unit Tests
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v5
 
@@ -21,7 +24,13 @@ jobs:
 
       - run: bandit -r kubeic_operator/ kubeic_checker/
 
-      - run: pytest tests/unit/ -v --tb=short --cov=kubeic_operator --cov=kubeic_checker --cov-report=term-missing --cov-fail-under=70
+      - run: pytest tests/unit/ -v --tb=short --cov=kubeic_operator --cov=kubeic_checker --cov-report=term-missing --cov-report=xml --cov-fail-under=70
+
+      - name: Coverage comment
+        if: github.event_name == 'pull_request'
+        uses: py-cov-action/python-coverage-comment-action@v3
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   integration:
     name: Integration Tests (kind)
