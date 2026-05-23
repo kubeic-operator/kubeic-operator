@@ -31,9 +31,19 @@ jobs:
       - name: Create pull request
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GIT_AUTHOR_NAME: kubeic-bot
+          GIT_AUTHOR_EMAIL: kubeic-bot@users.noreply.github.com
+          GIT_COMMITTER_NAME: kubeic-bot
+          GIT_COMMITTER_EMAIL: kubeic-bot@users.noreply.github.com
         run: |
           BRANCH="sync/main-to-alpha-$(date +%Y%m%d-%H%M%S)"
           git checkout -b "$BRANCH" origin/main
+          # Force a new commit on the sync branch. Without this, the push points
+          # at main's HEAD SHA (an existing commit) and GitHub does not link
+          # check runs to the resulting PR's status rollup, so branch protection
+          # cannot enforce required checks. The empty commit gives the branch a
+          # fresh SHA that pull_request: opened can fire against and attach to.
+          git commit --allow-empty -m "chore: trigger CI"
           git push origin "$BRANCH"
           gh pr create \
             --base alpha \
