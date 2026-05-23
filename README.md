@@ -5,9 +5,9 @@
 | Name                                      |    Stmts |     Miss |   Cover |   Missing |
 |------------------------------------------ | -------: | -------: | ------: | --------: |
 | kubeic\_checker/\_\_init\_\_.py           |        0 |        0 |    100% |           |
-| kubeic\_checker/availability.py           |      113 |       12 |     89% |66-67, 78-80, 98, 106-111 |
+| kubeic\_checker/availability.py           |      114 |       12 |     89% |67-68, 79-81, 99, 107-112 |
 | kubeic\_checker/credentials.py            |       61 |        1 |     98% |        81 |
-| kubeic\_checker/main.py                   |      132 |       47 |     64% |104, 112-115, 137, 142-143, 163-164, 173-226, 230-232 |
+| kubeic\_checker/main.py                   |      139 |       54 |     61% |104, 112-115, 137, 142-143, 163-164, 173-237, 241-243 |
 | kubeic\_operator/\_\_init\_\_.py          |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/\_\_init\_\_.py   |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/prerelease.py     |       99 |        1 |     99% |       241 |
@@ -19,7 +19,7 @@
 | kubeic\_operator/handlers/policy.py       |       18 |        0 |    100% |           |
 | kubeic\_operator/main.py                  |      174 |       72 |     59% |36, 39, 42, 45, 48, 63, 66, 71-81, 85-109, 126-128, 143, 153-154, 160-161, 231, 237, 244-255, 264-278 |
 | kubeic\_operator/metrics.py               |       38 |        0 |    100% |           |
-| **TOTAL**                                 |  **891** |  **151** | **83%** |           |
+| **TOTAL**                                 |  **899** |  **158** | **82%** |           |
 
 
 ## Setup coverage badge
