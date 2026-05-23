@@ -17,6 +17,7 @@ class AvailabilityResult:
     container: str
     available: bool
     error: str | None = None
+    error_class: str = ""  # auth_failure | not_found | network | unknown
     digest_match: bool | None = None  # None when image has no pinned digest
     registry_digest: str | None = None
     pinned_digest: str | None = None
@@ -152,7 +153,7 @@ def check_availability(
             if "@" in image:
                 _, pinned_digest = image.split("@", 1)
 
-            available, error, inspect_data, _ = seen_images[image]
+            available, error, inspect_data, error_class = seen_images[image]
             registry, image_name, _ = _parse_image(image)
 
             digest_match: bool | None = None
@@ -171,6 +172,7 @@ def check_availability(
                 container=container["name"],
                 available=available,
                 error=error,
+                error_class=error_class,
                 digest_match=digest_match,
                 registry_digest=registry_digest,
                 pinned_digest=pinned_digest,
