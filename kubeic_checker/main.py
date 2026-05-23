@@ -210,6 +210,17 @@ def run_check_loop():
                         "%d/%d images unavailable in %s",
                         len(unavailable), len(results), NAMESPACE,
                     )
+                    seen_errors: set[tuple[str, str]] = set()
+                    for r in unavailable:
+                        key = (r.image, r.error_class or "unknown")
+                        if key in seen_errors:
+                            continue
+                        seen_errors.add(key)
+                        logger.warning(
+                            "Image unavailable: image=%s error_class=%s error=%s",
+                            r.image, r.error_class or "unknown",
+                            (r.error or "").strip().replace("\n", " ")[:200],
+                        )
                 if digest_mismatches:
                     for r in digest_mismatches:
                         logger.warning(
