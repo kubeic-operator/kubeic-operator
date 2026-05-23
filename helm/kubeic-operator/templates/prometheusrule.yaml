@@ -20,7 +20,7 @@ spec:
             severity: critical
           annotations:
             summary: "Image unreachable: {{`{{ $labels.image }}`}}"
-            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry."
+            description: "Pod {{`{{ $labels.exported_namespace }}`}}/{{`{{ $labels.exported_pod }}`}} container {{`{{ $labels.exported_container }}`}} image cannot be verified in the registry."
 
         - alert: PrereleaseImageRunningTooLong
           expr: kube_image_prerelease_age_days > {{ .Values.policy.prerelease.maxAgeDays }}
@@ -29,7 +29,7 @@ spec:
             severity: warning
           annotations:
             summary: "Pre-release image running {{`{{ $value }}`}}d: {{`{{ $labels.image }}`}}"
-            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} for over {{ .Values.policy.prerelease.maxAgeDays }} days."
+            description: "Pod {{`{{ $labels.exported_namespace }}`}}/{{`{{ $labels.exported_pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} for over {{ .Values.policy.prerelease.maxAgeDays }} days."
 
         - alert: ImageVersionSpreadTooHigh
           expr: kube_image_version_spread_violation == 1
@@ -47,5 +47,5 @@ spec:
             severity: critical
           annotations:
             summary: "Registry credential invalid: {{`{{ $labels.registry }}`}}"
-            description: "Credential {{`{{ $labels.secret_name }}`}} in namespace {{`{{ $labels.namespace }}`}} failed validation against {{`{{ $labels.registry }}`}}."
+            description: "Credential {{`{{ $labels.secret_name }}`}} in namespace {{`{{ $labels.exported_namespace }}`}} failed validation against {{`{{ $labels.registry }}`}}."
 {{- end }}
