@@ -189,6 +189,19 @@ class TestClassifyError:
         assert _classify_error("something unexpected happened") == "unknown"
 
 
+class TestRunSkopeoInspectCommand:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_inspect_skips_tag_list(self, mock_run):
+        # Without --no-tags skopeo paginates the repo's entire tag list for
+        # the unused RepoTags field, which times out on repos with thousands
+        # of tags and reports a false "network" unavailability.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        _run_skopeo_inspect("registry.corp.com/org/app:v1")
+        cmd = mock_run.call_args[0][0]
+        assert "--no-tags" in cmd
+        assert "docker://registry.corp.com/org/app:v1" in cmd
+
+
 class TestRunSkopeoInspectBackoff:
     @patch("kubeic_checker.availability.time.sleep")
     @patch("kubeic_checker.availability.subprocess.run")
