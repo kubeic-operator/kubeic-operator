@@ -36,6 +36,22 @@ spec:
             summary: "Image unreachable: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry ({{`{{ $labels.error_class }}`}})."
 
+        - alert: ImageDigestMismatch
+          expr: |
+            max by (cluster, namespace, pod, container, image, image_name, registry) (
+              label_replace(label_replace(label_replace(
+                kube_image_digest_match,
+                "namespace", "$1", "exported_namespace", "(.+)"),
+                "pod", "$1", "exported_pod", "(.+)"),
+                "container", "$1", "exported_container", "(.+)")
+            ) == 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pinned digest no longer matches registry: {{`{{ $labels.image }}`}}"
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} pins a digest that no longer matches what the registry serves for its tag — the tag has been re-pushed with different content."
+
         - alert: PrereleaseImageRunningTooLong
           expr: |
             max by (cluster, namespace, pod, container, image, image_name, registry, tag) (
