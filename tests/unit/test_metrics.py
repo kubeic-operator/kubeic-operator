@@ -55,6 +55,7 @@ def _make_availability_result(
     container="main",
     available=True,
     digest_match=None,
+    error_class="",
 ):
     r = MagicMock()
     r.image = image
@@ -65,6 +66,7 @@ def _make_availability_result(
     r.container = container
     r.available = available
     r.digest_match = digest_match
+    r.error_class = error_class
     return r
 
 
@@ -201,12 +203,13 @@ class TestUpdateAvailabilityMetrics:
             "namespace": r.namespace,
             "pod": r.pod,
             "container": r.container,
+            "error_class": "",
         }
         avail = REGISTRY.get_sample_value("kube_image_available", labels)
         assert avail == 1
 
     def test_unavailable_images_set_available_to_zero(self):
-        r = _make_availability_result(available=False)
+        r = _make_availability_result(available=False, error_class="not_found")
         metrics.update_availability_metrics([r])
 
         labels = {
@@ -216,6 +219,23 @@ class TestUpdateAvailabilityMetrics:
             "namespace": r.namespace,
             "pod": r.pod,
             "container": r.container,
+            "error_class": "not_found",
+        }
+        avail = REGISTRY.get_sample_value("kube_image_available", labels)
+        assert avail == 0
+
+    def test_unavailable_without_error_class_defaults_to_unknown(self):
+        r = _make_availability_result(available=False, error_class="")
+        metrics.update_availability_metrics([r])
+
+        labels = {
+            "image": r.image,
+            "registry": r.registry,
+            "image_name": r.image_name,
+            "namespace": r.namespace,
+            "pod": r.pod,
+            "container": r.container,
+            "error_class": "unknown",
         }
         avail = REGISTRY.get_sample_value("kube_image_available", labels)
         assert avail == 0

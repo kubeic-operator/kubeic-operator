@@ -22,7 +22,7 @@ spec:
         # and must stay in by() to keep alerts distinct per cluster.
         - alert: ImageUnavailableInRegistry
           expr: |
-            max by (cluster, namespace, pod, container, image, image_name, registry) (
+            max by (cluster, namespace, pod, container, image, image_name, registry, error_class) (
               label_replace(label_replace(label_replace(
                 kube_image_available,
                 "namespace", "$1", "exported_namespace", "(.+)"),
@@ -34,7 +34,7 @@ spec:
             severity: critical
           annotations:
             summary: "Image unreachable: {{`{{ $labels.image }}`}}"
-            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry."
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry ({{`{{ $labels.error_class }}`}})."
 
         - alert: PrereleaseImageRunningTooLong
           expr: |
