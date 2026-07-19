@@ -86,6 +86,59 @@ def resolve_all_credentials(
     return credentials
 
 
+def _normalize_registry_host(registry: str) -> str:
+    """Reduce a docker-config auths key or image registry to a comparable host.
+
+    Docker Hub has several historical spellings that must compare equal.
+    """
+    host = registry.removeprefix("https://").removeprefix("http://").split("/")[0]
+    if host in ("index.docker.io", "registry-1.docker.io", "docker.io", ""):
+        return "docker.io"
+    return host
+
+
+def build_image_credentials(
+    pods: list[dict],
+    creds: list[ResolvedCredential],
+) -> dict[str, list[ResolvedCredential]]:
+    """Map each image to the credentials of the pull secrets its pods reference.
+
+    Mirrors kubelet semantics: a pod's imagePullSecrets are tried in order for
+    its own images. Credentials from secrets a pod does not reference are never
+    used for that pod's images — this is what prevents one namespace-wide
+    credential from masking (or being masked by) another for the same registry
+    host when per-project deploy tokens are in play.
+    """
+    by_secret: dict[str, list[ResolvedCredential]] = {}
+    for cred in creds:
+        secret_name = cred.source.split(":")[-1]
+        by_secret.setdefault(secret_name, []).append(cred)
+
+    image_creds: dict[str, list[ResolvedCredential]] = {}
+    for pod in pods:
+        secret_names = [
+            ref.get("name", "")
+            for ref in pod.get("spec", {}).get("imagePullSecrets", [])
+            if ref.get("name")
+        ]
+        containers = list(pod.get("spec", {}).get("containers", [])) + list(
+            pod.get("spec", {}).get("initContainers", [])
+        )
+        for container in containers:
+            image = container["image"]
+            image_host = _normalize_registry_host(registry_from_image(image))
+            candidates = image_creds.setdefault(image, [])
+            for secret_name in secret_names:
+                for cred in by_secret.get(secret_name, []):
+                    if _normalize_registry_host(cred.registry) != image_host:
+                        continue
+                    if any(c.source == cred.source and c.registry == cred.registry for c in candidates):
+                        continue
+                    candidates.append(cred)
+
+    return image_creds
+
+
 def registry_from_image(image: str) -> str:
     """Extract registry hostname from an image string.
 

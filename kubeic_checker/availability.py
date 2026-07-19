@@ -1,10 +1,14 @@
 import json
+import logging
 import os
 import subprocess  # nosec B404
+import tempfile
 import time
 from dataclasses import dataclass
 
 from kubeic_operator.checks.prerelease import _parse_image
+
+logger = logging.getLogger("image-audit-checker.availability")
 
 
 @dataclass
@@ -120,6 +124,46 @@ def _run_skopeo_list_tags(
         return False, str(exc), "unknown"
 
 
+def _inspect_with_candidates(
+    ref: str, candidates: list,
+) -> tuple[bool, str | None, dict | None, str]:
+    """Inspect an image trying each candidate credential in order.
+
+    Mirrors kubelet pull behaviour: candidates are the pod's imagePullSecrets
+    for this image's registry, tried in order; only an auth failure moves on
+    to the next credential. No candidates → unauthenticated inspect.
+    """
+    if not candidates:
+        return _run_skopeo_inspect(ref)
+
+    result: tuple[bool, str | None, dict | None, str] | None = None
+    for i, cred in enumerate(candidates):
+        entry = {"auth": cred.auth} if cred.auth else {
+            "username": cred.username, "password": cred.password,
+        }
+        fd, auth_path = tempfile.mkstemp(suffix=".json", prefix="image-audit-auth-")
+        os.close(fd)
+        try:
+            write_auth_config({cred.registry: entry}, auth_path)
+            result = _run_skopeo_inspect(ref, auth_file=auth_path)
+        finally:
+            try:
+                os.unlink(auth_path)
+            except OSError:
+                pass
+        if result[3] != "auth_failure":
+            if i > 0:
+                logger.info(
+                    "Credential %s succeeded for %s after %d auth failure(s) with earlier secrets",
+                    cred.source, ref, i,
+                )
+            return result
+    logger.warning(
+        "All %d candidate credentials failed auth for %s", len(candidates), ref,
+    )
+    return result
+
+
 def _inspect_ref(image: str) -> str:
     """Choose the registry reference to inspect for an image.
 
@@ -140,6 +184,7 @@ def _inspect_ref(image: str) -> str:
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
+    image_creds: dict[str, list] | None = None,
 ) -> list[AvailabilityResult]:
     """Check image availability for all containers in the given pods.
 
@@ -149,6 +194,10 @@ def check_availability(
     Args:
         pods: List of pod dicts with metadata and spec.
         auth_file: Path to a docker config JSON file for registry auth.
+            Ignored when image_creds is provided.
+        image_creds: Map of image -> ordered ResolvedCredential candidates
+            (from build_image_credentials). Candidates are tried per image in
+            kubelet order, advancing only on auth failure.
 
     Returns:
         One AvailabilityResult per container.
@@ -163,7 +212,12 @@ def check_availability(
         for container in list(containers) + list(init_containers):
             image = container["image"]
             if image not in seen_images:
-                seen_images[image] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
+                if image_creds is not None:
+                    seen_images[image] = _inspect_with_candidates(
+                        _inspect_ref(image), image_creds.get(image, []),
+                    )
+                else:
+                    seen_images[image] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]
