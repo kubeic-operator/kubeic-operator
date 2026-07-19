@@ -115,6 +115,23 @@ def _run_skopeo_list_tags(
         return False, str(exc), "unknown"
 
 
+def _inspect_ref(image: str) -> str:
+    """Choose the registry reference to inspect for an image.
+
+    repo:tag@sha256:...  -> repo:tag   (check the tag; digest compared separately)
+    repo@sha256:...      -> unchanged  (no tag — inspect the pinned digest itself,
+                                        otherwise skopeo would default to :latest)
+    repo:tag / repo      -> unchanged
+    """
+    if "@" not in image:
+        return image
+    before_at = image.split("@", 1)[0]
+    last_colon = before_at.rfind(":")
+    if last_colon != -1 and "/" not in before_at[last_colon:]:
+        return before_at
+    return image
+
+
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
@@ -141,8 +158,7 @@ def check_availability(
         for container in list(containers) + list(init_containers):
             image = container["image"]
             if image not in seen_images:
-                inspect_image = image.split("@")[0] if "@" in image else image
-                seen_images[image] = _run_skopeo_inspect(inspect_image, auth_file)
+                seen_images[image] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]

@@ -127,6 +127,40 @@ class TestCheckAvailability:
         assert results[0].digest_match is None
 
 
+class TestInspectRefSelection:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_digest_only_ref_inspected_by_digest(self, mock_run):
+        # A digest-only ref must be inspected as-is — stripping the digest
+        # would leave a bare repo, which skopeo defaults to :latest.
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc123"}')
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://nginx@sha256:abc123" in cmd
+        assert results[0].available is True
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_tag_and_digest_ref_inspected_by_tag(self, mock_run):
+        # With both tag and digest, the tag is inspected and the digest is
+        # compared separately (kube_image_digest_match).
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc123"}')
+        pods = [_make_pod("pod-1", "default", "nginx:1.25@sha256:abc123")]
+        results = check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://nginx:1.25" in cmd
+        assert not any("@" in part for part in cmd)
+        assert results[0].digest_match is True
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_registry_port_with_digest_only(self, mock_run):
+        # The registry port colon must not be mistaken for a tag.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [_make_pod("pod-1", "default", "reg.corp.com:5000/app@sha256:abc")]
+        check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://reg.corp.com:5000/app@sha256:abc" in cmd
+
+
 class TestWriteAuthConfig:
     def test_writes_auth_from_user_pass(self, tmp_path):
         secrets = {
