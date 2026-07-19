@@ -127,6 +127,66 @@ class TestCheckAvailability:
         assert results[0].digest_match is None
 
 
+class TestCreatedPropagation:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_propagates_from_inspect(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"Digest": "sha256:abc", "Created": "2026-07-01T00:00:00.123456789Z"}',
+        )
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created == "2026-07-01T00:00:00.123456789Z"
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_none_when_unavailable(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="manifest unknown")
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created is None
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_none_when_absent_from_inspect(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc"}')
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created is None
+
+
+class TestInspectRefSelection:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_digest_only_ref_inspected_by_digest(self, mock_run):
+        # A digest-only ref must be inspected as-is — stripping the digest
+        # would leave a bare repo, which skopeo defaults to :latest.
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc123"}')
+        pods = [_make_pod("pod-1", "default", "nginx@sha256:abc123")]
+        results = check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://nginx@sha256:abc123" in cmd
+        assert results[0].available is True
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_tag_and_digest_ref_inspected_by_tag(self, mock_run):
+        # With both tag and digest, the tag is inspected and the digest is
+        # compared separately (kube_image_digest_match).
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc123"}')
+        pods = [_make_pod("pod-1", "default", "nginx:1.25@sha256:abc123")]
+        results = check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://nginx:1.25" in cmd
+        assert not any("@" in part for part in cmd)
+        assert results[0].digest_match is True
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_registry_port_with_digest_only(self, mock_run):
+        # The registry port colon must not be mistaken for a tag.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [_make_pod("pod-1", "default", "reg.corp.com:5000/app@sha256:abc")]
+        check_availability(pods)
+        cmd = mock_run.call_args[0][0]
+        assert "docker://reg.corp.com:5000/app@sha256:abc" in cmd
+
+
 class TestWriteAuthConfig:
     def test_writes_auth_from_user_pass(self, tmp_path):
         secrets = {
@@ -188,6 +248,42 @@ class TestClassifyError:
     def test_unknown_error(self):
         assert _classify_error("something unexpected happened") == "unknown"
 
+    # Real registry error strings observed in production — these guard
+    # against classifying with substrings the registries don't actually emit.
+
+    def test_gitlab_manifest_unknown_real_string(self):
+        msg = ('time="2026-07-19T06:04:32Z" level=fatal msg="Error parsing image name '
+               '\\"docker://r.example.com/engineering/app:v3.0.2-a\\": reading manifest '
+               'v3.0.2-a in r.example.com/engineering/app: manifest unknown"')
+        assert _classify_error(msg) == "not_found"
+
+    def test_gitlab_requested_access_denied(self):
+        assert _classify_error(
+            "requested access to the resource is denied"
+        ) == "auth_failure"
+
+    def test_gitlab_token_service_forbidden(self):
+        assert _classify_error("access forbidden") == "auth_failure"
+
+    def test_dockerhub_rate_limit(self):
+        assert _classify_error(
+            "toomanyrequests: You have reached your pull rate limit. "
+            "You may increase the limit by authenticating and upgrading"
+        ) == "network"
+
+
+class TestRunSkopeoInspectCommand:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_inspect_skips_tag_list(self, mock_run):
+        # Without --no-tags skopeo paginates the repo's entire tag list for
+        # the unused RepoTags field, which times out on repos with thousands
+        # of tags and reports a false "network" unavailability.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        _run_skopeo_inspect("registry.corp.com/org/app:v1")
+        cmd = mock_run.call_args[0][0]
+        assert "--no-tags" in cmd
+        assert "docker://registry.corp.com/org/app:v1" in cmd
+
 
 class TestRunSkopeoInspectBackoff:
     @patch("kubeic_checker.availability.time.sleep")
@@ -241,3 +337,62 @@ class TestRunSkopeoListTags:
         cmd = mock_run.call_args[0][0]
         url = " ".join(cmd).split("docker://")[1]
         assert "@" not in url
+
+
+class TestInspectWithCandidates:
+    def _cred(self, secret, user="u"):
+        from kubeic_checker.credentials import ResolvedCredential
+        return ResolvedCredential(
+            registry="r.corp.io", username=user, password="p",
+            source=f"pod:imagePullSecret:{secret}",
+        )
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_retries_next_credential_on_auth_failure(self, mock_run):
+        # The last-cred-wins fix: an auth failure with one secret must fall
+        # through to the next candidate, not report the image unavailable.
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stderr="requested access to the resource is denied"),
+            MagicMock(returncode=0, stdout='{"Digest": "sha256:abc"}'),
+        ]
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("wrong-scope"), self._cred("right-scope")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is True
+        assert mock_run.call_count == 2
+        auth_files = [c[0][0][c[0][0].index("--authfile") + 1] for c in mock_run.call_args_list]
+        assert auth_files[0] != auth_files[1]
+
+    @patch("kubeic_checker.availability.time.sleep")
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_non_auth_failure_does_not_try_next_credential(self, mock_run, mock_sleep):
+        # manifest unknown is a content answer, not an auth problem — trying
+        # other credentials would only mask genuine deletions. The inner
+        # skopeo retry loop still runs (3 attempts), but all with the FIRST
+        # credential's auth file; the second candidate is never used.
+        mock_run.return_value = MagicMock(returncode=1, stderr="manifest unknown")
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is False
+        assert results[0].error_class == "not_found"
+        auth_files = {c[0][0][c[0][0].index("--authfile") + 1] for c in mock_run.call_args_list}
+        assert len(auth_files) == 1
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_all_candidates_auth_fail(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="unauthorized: authentication required")
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is False
+        assert results[0].error_class == "auth_failure"
+        assert mock_run.call_count == 2
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_no_candidates_inspects_unauthenticated(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [_make_pod("pod-1", "default", "quay.io/org/app:v1")]
+        results = check_availability(pods, image_creds={"quay.io/org/app:v1": []})
+        assert results[0].available is True
+        assert "--authfile" not in mock_run.call_args[0][0]

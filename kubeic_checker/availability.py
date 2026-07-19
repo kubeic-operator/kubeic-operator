@@ -1,10 +1,14 @@
 import json
+import logging
 import os
 import subprocess  # nosec B404
+import tempfile
 import time
 from dataclasses import dataclass
 
 from kubeic_operator.checks.prerelease import _parse_image
+
+logger = logging.getLogger("image-audit-checker.availability")
 
 
 @dataclass
@@ -21,16 +25,21 @@ class AvailabilityResult:
     digest_match: bool | None = None  # None when image has no pinned digest
     registry_digest: str | None = None
     pinned_digest: str | None = None
+    created: str | None = None  # image publication timestamp (registry Created field)
 
 
 def _classify_error(stderr: str | None, returncode: int | None = None) -> str:
     """Classify a skopeo error into auth_failure, not_found, or network."""
     msg = (stderr or "").lower()
-    if any(s in msg for s in ("unauthorized", "authentication required", "access denied", "401", "403")):
+    # "denied" catches GitLab's "requested access to the resource is denied"
+    # and the registry token service's "access forbidden".
+    if any(s in msg for s in ("unauthorized", "authentication required", "denied", "forbidden", "401", "403")):
         return "auth_failure"
     if any(s in msg for s in ("not found", "manifest unknown", "unknown blob", "404")):
         return "not_found"
-    if any(s in msg for s in ("timed out", "timeout", "connection refused", "i/o timeout", "no route to host", "no such host")):
+    # Rate limiting is transient registry-side pushback, grouped with network
+    # so it routes as retryable infra rather than a content problem.
+    if any(s in msg for s in ("timed out", "timeout", "connection refused", "i/o timeout", "no route to host", "no such host", "toomanyrequests", "too many requests", "429")):
         return "network"
     return "unknown"
 
@@ -46,7 +55,10 @@ def _run_skopeo_inspect(
     if backoff_delays is None:
         backoff_delays = [0, 10, 30]
 
-    cmd = ["skopeo", "inspect", "--retry-times", "2", f"docker://{image}"]
+    # --no-tags: without it skopeo paginates the repo's full tag list, which
+    # exceeds the 30s timeout on repos with thousands of tags (kyverno,
+    # gitlab-org) and surfaces as a false "network" unavailability.
+    cmd = ["skopeo", "inspect", "--no-tags", "--retry-times", "2", f"docker://{image}"]
 
     if auth_file:
         cmd.extend(["--authfile", auth_file])
@@ -112,9 +124,67 @@ def _run_skopeo_list_tags(
         return False, str(exc), "unknown"
 
 
+def _inspect_with_candidates(
+    ref: str, candidates: list,
+) -> tuple[bool, str | None, dict | None, str]:
+    """Inspect an image trying each candidate credential in order.
+
+    Mirrors kubelet pull behaviour: candidates are the pod's imagePullSecrets
+    for this image's registry, tried in order; only an auth failure moves on
+    to the next credential. No candidates → unauthenticated inspect.
+    """
+    if not candidates:
+        return _run_skopeo_inspect(ref)
+
+    result: tuple[bool, str | None, dict | None, str] | None = None
+    for i, cred in enumerate(candidates):
+        entry = {"auth": cred.auth} if cred.auth else {
+            "username": cred.username, "password": cred.password,
+        }
+        fd, auth_path = tempfile.mkstemp(suffix=".json", prefix="image-audit-auth-")
+        os.close(fd)
+        try:
+            write_auth_config({cred.registry: entry}, auth_path)
+            result = _run_skopeo_inspect(ref, auth_file=auth_path)
+        finally:
+            try:
+                os.unlink(auth_path)
+            except OSError:
+                pass
+        if result[3] != "auth_failure":
+            if i > 0:
+                logger.info(
+                    "Credential %s succeeded for %s after %d auth failure(s) with earlier secrets",
+                    cred.source, ref, i,
+                )
+            return result
+    logger.warning(
+        "All %d candidate credentials failed auth for %s", len(candidates), ref,
+    )
+    return result
+
+
+def _inspect_ref(image: str) -> str:
+    """Choose the registry reference to inspect for an image.
+
+    repo:tag@sha256:...  -> repo:tag   (check the tag; digest compared separately)
+    repo@sha256:...      -> unchanged  (no tag — inspect the pinned digest itself,
+                                        otherwise skopeo would default to :latest)
+    repo:tag / repo      -> unchanged
+    """
+    if "@" not in image:
+        return image
+    before_at = image.split("@", 1)[0]
+    last_colon = before_at.rfind(":")
+    if last_colon != -1 and "/" not in before_at[last_colon:]:
+        return before_at
+    return image
+
+
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
+    image_creds: dict[str, list] | None = None,
 ) -> list[AvailabilityResult]:
     """Check image availability for all containers in the given pods.
 
@@ -124,6 +194,10 @@ def check_availability(
     Args:
         pods: List of pod dicts with metadata and spec.
         auth_file: Path to a docker config JSON file for registry auth.
+            Ignored when image_creds is provided.
+        image_creds: Map of image -> ordered ResolvedCredential candidates
+            (from build_image_credentials). Candidates are tried per image in
+            kubelet order, advancing only on auth failure.
 
     Returns:
         One AvailabilityResult per container.
@@ -138,8 +212,12 @@ def check_availability(
         for container in list(containers) + list(init_containers):
             image = container["image"]
             if image not in seen_images:
-                inspect_image = image.split("@")[0] if "@" in image else image
-                seen_images[image] = _run_skopeo_inspect(inspect_image, auth_file)
+                if image_creds is not None:
+                    seen_images[image] = _inspect_with_candidates(
+                        _inspect_ref(image), image_creds.get(image, []),
+                    )
+                else:
+                    seen_images[image] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]
@@ -163,6 +241,8 @@ def check_availability(
                 if registry_digest:
                     digest_match = registry_digest == pinned_digest
 
+            created = inspect_data.get("Created") if available and inspect_data else None
+
             results.append(AvailabilityResult(
                 image=image,
                 registry=registry,
@@ -176,6 +256,7 @@ def check_availability(
                 digest_match=digest_match,
                 registry_digest=registry_digest,
                 pinned_digest=pinned_digest,
+                created=created,
             ))
 
     return results

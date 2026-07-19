@@ -194,6 +194,41 @@ class TestRunClusterAudit:
     @patch("kubeic_operator.main.check_prerelease", return_value=[])
     @patch("kubeic_operator.main._get_default_policy", return_value={})
     @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_terminated_pods_excluded_from_cluster_audit(self, mock_core_cls, mock_policy,
+                                                          mock_prerelease, mock_filter,
+                                                          mock_spread, mock_pre_metrics,
+                                                          mock_spread_metrics):
+        # Lingering Succeeded/Failed pods (dead CI job pods) must not feed
+        # prerelease/spread checks — nothing is running their images.
+        def pod(name, phase):
+            p = MagicMock()
+            p.metadata.name = name
+            p.metadata.namespace = "default"
+            p.metadata.creation_timestamp = None
+            p.metadata.annotations = {}
+            p.status.start_time = None
+            p.status.phase = phase
+            p.spec.containers = []
+            p.spec.init_containers = []
+            return p
+
+        mock_core_cls.return_value.list_pod_for_all_namespaces.return_value.items = [
+            pod("running", "Running"), pod("done", "Succeeded"), pod("dead", "Failed"),
+        ]
+
+        from kubeic_operator.main import _run_cluster_audit
+        _run_cluster_audit()
+
+        audited = [p["metadata"]["name"] for p in mock_prerelease.call_args[0][0]]
+        assert audited == ["running"]
+
+    @patch("kubeic_operator.main.update_spread_metrics")
+    @patch("kubeic_operator.main.update_prerelease_metrics")
+    @patch("kubeic_operator.main.aggregate_version_spread", return_value=[])
+    @patch("kubeic_operator.main.filter_violations", return_value=[])
+    @patch("kubeic_operator.main.check_prerelease", return_value=[])
+    @patch("kubeic_operator.main._get_default_policy", return_value={})
+    @patch("kubeic_operator.main.client.CoreV1Api")
     def test_handles_api_failure_gracefully(self, mock_core_cls, mock_policy,
                                              mock_prerelease, mock_filter,
                                              mock_spread, mock_pre_metrics,

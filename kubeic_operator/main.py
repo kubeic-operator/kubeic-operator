@@ -202,6 +202,11 @@ def _run_cluster_audit() -> None:
 
     pod_list = []
     for pod in pods.items:
+        # Terminated pods (Succeeded/Failed) never pull again and lingering
+        # ones (e.g. dead CI job pods) skew prerelease/spread with images
+        # nothing is running.
+        if pod.status.phase in ("Succeeded", "Failed"):
+            continue
         pod_list.append({
             "metadata": {
                 "name": pod.metadata.name,

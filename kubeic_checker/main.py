@@ -7,7 +7,9 @@ from kubernetes import client, config
 from prometheus_client import start_http_server
 
 from kubeic_checker.availability import check_availability, write_auth_config
-from kubeic_checker.credentials import resolve_all_credentials, ResolvedCredential
+from kubeic_checker.credentials import (
+    resolve_all_credentials, build_image_credentials, ResolvedCredential,
+)
 from kubeic_operator.metrics import update_availability_metrics, kube_image_credential_valid
 from kubeic_operator.checks.prerelease import should_skip
 
@@ -31,6 +33,12 @@ def _get_pods(namespace: str) -> list[dict]:
 
     result = []
     for pod in pods.items:
+        # Terminated pods never pull their image again; auditing them makes
+        # no availability claim worth alerting on — and CI job pods carry
+        # ephemeral pull secrets whose tokens die with the job, so checking
+        # a Failed job pod produces a guaranteed-false auth_failure.
+        if pod.status.phase in ("Succeeded", "Failed"):
+            continue
         result.append({
             "metadata": {"name": pod.metadata.name, "namespace": namespace, "annotations": pod.metadata.annotations or {}},
             "spec": {
@@ -40,30 +48,6 @@ def _get_pods(namespace: str) -> list[dict]:
             },
         })
     return result
-
-
-def _build_auth_file(creds: list[ResolvedCredential]) -> str | None:
-    """Build a Docker auth config file from resolved credentials."""
-    all_creds: dict[str, dict] = {}
-    for cred in creds:
-        # Normalize registry to hostname only — skopeo matches by hostname,
-        # but docker configs from GitLab/GHCR may include paths (e.g. ghcr.io/org).
-        host = cred.registry.split("/")[0]
-        all_creds[host] = {
-            k: v for k, v in {
-                "username": cred.username,
-                "password": cred.password,
-                "auth": cred.auth,
-            }.items() if v is not None
-        }
-
-    if not all_creds:
-        return None
-
-    fd, path = tempfile.mkstemp(suffix=".json", prefix="image-audit-auth-")
-    os.close(fd)
-    write_auth_config(all_creds, path)
-    return path
 
 
 def _check_credential_validity(
@@ -191,15 +175,12 @@ def run_check_loop():
                     auditable_pods = pods
 
                 creds = resolve_all_credentials(auditable_pods, secrets_client, CREDENTIAL_SOURCE)
-                auth_file = _build_auth_file(creds)
-                try:
-                    results = check_availability(auditable_pods, auth_file=auth_file)
-                finally:
-                    if auth_file:
-                        try:
-                            os.unlink(auth_file)
-                        except OSError:
-                            pass
+                # Per-image credential candidates (kubelet semantics): each
+                # image is checked with the pull secrets its own pods reference,
+                # tried in order on auth failure — never a single merged
+                # last-wins credential per registry host.
+                image_creds = build_image_credentials(auditable_pods, creds)
+                results = check_availability(auditable_pods, image_creds=image_creds)
                 update_availability_metrics(results)
                 _check_credential_validity(creds, NAMESPACE, auditable_pods)
 
