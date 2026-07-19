@@ -5,9 +5,9 @@
 | Name                                      |    Stmts |     Miss |   Cover |   Missing |
 |------------------------------------------ | -------: | -------: | ------: | --------: |
 | kubeic\_checker/\_\_init\_\_.py           |        0 |        0 |    100% |           |
-| kubeic\_checker/availability.py           |      114 |       12 |     89% |67-68, 79-81, 99, 107-112 |
-| kubeic\_checker/credentials.py            |       61 |        1 |     98% |        81 |
-| kubeic\_checker/main.py                   |      139 |       54 |     61% |104, 112-115, 137, 142-143, 163-164, 173-237, 241-243 |
+| kubeic\_checker/availability.py           |      149 |       13 |     91% |79-80, 91-93, 119-124, 152-153 |
+| kubeic\_checker/credentials.py            |       87 |        1 |     99% |        81 |
+| kubeic\_checker/main.py                   |      124 |        7 |     94% |147-148, 206-207, 222-224 |
 | kubeic\_operator/\_\_init\_\_.py          |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/\_\_init\_\_.py   |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/prerelease.py     |       99 |        1 |     99% |       241 |
@@ -17,9 +17,9 @@
 | kubeic\_operator/handlers/\_\_init\_\_.py |        0 |        0 |    100% |           |
 | kubeic\_operator/handlers/namespace.py    |       56 |        1 |     98% |        43 |
 | kubeic\_operator/handlers/policy.py       |       18 |        0 |    100% |           |
-| kubeic\_operator/main.py                  |      174 |       72 |     59% |36, 39, 42, 45, 48, 63, 66, 71-81, 85-109, 126-128, 143, 153-154, 160-161, 231, 237, 244-255, 264-278 |
-| kubeic\_operator/metrics.py               |       38 |        0 |    100% |           |
-| **TOTAL**                                 |  **899** |  **158** | **82%** |           |
+| kubeic\_operator/main.py                  |      176 |       72 |     59% |36, 39, 42, 45, 48, 63, 66, 71-81, 85-109, 126-128, 143, 153-154, 160-161, 236, 242, 249-260, 269-283 |
+| kubeic\_operator/metrics.py               |       55 |        0 |    100% |           |
+| **TOTAL**                                 |  **964** |  **112** | **88%** |           |
 
 
 ## Setup coverage badge
