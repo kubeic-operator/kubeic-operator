@@ -46,7 +46,10 @@ def _run_skopeo_inspect(
     if backoff_delays is None:
         backoff_delays = [0, 10, 30]
 
-    cmd = ["skopeo", "inspect", "--retry-times", "2", f"docker://{image}"]
+    # --no-tags: without it skopeo paginates the repo's full tag list, which
+    # exceeds the 30s timeout on repos with thousands of tags (kyverno,
+    # gitlab-org) and surfaces as a false "network" unavailability.
+    cmd = ["skopeo", "inspect", "--no-tags", "--retry-times", "2", f"docker://{image}"]
 
     if auth_file:
         cmd.extend(["--authfile", auth_file])
