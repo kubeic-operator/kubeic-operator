@@ -33,6 +33,12 @@ def _get_pods(namespace: str) -> list[dict]:
 
     result = []
     for pod in pods.items:
+        # Terminated pods never pull their image again; auditing them makes
+        # no availability claim worth alerting on — and CI job pods carry
+        # ephemeral pull secrets whose tokens die with the job, so checking
+        # a Failed job pod produces a guaranteed-false auth_failure.
+        if pod.status.phase in ("Succeeded", "Failed"):
+            continue
         result.append({
             "metadata": {"name": pod.metadata.name, "namespace": namespace, "annotations": pod.metadata.annotations or {}},
             "spec": {

@@ -9,6 +9,7 @@ def _make_mock_pod(
     containers=None,
     init_containers=None,
     image_pull_secrets=None,
+    phase="Running",
 ):
     """Build a MagicMock that looks like a kubernetes client V1Pod."""
     if containers is None:
@@ -21,6 +22,7 @@ def _make_mock_pod(
     pod = MagicMock()
     pod.metadata.name = name
     pod.metadata.annotations = annotations
+    pod.status.phase = phase
 
     mock_containers = []
     for c in containers:
@@ -546,3 +548,71 @@ class TestCycleLogging:
         with caplog.at_level(_logging.INFO):
             self._cycle(pods, registry)
         assert any("All 1 images available" in r.message for r in caplog.records)
+
+
+class TestTerminatedPodsExcluded:
+    @patch("kubeic_checker.main.client")
+    def test_get_pods_skips_succeeded_and_failed(self, mock_client_module):
+        pods = [
+            _make_mock_pod(name="running", phase="Running",
+                           containers=[{"name": "c", "image": "img:1"}]),
+            _make_mock_pod(name="pending", phase="Pending",
+                           containers=[{"name": "c", "image": "img:1"}]),
+            _make_mock_pod(name="done", phase="Succeeded",
+                           containers=[{"name": "c", "image": "img:1"}]),
+            _make_mock_pod(name="dead", phase="Failed",
+                           containers=[{"name": "c", "image": "img:1"}]),
+        ]
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.return_value.items = pods
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("ns")
+        names = [p["metadata"]["name"] for p in result]
+        assert names == ["running", "pending"]
+
+    def test_failed_job_pod_with_dead_token_produces_no_false_alert(self):
+        # The production shape behind JSM #64116 one layer deeper than the
+        # merged-auth-file bug: a Failed CI job pod lingers with an ephemeral
+        # pull secret whose job token expired. Auditing it yields a
+        # guaranteed auth_failure for an image nothing will ever re-pull.
+        from kubeic_operator import metrics
+        metrics.kube_image_available.clear()
+        metrics.kube_image_credential_valid.clear()
+        try:
+            registry = _FakeRegistry({}, public_repos={"docker://r.corp.io/org/live:v1"})
+            dead = _make_mock_pod(
+                name="runner-job-dead", phase="Failed",
+                containers=[{"name": "build", "image": "r.corp.io/devops/ci-images:v1"}],
+                image_pull_secrets=[{"name": "runner-ephemeral"}],
+            )
+            live = _make_mock_pod(
+                name="live", phase="Running",
+                containers=[{"name": "main", "image": "r.corp.io/org/live:v1"}],
+            )
+            mock_v1 = MagicMock()
+            mock_v1.list_namespaced_pod.return_value.items = [dead, live]
+            # the ephemeral secret is gone/expired — reading it would fail
+            mock_v1.read_namespaced_secret.side_effect = RuntimeError("secret deleted with job")
+            with patch("kubeic_checker.main.config"), \
+                 patch("kubeic_checker.main.client") as mock_client, \
+                 patch("kubeic_checker.main.NAMESPACE", "testns"), \
+                 patch("kubeic_checker.availability.subprocess.run", side_effect=registry):
+                mock_client.CoreV1Api.return_value = mock_v1
+                _run_one_cycle()
+
+            refs = [r for r, _ in registry.inspect_calls]
+            assert refs == ["docker://r.corp.io/org/live:v1"]
+            # the dead pod's secret was never even read
+            mock_v1.read_namespaced_secret.assert_not_called()
+            from prometheus_client import REGISTRY
+            for ec in ("auth_failure", "not_found", "network", "unknown"):
+                v = REGISTRY.get_sample_value("kube_image_available", {
+                    "image": "r.corp.io/devops/ci-images:v1", "registry": "r.corp.io",
+                    "image_name": "devops/ci-images", "namespace": "testns",
+                    "pod": "runner-job-dead", "container": "build", "error_class": ec,
+                })
+                assert v is None
+        finally:
+            metrics.kube_image_available.clear()
+            metrics.kube_image_credential_valid.clear()
