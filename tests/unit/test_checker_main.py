@@ -2,7 +2,7 @@ import json
 import os
 from unittest.mock import MagicMock, patch
 
-from kubeic_checker.main import _get_pods, _build_auth_file, _check_credential_validity
+from kubeic_checker.main import _get_pods, _check_credential_validity
 
 
 def _make_mock_pod(
@@ -132,122 +132,6 @@ class TestGetPods:
         result = _get_pods("ns")
 
         assert result[0]["metadata"]["annotations"] == {}
-
-
-class TestBuildAuthFile:
-    def test_returns_none_for_empty_creds(self):
-        result = _build_auth_file([])
-        assert result is None
-
-    def test_creates_temp_file_with_username_password(self):
-        cred = MagicMock()
-        cred.registry = "registry.example.com"
-        cred.username = "myuser"
-        cred.password = "mypassword"
-        cred.auth = None
-
-        path = _build_auth_file([cred])
-        assert path is not None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            assert "auths" in data
-            assert "registry.example.com" in data["auths"]
-            entry = data["auths"]["registry.example.com"]
-            assert "auth" in entry
-            import base64
-            decoded = base64.b64decode(entry["auth"]).decode()
-            assert decoded == "myuser:mypassword"
-        finally:
-            os.unlink(path)
-
-    def test_creates_temp_file_with_base64_auth(self):
-        import base64
-
-        auth_token = base64.b64encode(b"admin:s3cret").decode()
-        cred = MagicMock()
-        cred.registry = "quay.io"
-        cred.username = None
-        cred.password = None
-        cred.auth = auth_token
-
-        path = _build_auth_file([cred])
-        assert path is not None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            assert "auths" in data
-            assert "quay.io" in data["auths"]
-            assert data["auths"]["quay.io"]["auth"] == auth_token
-        finally:
-            os.unlink(path)
-
-    def test_normalizes_registry_with_path_to_hostname(self):
-        cred = MagicMock()
-        cred.registry = "ghcr.io/myorg"
-        cred.username = "user"
-        cred.password = "pass"
-        cred.auth = None
-
-        path = _build_auth_file([cred])
-        assert path is not None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            assert "auths" in data
-            assert "ghcr.io" in data["auths"]
-            assert "ghcr.io/myorg" not in data["auths"]
-        finally:
-            os.unlink(path)
-
-    def test_multiple_creds_produce_multiple_entries(self):
-        cred1 = MagicMock()
-        cred1.registry = "r1.io"
-        cred1.username = "u1"
-        cred1.password = "p1"
-        cred1.auth = None
-
-        cred2 = MagicMock()
-        cred2.registry = "r2.io"
-        cred2.username = None
-        cred2.password = None
-        cred2.auth = "dG9rZW4="
-
-        path = _build_auth_file([cred1, cred2])
-        assert path is not None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            assert "r1.io" in data["auths"]
-            assert "r2.io" in data["auths"]
-        finally:
-            os.unlink(path)
-
-    def test_includes_only_non_none_fields_in_cred_dict(self):
-        """When auth is set but username/password are None, only auth is passed through."""
-        import base64
-
-        auth_token = base64.b64encode(b"user:pass").decode()
-        cred = MagicMock()
-        cred.registry = "r.io"
-        cred.username = None
-        cred.password = None
-        cred.auth = auth_token
-
-        path = _build_auth_file([cred])
-        assert path is not None
-
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            # write_auth_config should use the auth field directly
-            assert data["auths"]["r.io"]["auth"] == auth_token
-        finally:
-            os.unlink(path)
 
 
 class TestCheckCredentialValidity:

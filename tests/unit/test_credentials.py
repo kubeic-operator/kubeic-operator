@@ -153,3 +153,77 @@ class TestRegistryFromImage:
 
     def test_registry_with_port(self):
         assert registry_from_image("myregistry.corp.com:5000/app") == "myregistry.corp.com:5000"
+
+
+class TestBuildImageCredentials:
+    def _cred(self, registry, secret, user="u"):
+        from kubeic_checker.credentials import ResolvedCredential
+        return ResolvedCredential(
+            registry=registry, username=user, password="p",
+            source=f"pod:imagePullSecret:{secret}",
+        )
+
+    def _pod(self, image, secrets):
+        return {
+            "metadata": {"name": "pod-1", "namespace": "default"},
+            "spec": {
+                "containers": [{"name": "main", "image": image}],
+                "imagePullSecrets": [{"name": s} for s in secrets],
+            },
+        }
+
+    def test_candidates_follow_pod_secret_order(self):
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [
+            self._cred("r.corp.io", "secret-b", user="b"),
+            self._cred("r.corp.io", "secret-a", user="a"),
+        ]
+        pods = [self._pod("r.corp.io/org/app:v1", ["secret-a", "secret-b"])]
+        result = build_image_credentials(pods, creds)
+        users = [c.username for c in result["r.corp.io/org/app:v1"]]
+        assert users == ["a", "b"]  # pod's imagePullSecrets order, not resolve order
+
+    def test_unreferenced_secret_not_used(self):
+        # The core of the last-cred-wins fix: a secret no pod references must
+        # never be a candidate for that pod's images.
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [
+            self._cred("r.corp.io", "referenced"),
+            self._cred("r.corp.io", "unreferenced"),
+        ]
+        pods = [self._pod("r.corp.io/org/app:v1", ["referenced"])]
+        result = build_image_credentials(pods, creds)
+        sources = [c.source for c in result["r.corp.io/org/app:v1"]]
+        assert sources == ["pod:imagePullSecret:referenced"]
+
+    def test_other_registry_not_matched(self):
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [self._cred("ghcr.io", "secret-a")]
+        pods = [self._pod("r.corp.io/org/app:v1", ["secret-a"])]
+        result = build_image_credentials(pods, creds)
+        assert result["r.corp.io/org/app:v1"] == []
+
+    def test_docker_hub_spellings_match(self):
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [self._cred("https://index.docker.io/v1/", "hub-secret")]
+        pods = [self._pod("nginx:1.25", ["hub-secret"])]
+        result = build_image_credentials(pods, creds)
+        assert len(result["nginx:1.25"]) == 1
+
+    def test_dedupes_across_pods(self):
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [self._cred("r.corp.io", "secret-a")]
+        pods = [
+            self._pod("r.corp.io/org/app:v1", ["secret-a"]),
+            self._pod("r.corp.io/org/app:v1", ["secret-a"]),
+        ]
+        result = build_image_credentials(pods, creds)
+        assert len(result["r.corp.io/org/app:v1"]) == 1
+
+    def test_init_containers_included(self):
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [self._cred("r.corp.io", "secret-a")]
+        pod = self._pod("r.corp.io/org/app:v1", ["secret-a"])
+        pod["spec"]["initContainers"] = [{"name": "init", "image": "r.corp.io/org/init:v1"}]
+        result = build_image_credentials([pod], creds)
+        assert len(result["r.corp.io/org/init:v1"]) == 1

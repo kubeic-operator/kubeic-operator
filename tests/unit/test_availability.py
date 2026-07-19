@@ -337,3 +337,62 @@ class TestRunSkopeoListTags:
         cmd = mock_run.call_args[0][0]
         url = " ".join(cmd).split("docker://")[1]
         assert "@" not in url
+
+
+class TestInspectWithCandidates:
+    def _cred(self, secret, user="u"):
+        from kubeic_checker.credentials import ResolvedCredential
+        return ResolvedCredential(
+            registry="r.corp.io", username=user, password="p",
+            source=f"pod:imagePullSecret:{secret}",
+        )
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_retries_next_credential_on_auth_failure(self, mock_run):
+        # The last-cred-wins fix: an auth failure with one secret must fall
+        # through to the next candidate, not report the image unavailable.
+        mock_run.side_effect = [
+            MagicMock(returncode=1, stderr="requested access to the resource is denied"),
+            MagicMock(returncode=0, stdout='{"Digest": "sha256:abc"}'),
+        ]
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("wrong-scope"), self._cred("right-scope")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is True
+        assert mock_run.call_count == 2
+        auth_files = [c[0][0][c[0][0].index("--authfile") + 1] for c in mock_run.call_args_list]
+        assert auth_files[0] != auth_files[1]
+
+    @patch("kubeic_checker.availability.time.sleep")
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_non_auth_failure_does_not_try_next_credential(self, mock_run, mock_sleep):
+        # manifest unknown is a content answer, not an auth problem — trying
+        # other credentials would only mask genuine deletions. The inner
+        # skopeo retry loop still runs (3 attempts), but all with the FIRST
+        # credential's auth file; the second candidate is never used.
+        mock_run.return_value = MagicMock(returncode=1, stderr="manifest unknown")
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is False
+        assert results[0].error_class == "not_found"
+        auth_files = {c[0][0][c[0][0].index("--authfile") + 1] for c in mock_run.call_args_list}
+        assert len(auth_files) == 1
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_all_candidates_auth_fail(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="unauthorized: authentication required")
+        pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
+        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        results = check_availability(pods, image_creds=image_creds)
+        assert results[0].available is False
+        assert results[0].error_class == "auth_failure"
+        assert mock_run.call_count == 2
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_no_candidates_inspects_unauthenticated(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [_make_pod("pod-1", "default", "quay.io/org/app:v1")]
+        results = check_availability(pods, image_creds={"quay.io/org/app:v1": []})
+        assert results[0].available is True
+        assert "--authfile" not in mock_run.call_args[0][0]
