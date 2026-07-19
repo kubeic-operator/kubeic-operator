@@ -21,6 +21,7 @@ class AvailabilityResult:
     digest_match: bool | None = None  # None when image has no pinned digest
     registry_digest: str | None = None
     pinned_digest: str | None = None
+    created: str | None = None  # image publication timestamp (registry Created field)
 
 
 def _classify_error(stderr: str | None, returncode: int | None = None) -> str:
@@ -186,6 +187,8 @@ def check_availability(
                 if registry_digest:
                     digest_match = registry_digest == pinned_digest
 
+            created = inspect_data.get("Created") if available and inspect_data else None
+
             results.append(AvailabilityResult(
                 image=image,
                 registry=registry,
@@ -199,6 +202,7 @@ def check_availability(
                 digest_match=digest_match,
                 registry_digest=registry_digest,
                 pinned_digest=pinned_digest,
+                created=created,
             ))
 
     return results

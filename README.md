@@ -149,8 +149,9 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `kube_image_available` | Gauge | image, registry, image_name, namespace, pod, container |
+| `kube_image_available` | Gauge | image, registry, image_name, namespace, pod, container, error_class |
 | `kube_image_digest_match` | Gauge | image, registry, image_name, namespace, pod, container |
+| `kube_image_created_timestamp_seconds` | Gauge | image, registry, image_name, namespace, pod, container |
 | `kube_image_credential_valid` | Gauge | registry, namespace, secret_name |
 
 ## Alert rules
