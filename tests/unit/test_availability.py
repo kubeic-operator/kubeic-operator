@@ -222,6 +222,29 @@ class TestClassifyError:
     def test_unknown_error(self):
         assert _classify_error("something unexpected happened") == "unknown"
 
+    # Real registry error strings observed in production — these guard
+    # against classifying with substrings the registries don't actually emit.
+
+    def test_gitlab_manifest_unknown_real_string(self):
+        msg = ('time="2026-07-19T06:04:32Z" level=fatal msg="Error parsing image name '
+               '\\"docker://r.example.com/engineering/app:v3.0.2-a\\": reading manifest '
+               'v3.0.2-a in r.example.com/engineering/app: manifest unknown"')
+        assert _classify_error(msg) == "not_found"
+
+    def test_gitlab_requested_access_denied(self):
+        assert _classify_error(
+            "requested access to the resource is denied"
+        ) == "auth_failure"
+
+    def test_gitlab_token_service_forbidden(self):
+        assert _classify_error("access forbidden") == "auth_failure"
+
+    def test_dockerhub_rate_limit(self):
+        assert _classify_error(
+            "toomanyrequests: You have reached your pull rate limit. "
+            "You may increase the limit by authenticating and upgrading"
+        ) == "network"
+
 
 class TestRunSkopeoInspectCommand:
     @patch("kubeic_checker.availability.subprocess.run")

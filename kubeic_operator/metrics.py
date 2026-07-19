@@ -43,7 +43,7 @@ kube_image_version_spread_violation = Gauge(
 kube_image_available = Gauge(
     "kube_image_available",
     "Whether the image is reachable in the registry (0 or 1)",
-    ["image", "registry", "image_name", "namespace", "pod", "container"],
+    ["image", "registry", "image_name", "namespace", "pod", "container", "error_class"],
 )
 
 kube_image_credential_valid = Gauge(
@@ -127,9 +127,13 @@ def update_availability_metrics(results: list) -> None:
 
     for r in results:
         value = 1 if r.available else 0
+        # error_class is empty for available images; for unavailable images it
+        # is auth_failure | not_found | network | unknown, so alerts can route
+        # registry-content problems separately from checker-side infra noise.
         kube_image_available.labels(
             image=r.image, registry=r.registry, image_name=r.image_name,
             namespace=r.namespace, pod=r.pod, container=r.container,
+            error_class="" if r.available else (getattr(r, "error_class", "") or "unknown"),
         ).set(value)
 
         if r.digest_match is not None:

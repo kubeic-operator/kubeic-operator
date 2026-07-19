@@ -26,11 +26,15 @@ class AvailabilityResult:
 def _classify_error(stderr: str | None, returncode: int | None = None) -> str:
     """Classify a skopeo error into auth_failure, not_found, or network."""
     msg = (stderr or "").lower()
-    if any(s in msg for s in ("unauthorized", "authentication required", "access denied", "401", "403")):
+    # "denied" catches GitLab's "requested access to the resource is denied"
+    # and the registry token service's "access forbidden".
+    if any(s in msg for s in ("unauthorized", "authentication required", "denied", "forbidden", "401", "403")):
         return "auth_failure"
     if any(s in msg for s in ("not found", "manifest unknown", "unknown blob", "404")):
         return "not_found"
-    if any(s in msg for s in ("timed out", "timeout", "connection refused", "i/o timeout", "no route to host", "no such host")):
+    # Rate limiting is transient registry-side pushback, grouped with network
+    # so it routes as retryable infra rather than a content problem.
+    if any(s in msg for s in ("timed out", "timeout", "connection refused", "i/o timeout", "no route to host", "no such host", "toomanyrequests", "too many requests", "429")):
         return "network"
     return "unknown"
 
