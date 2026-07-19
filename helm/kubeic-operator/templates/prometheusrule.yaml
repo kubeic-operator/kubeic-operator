@@ -52,21 +52,38 @@ spec:
             summary: "Pinned digest no longer matches registry: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} pins a digest that no longer matches what the registry serves for its tag — the tag has been re-pushed with different content."
 
+        # Age is the image's registry publication timestamp (from the checker's
+        # skopeo inspect), joined against the operator's prerelease flag — pod
+        # restarts do not reset the clock, and a fresh image on an old pod does
+        # not fire. Images with no usable Created (inspect failed, or a
+        # reproducible-build placeholder date) produce no series and no alert;
+        # deleted tags surface via ImageUnavailableInRegistry instead.
         - alert: PrereleaseImageRunningTooLong
           expr: |
-            max by (cluster, namespace, pod, container, image, image_name, registry, tag) (
-              label_replace(label_replace(label_replace(
-                kube_image_prerelease_age_days,
-                "namespace", "$1", "exported_namespace", "(.+)"),
-                "pod", "$1", "exported_pod", "(.+)"),
-                "container", "$1", "exported_container", "(.+)")
+            (
+              max by (cluster, namespace, pod, container, image, image_name, registry) (
+                (time() - label_replace(label_replace(label_replace(
+                  kube_image_created_timestamp_seconds,
+                  "namespace", "$1", "exported_namespace", "(.+)"),
+                  "pod", "$1", "exported_pod", "(.+)"),
+                  "container", "$1", "exported_container", "(.+)")) / 86400
+              )
+              * on (cluster, namespace, pod, container, image) group_left(tag)
+              max by (cluster, namespace, pod, container, image, tag) (
+                label_replace(label_replace(label_replace(
+                  kube_image_is_prerelease,
+                  "namespace", "$1", "exported_namespace", "(.+)"),
+                  "pod", "$1", "exported_pod", "(.+)"),
+                  "container", "$1", "exported_container", "(.+)")
+                == 1
+              )
             ) > {{ .Values.policy.prerelease.maxAgeDays }}
           for: 1h
           labels:
             severity: warning
           annotations:
-            summary: "Pre-release image running {{`{{ $value }}`}}d: {{`{{ $labels.image }}`}}"
-            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} for over {{ .Values.policy.prerelease.maxAgeDays }} days."
+            summary: "Pre-release image published {{`{{ $value | printf \"%.0f\" }}`}}d ago: {{`{{ $labels.image }}`}}"
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} whose image was published more than {{ .Values.policy.prerelease.maxAgeDays }} days ago."
 
         - alert: ImageVersionSpreadTooHigh
           expr: |

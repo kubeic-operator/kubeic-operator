@@ -127,6 +127,32 @@ class TestCheckAvailability:
         assert results[0].digest_match is None
 
 
+class TestCreatedPropagation:
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_propagates_from_inspect(self, mock_run):
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout='{"Digest": "sha256:abc", "Created": "2026-07-01T00:00:00.123456789Z"}',
+        )
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created == "2026-07-01T00:00:00.123456789Z"
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_none_when_unavailable(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stderr="manifest unknown")
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created is None
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_created_none_when_absent_from_inspect(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"Digest": "sha256:abc"}')
+        pods = [_make_pod("pod-1", "default", "nginx:1.25")]
+        results = check_availability(pods)
+        assert results[0].created is None
+
+
 class TestInspectRefSelection:
     @patch("kubeic_checker.availability.subprocess.run")
     def test_digest_only_ref_inspected_by_digest(self, mock_run):

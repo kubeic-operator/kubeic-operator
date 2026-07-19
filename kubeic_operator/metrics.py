@@ -1,4 +1,12 @@
+import re
+from datetime import datetime, timezone
+
 from prometheus_client import Gauge
+
+# Images created before this are treated as having no usable timestamp:
+# reproducible-build tooling (ko, Bazel, buildpacks) stamps epoch or other
+# fixed placeholder dates, which would otherwise read as a ~50-year-old image.
+_CREATED_SANITY_FLOOR = datetime(2000, 1, 1, tzinfo=timezone.utc).timestamp()
 
 # --- Operator metrics (cluster-wide) ---
 
@@ -57,6 +65,30 @@ kube_image_digest_match = Gauge(
     "Whether the registry digest matches the pinned digest (1=match, 0=mismatch, absent=no digest pinned)",
     ["image", "registry", "image_name", "namespace", "pod", "container"],
 )
+
+kube_image_created_timestamp_seconds = Gauge(
+    "kube_image_created_timestamp_seconds",
+    "Unix timestamp of the image's registry Created field (absent when unavailable or unparseable)",
+    ["image", "registry", "image_name", "namespace", "pod", "container"],
+)
+
+
+def _parse_created_timestamp(created: str | None) -> float | None:
+    """Parse a registry Created field into unix seconds.
+
+    Registries emit RFC 3339 with up to nanosecond precision
+    (e.g. 2023-04-02T17:10:33.913163778Z); fromisoformat only accepts
+    microseconds, so the fraction is trimmed. Returns None for missing,
+    unparseable, or pre-2000 placeholder timestamps.
+    """
+    if not created:
+        return None
+    trimmed = re.sub(r"(\.\d{6})\d+", r"\1", created.replace("Z", "+00:00"))
+    try:
+        ts = datetime.fromisoformat(trimmed).timestamp()
+    except ValueError:
+        return None
+    return ts if ts >= _CREATED_SANITY_FLOOR else None
 
 
 def update_prerelease_metrics(findings: list, violations: list = None) -> None:
@@ -124,6 +156,7 @@ def update_availability_metrics(results: list) -> None:
     """
     kube_image_available.clear()
     kube_image_digest_match.clear()
+    kube_image_created_timestamp_seconds.clear()
 
     for r in results:
         value = 1 if r.available else 0
@@ -135,6 +168,13 @@ def update_availability_metrics(results: list) -> None:
             namespace=r.namespace, pod=r.pod, container=r.container,
             error_class="" if r.available else (getattr(r, "error_class", "") or "unknown"),
         ).set(value)
+
+        created_ts = _parse_created_timestamp(getattr(r, "created", None))
+        if created_ts is not None:
+            kube_image_created_timestamp_seconds.labels(
+                image=r.image, registry=r.registry, image_name=r.image_name,
+                namespace=r.namespace, pod=r.pod, container=r.container,
+            ).set(created_ts)
 
         if r.digest_match is not None:
             kube_image_digest_match.labels(

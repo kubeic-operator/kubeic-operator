@@ -56,6 +56,7 @@ def _make_availability_result(
     available=True,
     digest_match=None,
     error_class="",
+    created=None,
 ):
     r = MagicMock()
     r.image = image
@@ -67,6 +68,7 @@ def _make_availability_result(
     r.available = available
     r.digest_match = digest_match
     r.error_class = error_class
+    r.created = created
     return r
 
 
@@ -284,3 +286,62 @@ class TestUpdateAvailabilityMetrics:
         }
         digest = REGISTRY.get_sample_value("kube_image_digest_match", labels)
         assert digest is None
+
+
+class TestParseCreatedTimestamp:
+    def test_rfc3339_nanoseconds(self):
+        # Registries emit nanosecond precision, which fromisoformat rejects raw.
+        ts = metrics._parse_created_timestamp("2023-04-02T17:10:33.913163778Z")
+        assert ts is not None
+        assert abs(ts - 1680455433.913163) < 1
+
+    def test_plain_rfc3339(self):
+        ts = metrics._parse_created_timestamp("2026-07-01T00:00:00Z")
+        assert ts is not None
+
+    def test_epoch_placeholder_rejected(self):
+        # ko/Bazel/buildpack reproducible builds stamp epoch — must not read
+        # as a ~50-year-old image.
+        assert metrics._parse_created_timestamp("1970-01-01T00:00:00Z") is None
+
+    def test_garbage_rejected(self):
+        assert metrics._parse_created_timestamp("not-a-date") is None
+
+    def test_none_rejected(self):
+        assert metrics._parse_created_timestamp(None) is None
+
+
+class TestCreatedTimestampMetric:
+    def setup_method(self):
+        metrics.kube_image_created_timestamp_seconds.clear()
+
+    def teardown_method(self):
+        metrics.kube_image_created_timestamp_seconds.clear()
+
+    def _labels(self, r):
+        return {
+            "image": r.image,
+            "registry": r.registry,
+            "image_name": r.image_name,
+            "namespace": r.namespace,
+            "pod": r.pod,
+            "container": r.container,
+        }
+
+    def test_created_exported_as_unix_seconds(self):
+        r = _make_availability_result(created="2026-07-01T00:00:00Z")
+        metrics.update_availability_metrics([r])
+        ts = REGISTRY.get_sample_value("kube_image_created_timestamp_seconds", self._labels(r))
+        assert ts == 1782864000.0
+
+    def test_no_created_no_series(self):
+        r = _make_availability_result(created=None)
+        metrics.update_availability_metrics([r])
+        ts = REGISTRY.get_sample_value("kube_image_created_timestamp_seconds", self._labels(r))
+        assert ts is None
+
+    def test_epoch_created_no_series(self):
+        r = _make_availability_result(created="1970-01-01T00:00:00Z")
+        metrics.update_availability_metrics([r])
+        ts = REGISTRY.get_sample_value("kube_image_created_timestamp_seconds", self._labels(r))
+        assert ts is None
