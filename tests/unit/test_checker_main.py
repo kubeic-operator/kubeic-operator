@@ -1,5 +1,3 @@
-import json
-import os
 from unittest.mock import MagicMock, patch
 
 from kubeic_checker.main import _get_pods, _check_credential_validity
