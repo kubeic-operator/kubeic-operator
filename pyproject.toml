@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kubeic-operator"
-version = "0.2.0"
+version = "0.2.1-alpha.1"
 description = "Kubernetes Image Audit Operator - detects silent image failure risks"
 requires-python = ">=3.11"
 dependencies = [
@@ -17,13 +17,21 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-cov",
-    "ruff>=0.8",
+    "ruff>=0.8,<0.17",
     "bandit>=1.8",
 ]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+
+[tool.ruff.lint]
+# Pinned explicitly. With no `select`, the project inherits ruff's defaults,
+# which broaden between releases — 0.16 added YTT/ASYNC/S/BLE/B/SIM/UP and
+# turned a green CI red on untouched code. These four are what ruff enforced
+# by default when this project was linted clean, so they are now stated
+# outright rather than inherited. Security rules live in the bandit step.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.setuptools.packages.find]
 include = ["kubeic_operator*", "kubeic_checker*"]

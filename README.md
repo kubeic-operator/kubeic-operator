@@ -156,14 +156,22 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 
 ## Alert rules
 
-The Helm chart deploys a `PrometheusRule` with four alerts:
+The Helm chart deploys a `PrometheusRule` with six alerts:
 
 | Alert | Severity | For | Condition |
 | --- | --- | --- | --- |
-| ImageUnavailableInRegistry | critical | 10m | `kube_image_available == 0` |
+| ImageMissingFromRegistry | warning | interval + 10m | `kube_image_available{error_class="not_found"} == 0` |
+| ImageAuditCheckerDegraded | warning | interval + 10m | `kube_image_available{error_class=~"auth_failure\|network"} == 0`, counted per namespace/registry |
+| ImageDigestMismatch | warning | 30m | `kube_image_digest_match == 0` |
 | PrereleaseImageRunningTooLong | warning | 1h | `kube_image_prerelease_age_days > maxAgeDays` |
 | ImageVersionSpreadTooHigh | warning | 30m | `kube_image_version_spread_violation == 1` |
-| RegistryCredentialInvalid | critical | 10m | `kube_image_credential_valid == 0` |
+| RegistryCredentialInvalid | critical | interval + 10m | `kube_image_credential_valid == 0` |
+
+Alerts driven by the availability sweep use `for: policy.availability.intervalMinutes + 10m`.
+The metrics are step functions that only move once per sweep, so a shorter `for` would fire
+on a single sample. `ImageMissingFromRegistry` is a warning rather than a page: the pod keeps
+running on an already-pulled image, and only fails once it needs to be rescheduled. A pod that
+genuinely cannot pull surfaces as `ImagePullBackOff`, which this chart does not alert on.
 
 ## Development
 
