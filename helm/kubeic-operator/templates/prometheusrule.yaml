@@ -13,28 +13,42 @@ spec:
   groups:
     - name: image-audit
       rules:
-        # Alert exprs aggregate away the checker/operator's own scrape identity
-        # (pod, instance, job, ...) so alerts don't resolve/re-fire when the
-        # checker pod restarts, and rename exported_* back to the subject
-        # workload's namespace/pod/container. label_replace uses "(.+)" so a
-        # missing exported_* label leaves the original label untouched.
-        # cluster is a series label injected by the ServiceMonitor relabelings
-        # and must stay in by() to keep alerts distinct per cluster.
-        - alert: ImageUnavailableInRegistry
+        # Exprs aggregate away the checker's own scrape identity so alerts
+        # survive a checker restart, and rename exported_* back to the subject
+        # workload. "(.+)" leaves the label untouched when exported_* is absent.
+        #
+        # Metrics only move once per checker sweep, so `for` must exceed
+        # intervalMinutes or a single sample fires the alert. A per-namespace
+        # ImageAuditPolicy raising intervalMinutes re-breaks that.
+        - alert: ImageMissingFromRegistry
           expr: |
-            max by (cluster, namespace, pod, container, image, image_name, registry, error_class) (
+            max by (cluster, namespace, pod, container, image, image_name, registry) (
               label_replace(label_replace(label_replace(
-                kube_image_available,
+                kube_image_available{error_class="not_found"},
                 "namespace", "$1", "exported_namespace", "(.+)"),
                 "pod", "$1", "exported_pod", "(.+)"),
                 "container", "$1", "exported_container", "(.+)")
             ) == 0
-          for: 10m
+          for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
           labels:
-            severity: critical
+            severity: warning
           annotations:
-            summary: "Image unreachable: {{`{{ $labels.image }}`}}"
-            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} image cannot be verified in the registry ({{`{{ $labels.error_class }}`}})."
+            summary: "Image no longer in registry: {{`{{ $labels.image }}`}}"
+            description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} runs an image that is no longer present in {{`{{ $labels.registry }}`}}. The pod keeps running, but it cannot be rescheduled, scaled or restarted until the tag is restored or the workload is moved to a tag that exists."
+
+        - alert: ImageAuditCheckerDegraded
+          expr: |
+            count by (cluster, namespace, registry, error_class) (
+              label_replace(
+                kube_image_available{error_class=~"auth_failure|network"} == 0,
+                "namespace", "$1", "exported_namespace", "(.+)")
+            )
+          for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Image audit cannot verify {{`{{ $value }}`}} image(s) on {{`{{ $labels.registry }}`}}"
+            description: "The checker in namespace {{`{{ $labels.namespace }}`}} could not verify {{`{{ $value }}`}} image(s) against {{`{{ $labels.registry }}`}} ({{`{{ $labels.error_class }}`}}). This is a checker credential or connectivity fault — the images themselves are probably fine. Check the checker's credentials for that registry."
 
         - alert: ImageDigestMismatch
           expr: |
@@ -52,12 +66,9 @@ spec:
             summary: "Pinned digest no longer matches registry: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} pins a digest that no longer matches what the registry serves for its tag — the tag has been re-pushed with different content."
 
-        # Age is the image's registry publication timestamp (from the checker's
-        # skopeo inspect), joined against the operator's prerelease flag — pod
-        # restarts do not reset the clock, and a fresh image on an old pod does
-        # not fire. Images with no usable Created (inspect failed, or a
-        # reproducible-build placeholder date) produce no series and no alert;
-        # deleted tags surface via ImageUnavailableInRegistry instead.
+        # Age is the image's registry publication timestamp, so pod restarts do
+        # not reset the clock. Images with no usable Created produce no series;
+        # deleted tags surface via ImageMissingFromRegistry instead.
         - alert: PrereleaseImageRunningTooLong
           expr: |
             (
@@ -100,7 +111,7 @@ spec:
             max by (cluster, namespace, registry, secret_name) (
               label_replace(kube_image_credential_valid, "namespace", "$1", "exported_namespace", "(.+)")
             ) == 0
-          for: 10m
+          for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
           labels:
             severity: critical
           annotations:
