@@ -33,6 +33,12 @@ checker:
   podLabels: {}
   podAnnotations: {}
 
+  # Old ReplicaSets retained per checker Deployment. Kubernetes defaults to 10,
+  # which with one Deployment per namespace makes ReplicaSets the largest class
+  # of object this operator creates, growing by one per namespace per version
+  # bump. Two is enough to roll back a single bad release.
+  revisionHistoryLimit: 2
+
   # Namespaces excluded from auditing entirely (no checker deployed)
   excludedNamespaces:
     - kube-public
