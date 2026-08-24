@@ -13,6 +13,7 @@ from kubeic_operator.deployer import (
     _common_labels,
     _parse_json_env,
     _parse_bool_env,
+    _parse_int_env,
     deploy_checker,
     teardown_checker,
     get_secret_names_for_namespace,
@@ -181,6 +182,25 @@ class TestBuildDeployment:
         assert pod_sc.run_as_non_root is True
         assert pod_sc.seccomp_profile.type == "RuntimeDefault"
 
+    def test_revision_history_limit_is_set(self):
+        # Unset would inherit the Kubernetes default of 10 per namespace.
+        deploy = _build_deployment("my-ns")
+        assert deploy.spec.revision_history_limit is not None
+        assert deploy.spec.revision_history_limit == 2
+
+    @patch("kubeic_operator.deployer.CHECKER_REVISION_HISTORY_LIMIT", 5)
+    def test_revision_history_limit_is_configurable(self):
+        deploy = _build_deployment("my-ns")
+        assert deploy.spec.revision_history_limit == 5
+
+    def test_revision_history_limit_does_not_touch_pod_template(self):
+        # revisionHistoryLimit lives on spec, not spec.template, so changing it
+        # patches the Deployment without triggering a pod rollout.
+        deploy = _build_deployment("my-ns")
+        template = deploy.spec.template.to_dict()
+        assert "revision_history_limit" not in template
+        assert "revisionHistoryLimit" not in template
+
 
 class TestDeployChecker:
     @patch("kubeic_operator.deployer.client")
@@ -303,6 +323,35 @@ class TestParseBoolEnv:
         for raw in ("false", "False", "0", "no", "off", "nonsense"):
             with patch("kubeic_operator.deployer.os.environ.get", return_value=raw):
                 assert _parse_bool_env("TEST_KEY") is False, raw
+
+class TestParseIntEnv:
+    def test_returns_default_when_env_not_set(self):
+        assert _parse_int_env("NONEXISTENT_TEST_KEY_12345", 2) == 2
+
+    def test_parses_valid_int(self):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="7"):
+            assert _parse_int_env("TEST_KEY", 2) == 7
+
+    def test_empty_falls_back_to_default(self):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="  "):
+            assert _parse_int_env("TEST_KEY", 2) == 2
+
+    def test_non_numeric_falls_back_and_warns(self, caplog):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="ten"):
+            with caplog.at_level(logging.WARNING, logger="kubeic-operator.deployer"):
+                assert _parse_int_env("TEST_KEY", 2) == 2
+        assert "Failed to parse env TEST_KEY as int" in caplog.text
+
+    def test_below_minimum_falls_back_and_warns(self, caplog):
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="-1"):
+            with caplog.at_level(logging.WARNING, logger="kubeic-operator.deployer"):
+                assert _parse_int_env("TEST_KEY", 2) == 2
+        assert "below minimum" in caplog.text
+
+    def test_zero_is_allowed(self):
+        # 0 is a legitimate revisionHistoryLimit (keep no old ReplicaSets).
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="0"):
+            assert _parse_int_env("TEST_KEY", 2) == 0
 
 
 class TestAnnotationMerge:
