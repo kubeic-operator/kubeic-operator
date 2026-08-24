@@ -13,6 +13,7 @@ spec:
   groups:
     - name: image-audit
       rules:
+        {{- if .Values.checker.enabled }}
         # Exprs aggregate away the checker's own scrape identity so alerts
         # survive a checker restart, and rename exported_* back to the subject
         # workload. "(.+)" leaves the label untouched when exported_* is absent.
@@ -96,6 +97,9 @@ spec:
             summary: "Pre-release image published {{`{{ $value | printf \"%.0f\" }}`}}d ago: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} whose image was published more than {{ .Values.policy.prerelease.maxAgeDays }} days ago."
 
+        {{- end }}
+
+        # Operator-sourced: the only rule that still works with checkers disabled.
         - alert: ImageVersionSpreadTooHigh
           expr: |
             max by (cluster, registry, image_name) (kube_image_version_spread_violation) == 1
@@ -106,6 +110,7 @@ spec:
             summary: "Version spread on {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}}"
             description: "Image {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}} has too many distinct versions running simultaneously."
 
+        {{- if .Values.checker.enabled }}
         - alert: RegistryCredentialInvalid
           expr: |
             max by (cluster, namespace, registry, secret_name) (
@@ -117,4 +122,5 @@ spec:
           annotations:
             summary: "Registry credential invalid: {{`{{ $labels.registry }}`}}"
             description: "Credential {{`{{ $labels.secret_name }}`}} in namespace {{`{{ $labels.namespace }}`}} failed validation against {{`{{ $labels.registry }}`}}."
+        {{- end }}
 {{- end }}

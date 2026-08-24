@@ -39,6 +39,22 @@ CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
 CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
 
 
+def _parse_bool_env(key: str, default: bool = True) -> bool:
+    """Parse a boolean env var, treating unset *and* empty as the default.
+
+    Helm renders a missing value as an empty string rather than omitting the
+    env var, so "" must fall back to the default instead of reading as false —
+    otherwise a chart typo silently disables checkers fleet-wide.
+    """
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+CHECKER_ENABLED = _parse_bool_env("CHECKER_ENABLED")
+
+
 def _parse_excluded_namespaces() -> set[str]:
     raw = os.environ.get("EXCLUDED_NAMESPACES", "")
     if not raw:

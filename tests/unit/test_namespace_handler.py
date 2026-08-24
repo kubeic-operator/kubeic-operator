@@ -32,6 +32,17 @@ class TestShouldAudit:
         policy = {"namespaceSelector": {"excludeLabels": {"audit": "disabled"}}}
         assert _should_audit("my-app", None, policy) is True
 
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    def test_returns_false_for_every_namespace_when_checkers_disabled(self):
+        # The gate lives here so _reconcile_checkers tears down existing
+        # checkers via its normal not-should-but-exists path.
+        assert _should_audit("my-app", {}, {}) is False
+        assert _should_audit("another", {"audit": "enabled"}, {}) is False
+
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", True)
+    def test_normal_namespace_still_audited_when_checkers_enabled(self):
+        assert _should_audit("my-app", {}, {}) is True
+
 
 class TestGetEffectivePolicy:
     @patch("kubeic_operator.handlers.namespace.client.CustomObjectsApi")

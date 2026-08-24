@@ -17,6 +17,14 @@ operator:
 
 # Checker settings (applied to per-namespace checker deployments)
 checker:
+  # Deploy checkers at all. When false the operator still runs the cluster-wide
+  # checks (pre-release, version spread) but deploys no checker pods, and any
+  # existing ones are torn down on the next reconcile.
+  #
+  # Availability, digest, credential-validity AND pre-release *age* all come
+  # from the checker, so their alerts are omitted when this is false — only
+  # ImageVersionSpreadTooHigh runs on operator metrics alone.
+  enabled: true
   # Service name for checker metrics — must match across dashboard, RBAC, and operator code
   serviceName: kubeic-checker-metrics
   image:
@@ -77,7 +85,6 @@ policy:
   versionSpread:
     threshold: 3
   availability:
-    enabled: true
     intervalMinutes: 30
   namespaceSelector:
     excludeLabels:

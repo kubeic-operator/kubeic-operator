@@ -12,6 +12,7 @@ from kubeic_operator.deployer import (
     _selector_labels,
     _common_labels,
     _parse_json_env,
+    _parse_bool_env,
     deploy_checker,
     teardown_checker,
     get_secret_names_for_namespace,
@@ -278,6 +279,30 @@ class TestParseJsonEnv:
                 result = _parse_json_env("TEST_KEY")
         assert result == {}
         assert "Failed to parse env TEST_KEY as JSON" in caplog.text
+
+
+class TestParseBoolEnv:
+    def test_returns_default_when_env_not_set(self):
+        assert _parse_bool_env("NONEXISTENT_TEST_KEY_12345") is True
+        assert _parse_bool_env("NONEXISTENT_TEST_KEY_12345", default=False) is False
+
+    def test_empty_string_falls_back_to_default(self):
+        # Helm renders a missing value as "" rather than omitting the env var,
+        # so "" must not read as false and silently disable checkers.
+        with patch("kubeic_operator.deployer.os.environ.get", return_value=""):
+            assert _parse_bool_env("TEST_KEY") is True
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="   "):
+            assert _parse_bool_env("TEST_KEY") is True
+
+    def test_parses_truthy_values(self):
+        for raw in ("true", "True", "TRUE", "1", "yes", "on", " true "):
+            with patch("kubeic_operator.deployer.os.environ.get", return_value=raw):
+                assert _parse_bool_env("TEST_KEY") is True, raw
+
+    def test_parses_falsy_values(self):
+        for raw in ("false", "False", "0", "no", "off", "nonsense"):
+            with patch("kubeic_operator.deployer.os.environ.get", return_value=raw):
+                assert _parse_bool_env("TEST_KEY") is False, raw
 
 
 class TestAnnotationMerge:

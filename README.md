@@ -122,6 +122,7 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 
 | Value | Description | Default |
 | --- | --- | --- |
+| `checker.enabled` | Deploy checker pods at all (see below) | `true` |
 | `serviceMonitor.enabled` | Deploy a ServiceMonitor for checker pods | `true` |
 | `serviceMonitor.interval` | Scrape interval | `30s` |
 | `serviceMonitor.labels` | Labels for ServiceMonitor discovery | `{}` |
@@ -131,6 +132,29 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | `prometheusRule.labels` | Labels for PrometheusRule selection | `{}` |
 | `networkPolicy.enabled` | Deploy network policy for checker pods | `true` |
 | `crds.install` | Install CRDs with the chart | `false` |
+
+### Disabling checkers
+
+`checker.enabled: false` stops the operator deploying checker pods and tears down any that
+already exist on the next reconcile. The operator keeps running the cluster-wide checks that
+need only pod specs.
+
+This is a bigger reduction in coverage than it looks, because pre-release *age* is a joint
+metric: the operator knows a tag is pre-release, but only the checker knows when the image was
+published. Five of the six alerts are therefore omitted when checkers are disabled, and only
+`ImageVersionSpreadTooHigh` remains:
+
+| Alert | Survives `checker.enabled: false` |
+| --- | --- |
+| ImageVersionSpreadTooHigh | yes — operator metrics only |
+| ImageMissingFromRegistry | no |
+| ImageAuditCheckerDegraded | no |
+| ImageDigestMismatch | no |
+| PrereleaseImageRunningTooLong | no — needs `kube_image_created_timestamp_seconds` |
+| RegistryCredentialInvalid | no |
+
+The rules are omitted from the `PrometheusRule` rather than left in place to fire never, so
+there is no rule that silently cannot alert.
 
 ## Prometheus metrics
 
@@ -163,7 +187,7 @@ The Helm chart deploys a `PrometheusRule` with six alerts:
 | ImageMissingFromRegistry | warning | interval + 10m | `kube_image_available{error_class="not_found"} == 0` |
 | ImageAuditCheckerDegraded | warning | interval + 10m | `kube_image_available{error_class=~"auth_failure\|network"} == 0`, counted per namespace/registry |
 | ImageDigestMismatch | warning | 30m | `kube_image_digest_match == 0` |
-| PrereleaseImageRunningTooLong | warning | 1h | `kube_image_prerelease_age_days > maxAgeDays` |
+| PrereleaseImageRunningTooLong | warning | 1h | `kube_image_created_timestamp_seconds` age `> maxAgeDays`, joined to `kube_image_is_prerelease == 1` |
 | ImageVersionSpreadTooHigh | warning | 30m | `kube_image_version_spread_violation == 1` |
 | RegistryCredentialInvalid | critical | interval + 10m | `kube_image_credential_valid == 0` |
 
