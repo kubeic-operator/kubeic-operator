@@ -3,7 +3,13 @@ import logging
 import kopf
 from kubernetes import client
 
-from kubeic_operator.deployer import deploy_checker, teardown_checker, EXCLUDED_NAMESPACES, get_secret_names_for_namespace
+from kubeic_operator.deployer import (
+    CHECKER_ENABLED,
+    EXCLUDED_NAMESPACES,
+    deploy_checker,
+    get_secret_names_for_namespace,
+    teardown_checker,
+)
 
 logger = logging.getLogger("kubeic-operator.handlers.namespace")
 
@@ -52,6 +58,12 @@ def _get_operator_namespace() -> str:
 
 
 def _should_audit(namespace: str, labels: dict | None, policy: dict) -> bool:
+    # Single choke point for "should a checker exist here", so disabling
+    # checkers needs no separate teardown path: _reconcile_checkers already
+    # removes a checker wherever this returns False and one exists.
+    if not CHECKER_ENABLED:
+        return False
+
     if namespace in EXCLUDED_NAMESPACES:
         return False
 

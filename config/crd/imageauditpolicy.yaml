@@ -69,9 +69,6 @@ spec:
                 availability:
                   type: object
                   properties:
-                    enabled:
-                      type: boolean
-                      default: true
                     intervalMinutes:
                       type: integer
                       minimum: 1

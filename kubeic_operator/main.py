@@ -82,8 +82,14 @@ def _get_default_policy() -> dict:
 
 
 def _bootstrap_checkers() -> None:
-    from kubeic_operator.deployer import deploy_checker, get_secret_names_for_namespace
+    from kubeic_operator.deployer import (
+        CHECKER_ENABLED, deploy_checker, get_secret_names_for_namespace,
+    )
     from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
+
+    if not CHECKER_ENABLED:
+        logger.info("Checkers disabled (checker.enabled=false); skipping bootstrap")
+        return
 
     v1 = client.CoreV1Api()
     try:
@@ -115,7 +121,8 @@ def _reconcile_checkers() -> dict:
     Returns a dict of namespace -> {deployed, reason} for status reporting.
     """
     from kubeic_operator.deployer import (
-        CHECKER_DEPLOYMENT, deploy_checker, teardown_checker, get_secret_names_for_namespace,
+        CHECKER_DEPLOYMENT, CHECKER_ENABLED, deploy_checker, teardown_checker,
+        get_secret_names_for_namespace,
     )
     from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
 
@@ -159,12 +166,15 @@ def _reconcile_checkers() -> dict:
                 logger.info("Reconciled: removed checker from %s", name)
             except Exception as exc:
                 logger.error("Failed to teardown checker in %s: %s", name, exc)
-            reason = "excluded"
-            excluded_ns = policy.get("namespaceSelector", {}).get("excludeLabels", {})
-            for k, v in excluded_ns.items():
-                if labels.get(k) == v:
-                    reason = f"excluded by label {k}={v}"
-                    break
+            if not CHECKER_ENABLED:
+                reason = "checkers disabled"
+            else:
+                reason = "excluded"
+                excluded_ns = policy.get("namespaceSelector", {}).get("excludeLabels", {})
+                for k, v in excluded_ns.items():
+                    if labels.get(k) == v:
+                        reason = f"excluded by label {k}={v}"
+                        break
             namespace_status[name] = {"deployed": False, "reason": reason}
         elif should:
             namespace_status[name] = {"deployed": True}

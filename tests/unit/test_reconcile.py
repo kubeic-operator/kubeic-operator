@@ -242,6 +242,66 @@ class TestRunClusterAudit:
         mock_spread.assert_not_called()
 
 
+class TestCheckerEnabledFlag:
+    @patch("kubeic_operator.deployer.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_reconcile_tears_down_existing_checkers_when_disabled(
+        self, mock_core, mock_apps_cls, mock_policy, mock_deploy, mock_teardown, mock_secrets,
+    ):
+        # Deployment read succeeds -> a checker exists in this namespace.
+        mock_apps_cls.return_value = MagicMock()
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("my-app"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        mock_teardown.assert_called_once_with("my-app")
+        mock_deploy.assert_not_called()
+        assert result["my-app"]["deployed"] is False
+        assert result["my-app"]["reason"] == "checkers disabled"
+
+    @patch("kubeic_operator.deployer.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_reconcile_deploys_nothing_when_disabled_and_none_exist(
+        self, mock_core, mock_apps_cls, mock_policy, mock_deploy, mock_teardown,
+    ):
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = _404()
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("my-app"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        mock_deploy.assert_not_called()
+        mock_teardown.assert_not_called()
+
+    @patch("kubeic_operator.deployer.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_bootstrap_short_circuits_when_disabled(self, mock_core, mock_deploy):
+        from kubeic_operator.main import _bootstrap_checkers
+        _bootstrap_checkers()
+
+        mock_deploy.assert_not_called()
+        mock_core.return_value.list_namespace.assert_not_called()
+
+
 class TestWriteIapStatus:
     @patch("kubeic_operator.main.client.CustomObjectsApi")
     def test_patches_status_with_reconcile_results(self, mock_api_cls):
