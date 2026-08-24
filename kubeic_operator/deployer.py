@@ -39,6 +39,35 @@ CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
 CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
 
 
+def _parse_int_env(key: str, default: int, minimum: int = 0) -> int:
+    """Parse a non-negative integer env var, falling back to the default.
+
+    Unset, empty, non-numeric and out-of-range values all fall back rather than
+    raising: a bad value here would crash the operator at import time, which is
+    a far worse outcome than one setting reverting to its default.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Failed to parse env %s as int, falling back to %d", key, default)
+        return default
+    if value < minimum:
+        logger.warning("Env %s (%d) is below minimum %d, falling back to %d", key, value, minimum, default)
+        return default
+    return value
+
+
+# Deployments default to keeping 10 old ReplicaSets. With one checker Deployment
+# per namespace that is the dominant source of API objects this operator creates
+# — 54 checkers on one production cluster had accumulated 521 ReplicaSets — and
+# every version bump adds another per namespace. Two is enough to roll back one
+# bad release.
+CHECKER_REVISION_HISTORY_LIMIT = _parse_int_env("CHECKER_REVISION_HISTORY_LIMIT", 2)
+
+
 def _parse_excluded_namespaces() -> set[str]:
     raw = os.environ.get("EXCLUDED_NAMESPACES", "")
     if not raw:
@@ -211,6 +240,7 @@ def _build_deployment(
         ),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            revision_history_limit=CHECKER_REVISION_HISTORY_LIMIT,
             selector=client.V1LabelSelector(
                 match_labels=_selector_labels(),
             ),
