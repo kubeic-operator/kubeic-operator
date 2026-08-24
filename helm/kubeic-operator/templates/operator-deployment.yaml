@@ -50,6 +50,8 @@ spec:
               value: {{ .Values.checker.resources.limits.cpu | quote }}
             - name: CHECKER_MEMORY_LIMIT
               value: {{ .Values.checker.resources.limits.memory | quote }}
+            - name: CHECKER_REVISION_HISTORY_LIMIT
+              value: {{ .Values.checker.revisionHistoryLimit | quote }}
             - name: EXCLUDED_NAMESPACES
               value: {{ .Values.checker.excludedNamespaces | join "," | quote }}
             - name: NO_SECRET_NAMESPACES

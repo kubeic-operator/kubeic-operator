@@ -131,7 +131,15 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | `prometheusRule.labels` | Labels for PrometheusRule selection | `{}` |
 | `networkPolicy.enabled` | Deploy network policy for checker pods | `true` |
 | `checker.readyTimeoutSeconds` | Per-namespace wait during a serialised rollout | `90` |
+| `checker.revisionHistoryLimit` | Old ReplicaSets kept per checker Deployment | `2` |
 | `crds.install` | Install CRDs with the chart | `false` |
+
+`checker.revisionHistoryLimit` defaults to 2 rather than the Kubernetes default of 10 because
+this operator creates one Deployment per audited namespace, so retained ReplicaSets are its
+largest class of API object and grow by one per namespace on every version bump. Lowering it
+on an existing install is safe: the Deployment controller reaps the excess on its next sync,
+and because `revisionHistoryLimit` lives on the Deployment spec rather than the pod template,
+changing it does not restart any checker.
 
 ### Checker rollouts are serialised
 

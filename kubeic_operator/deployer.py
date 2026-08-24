@@ -26,30 +26,6 @@ CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
 SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
 
 
-def _env_int(key: str, default: int) -> int:
-    """Parse a positive integer env var, falling back to the default.
-
-    Never raises: a bad value here would crash the operator at import time,
-    which is worse than one tunable reverting to its default.
-    """
-    raw = os.environ.get(key, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning("Failed to parse env %s as int, using %d", key, default)
-        return default
-    if value <= 0:
-        logger.warning("Env %s (%d) must be positive, using %d", key, value, default)
-        return default
-    return value
-
-
-CHECKER_READY_TIMEOUT = _env_int("CHECKER_READY_TIMEOUT_SECONDS", 90)
-CHECKER_READY_POLL_SECONDS = _env_int("CHECKER_READY_POLL_SECONDS", 2)
-
-
 def _parse_json_env(key: str, default: str = "{}") -> dict:
     raw = os.environ.get(key, default)
     if raw == default:
@@ -63,6 +39,40 @@ def _parse_json_env(key: str, default: str = "{}") -> dict:
 
 CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
 CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
+
+
+def _parse_int_env(key: str, default: int, minimum: int = 0) -> int:
+    """Parse a non-negative integer env var, falling back to the default.
+
+    Unset, empty, non-numeric and out-of-range values all fall back rather than
+    raising: a bad value here would crash the operator at import time, which is
+    a far worse outcome than one setting reverting to its default.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Failed to parse env %s as int, falling back to %d", key, default)
+        return default
+    if value < minimum:
+        logger.warning("Env %s (%d) is below minimum %d, falling back to %d", key, value, minimum, default)
+        return default
+    return value
+
+
+# Deployments default to keeping 10 old ReplicaSets. With one checker Deployment
+# per namespace that is the dominant source of API objects this operator creates
+# — 54 checkers on one production cluster had accumulated 521 ReplicaSets — and
+# every version bump adds another per namespace. Two is enough to roll back one
+# bad release.
+CHECKER_REVISION_HISTORY_LIMIT = _parse_int_env("CHECKER_REVISION_HISTORY_LIMIT", 2)
+
+# Rollout pacing. minimum=1 because a zero timeout would skip the readiness wait
+# entirely and a zero poll interval would busy-loop against the API server.
+CHECKER_READY_TIMEOUT = _parse_int_env("CHECKER_READY_TIMEOUT_SECONDS", 90, minimum=1)
+CHECKER_READY_POLL_SECONDS = _parse_int_env("CHECKER_READY_POLL_SECONDS", 2, minimum=1)
 
 
 def _parse_excluded_namespaces() -> set[str]:
@@ -237,6 +247,7 @@ def _build_deployment(
         ),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            revision_history_limit=CHECKER_REVISION_HISTORY_LIMIT,
             selector=client.V1LabelSelector(
                 match_labels=_selector_labels(),
             ),
