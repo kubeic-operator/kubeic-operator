@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import threading
+import time
 
 from kubernetes import client
 from kubernetes.client import ApiException
@@ -22,6 +24,30 @@ CHECKER_MEMORY_REQUEST = os.environ.get("CHECKER_MEMORY_REQUEST", "64Mi")
 CHECKER_CPU_LIMIT = os.environ.get("CHECKER_CPU_LIMIT", "200m")
 CHECKER_MEMORY_LIMIT = os.environ.get("CHECKER_MEMORY_LIMIT", "128Mi")
 SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
+
+
+def _env_int(key: str, default: int) -> int:
+    """Parse a positive integer env var, falling back to the default.
+
+    Never raises: a bad value here would crash the operator at import time,
+    which is worse than one tunable reverting to its default.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Failed to parse env %s as int, using %d", key, default)
+        return default
+    if value <= 0:
+        logger.warning("Env %s (%d) must be positive, using %d", key, value, default)
+        return default
+    return value
+
+
+CHECKER_READY_TIMEOUT = _env_int("CHECKER_READY_TIMEOUT_SECONDS", 90)
+CHECKER_READY_POLL_SECONDS = _env_int("CHECKER_READY_POLL_SECONDS", 2)
 
 
 def _parse_json_env(key: str, default: str = "{}") -> dict:
@@ -221,6 +247,30 @@ def _build_deployment(
                 ),
                 spec=client.V1PodSpec(
                     service_account_name=CHECKER_SERVICE_ACCOUNT,
+                    # Spread checkers across nodes. topologySpreadConstraints
+                    # cannot do this: a TSC labelSelector only counts pods in
+                    # the *same* namespace, and each checker is replicas:1 alone
+                    # in its own namespace, so it would only ever match itself.
+                    # podAntiAffinity with an empty namespaceSelector (= all
+                    # namespaces) is the cross-namespace equivalent. Preferred
+                    # rather than required so it degrades gracefully once
+                    # checkers outnumber nodes, which they always will.
+                    affinity=client.V1Affinity(
+                        pod_anti_affinity=client.V1PodAntiAffinity(
+                            preferred_during_scheduling_ignored_during_execution=[
+                                client.V1WeightedPodAffinityTerm(
+                                    weight=100,
+                                    pod_affinity_term=client.V1PodAffinityTerm(
+                                        topology_key="kubernetes.io/hostname",
+                                        label_selector=client.V1LabelSelector(
+                                            match_labels=_selector_labels(),
+                                        ),
+                                        namespace_selector=client.V1LabelSelector(),
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ),
                     security_context=client.V1PodSecurityContext(
                         run_as_non_root=True,
                         seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
@@ -366,6 +416,92 @@ def deploy_checker(
             logger.info("Created checker Deployment in %s", namespace)
         else:
             raise
+
+
+# Every checker pod template carries app.kubernetes.io/version, so a version
+# bump changes all N templates at once and Kubernetes rolls them simultaneously.
+# On 2026-08-17 that put 34 new pods on one node in 29 seconds and drove its
+# kube-multus into OOMKill, stranding 36 pods for ~50 minutes (#61).
+#
+# One lock, held across the patch *and* the readiness wait, makes checker
+# rollouts strictly one-at-a-time however they are triggered. Both the paced
+# bulk loops and the namespace handler go through it, so neither can burst on
+# its own or race the other.
+_rollout_lock = threading.Lock()
+
+
+def _rollout_complete(deployment) -> bool:
+    """Whether a Deployment has finished rolling out to its current generation.
+
+    Mirrors `kubectl rollout status`. Checking readyReplicas alone is not
+    enough: for a single-replica Deployment the default strategy surges to two
+    pods, so immediately after a patch the *old* pod is still Ready and a naive
+    check returns instantly — serialising nothing at all.
+    """
+    spec_replicas = deployment.spec.replicas if deployment.spec.replicas is not None else 1
+    status = deployment.status
+    generation = deployment.metadata.generation
+
+    # The controller has not yet acted on the patch we just made.
+    if generation is not None and (status.observed_generation or 0) < generation:
+        return False
+    # Not every replica has been recreated against the new template.
+    if (status.updated_replicas or 0) < spec_replicas:
+        return False
+    # Old-template pods are still terminating.
+    if (status.replicas or 0) > (status.updated_replicas or 0):
+        return False
+    if (status.available_replicas or 0) < spec_replicas:
+        return False
+    return True
+
+
+def wait_for_checker_ready(namespace: str, timeout: int = CHECKER_READY_TIMEOUT) -> bool:
+    """Block until the checker Deployment in a namespace finishes rolling out.
+
+    Returns False on timeout or API error rather than raising, so one wedged
+    namespace cannot stall the rollout for every namespace behind it.
+    """
+    apps_v1 = client.AppsV1Api()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            deployment = apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, namespace)
+        except ApiException as exc:
+            logger.warning("Cannot read checker Deployment in %s while waiting: %s", namespace, exc)
+            return False
+
+        if _rollout_complete(deployment):
+            return True
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Checker in %s did not roll out within %ds; continuing to next namespace",
+                namespace, timeout,
+            )
+            return False
+
+        time.sleep(CHECKER_READY_POLL_SECONDS)
+
+
+def deploy_checker_serialised(namespace: str, *, blocking: bool = True, **kwargs) -> bool:
+    """Deploy a checker, serialised cluster-wide against other checker rollouts.
+
+    With blocking=False the call is skipped entirely when another rollout holds
+    the lock, and the caller relies on the reconcile loop to pick the namespace
+    up on its next pass. That is what keeps the namespace event handler from
+    fanning out: on startup kopf fires it for every existing namespace at once,
+    and all but one of those return immediately.
+    """
+    if not _rollout_lock.acquire(blocking=blocking):
+        logger.info("Checker rollout in progress; deferring %s to reconcile", namespace)
+        return False
+    try:
+        deploy_checker(namespace=namespace, **kwargs)
+        wait_for_checker_ready(namespace)
+        return True
+    finally:
+        _rollout_lock.release()
 
 
 def teardown_checker(namespace: str) -> None:

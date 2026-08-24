@@ -1,9 +1,14 @@
 import logging
 from unittest.mock import MagicMock, patch
 
+import pytest
 from kubernetes.client import ApiException as K8sApiException
 
 from kubeic_operator.deployer import (
+    _rollout_complete,
+    _rollout_lock,
+    wait_for_checker_ready,
+    deploy_checker_serialised,
     _build_service_account,
     _build_role,
     _build_role_binding,
@@ -180,6 +185,33 @@ class TestBuildDeployment:
         assert pod_sc.run_as_non_root is True
         assert pod_sc.seccomp_profile.type == "RuntimeDefault"
 
+    def test_pod_anti_affinity_prefers_spreading_across_nodes(self):
+        deploy = _build_deployment("my-ns")
+        terms = (deploy.spec.template.spec.affinity.pod_anti_affinity
+                 .preferred_during_scheduling_ignored_during_execution)
+        assert len(terms) == 1
+        term = terms[0].pod_affinity_term
+        assert term.topology_key == "kubernetes.io/hostname"
+        assert term.label_selector.match_labels == _selector_labels()
+
+    def test_anti_affinity_selects_all_namespaces(self):
+        # An empty namespaceSelector means "all namespaces". Without it the term
+        # would only consider pods in the checker's own namespace, where it is
+        # always alone — the same reason topologySpreadConstraints cannot work.
+        deploy = _build_deployment("my-ns")
+        term = (deploy.spec.template.spec.affinity.pod_anti_affinity
+                .preferred_during_scheduling_ignored_during_execution[0].pod_affinity_term)
+        assert term.namespace_selector is not None
+        assert term.namespace_selector.match_labels is None
+        assert term.namespace_selector.match_expressions is None
+
+    def test_anti_affinity_is_preferred_not_required(self):
+        # Checkers always outnumber nodes, so a required term would leave them
+        # permanently Pending.
+        deploy = _build_deployment("my-ns")
+        anti = deploy.spec.template.spec.affinity.pod_anti_affinity
+        assert anti.required_during_scheduling_ignored_during_execution is None
+
 
 class TestDeployChecker:
     @patch("kubeic_operator.deployer.client")
@@ -278,6 +310,107 @@ class TestParseJsonEnv:
                 result = _parse_json_env("TEST_KEY")
         assert result == {}
         assert "Failed to parse env TEST_KEY as JSON" in caplog.text
+
+
+def _fake_deployment(generation=2, observed=2, spec_replicas=1,
+                     replicas=1, updated=1, available=1):
+    d = MagicMock()
+    d.metadata.generation = generation
+    d.spec.replicas = spec_replicas
+    d.status.observed_generation = observed
+    d.status.replicas = replicas
+    d.status.updated_replicas = updated
+    d.status.available_replicas = available
+    return d
+
+
+class TestRolloutComplete:
+    def test_complete_when_new_pod_is_up_and_old_one_gone(self):
+        assert _rollout_complete(_fake_deployment()) is True
+
+    def test_incomplete_until_controller_observes_the_patch(self):
+        # The critical case: right after a patch the OLD pod is still Ready, so
+        # a readyReplicas check would return instantly and serialise nothing.
+        assert _rollout_complete(_fake_deployment(generation=3, observed=2)) is False
+
+    def test_incomplete_while_old_replicas_still_terminating(self):
+        # maxSurge takes a 1-replica Deployment to 2 pods mid-rollout.
+        assert _rollout_complete(_fake_deployment(replicas=2, updated=1)) is False
+
+    def test_incomplete_when_not_every_replica_updated(self):
+        assert _rollout_complete(
+            _fake_deployment(spec_replicas=2, replicas=2, updated=1, available=2)
+        ) is False
+
+    def test_incomplete_when_new_pod_not_yet_available(self):
+        assert _rollout_complete(_fake_deployment(available=0)) is False
+
+    def test_absent_status_fields_count_as_zero(self):
+        assert _rollout_complete(
+            _fake_deployment(observed=None, replicas=None, updated=None, available=None)
+        ) is False
+
+
+class TestWaitForCheckerReady:
+    @patch("kubeic_operator.deployer.time.sleep")
+    @patch("kubeic_operator.deployer.client.AppsV1Api")
+    def test_polls_until_rollout_completes(self, mock_apps_cls, mock_sleep):
+        mock_apps_cls.return_value.read_namespaced_deployment.side_effect = [
+            _fake_deployment(generation=3, observed=2),
+            _fake_deployment(generation=3, observed=3),
+        ]
+        assert wait_for_checker_ready("my-ns", timeout=30) is True
+        assert mock_sleep.call_count == 1
+
+    @patch("kubeic_operator.deployer.client.AppsV1Api")
+    def test_returns_false_on_timeout_rather_than_raising(self, mock_apps_cls):
+        # One wedged namespace must not stall every namespace behind it.
+        mock_apps_cls.return_value.read_namespaced_deployment.return_value = (
+            _fake_deployment(generation=3, observed=2)
+        )
+        assert wait_for_checker_ready("my-ns", timeout=0) is False
+
+    @patch("kubeic_operator.deployer.client.AppsV1Api")
+    def test_returns_false_on_api_error(self, mock_apps_cls):
+        mock_apps_cls.return_value.read_namespaced_deployment.side_effect = (
+            K8sApiException(status=404)
+        )
+        assert wait_for_checker_ready("my-ns") is False
+
+
+class TestDeployCheckerSerialised:
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    def test_deploys_then_waits_for_readiness(self, mock_deploy, mock_wait):
+        assert deploy_checker_serialised(
+            "my-ns", blocking=True, check_interval_minutes=30,
+        ) is True
+        mock_deploy.assert_called_once_with(namespace="my-ns", check_interval_minutes=30)
+        mock_wait.assert_called_once_with("my-ns")
+
+    @patch("kubeic_operator.deployer.deploy_checker")
+    def test_non_blocking_skips_entirely_while_a_rollout_holds_the_lock(self, mock_deploy):
+        # This is what stops the namespace handler fanning out: kopf fires it
+        # for every namespace at once and all but one return here.
+        with _rollout_lock:
+            assert deploy_checker_serialised("my-ns", blocking=False) is False
+        mock_deploy.assert_not_called()
+
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    def test_releases_the_lock_on_success(self, mock_deploy, mock_wait):
+        deploy_checker_serialised("my-ns", blocking=True)
+        assert _rollout_lock.acquire(blocking=False)
+        _rollout_lock.release()
+
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker", side_effect=RuntimeError("boom"))
+    def test_releases_the_lock_when_deploy_raises(self, mock_deploy, mock_wait):
+        # A namespace that fails must not wedge the rollout permanently.
+        with pytest.raises(RuntimeError):
+            deploy_checker_serialised("my-ns", blocking=True)
+        assert _rollout_lock.acquire(blocking=False)
+        _rollout_lock.release()
 
 
 class TestAnnotationMerge:

@@ -64,6 +64,8 @@ spec:
               value: {{ .Values.scanIntervalSeconds | default 300 | quote }}
             - name: SKIP_ANNOTATION
               value: {{ .Values.policy.skipAnnotation | default "" | quote }}
+            - name: CHECKER_READY_TIMEOUT_SECONDS
+              value: {{ .Values.checker.readyTimeoutSeconds | quote }}
           ports:
             - name: metrics
               containerPort: 9090

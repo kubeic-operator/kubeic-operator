@@ -82,7 +82,7 @@ def _get_default_policy() -> dict:
 
 
 def _bootstrap_checkers() -> None:
-    from kubeic_operator.deployer import deploy_checker, get_secret_names_for_namespace
+    from kubeic_operator.deployer import deploy_checker_serialised, get_secret_names_for_namespace
     from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
 
     v1 = client.CoreV1Api()
@@ -101,9 +101,11 @@ def _bootstrap_checkers() -> None:
         interval = policy.get("availability", {}).get("intervalMinutes", 30)
         cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
         try:
-            deploy_checker(namespace=name,
-                           check_interval_minutes=interval, credential_source=cred_source,
-                           secret_names=get_secret_names_for_namespace(name))
+            # blocking=True: wait our turn and then for the rollout, so the
+            # whole bootstrap is one checker at a time.
+            deploy_checker_serialised(name, blocking=True,
+                                      check_interval_minutes=interval, credential_source=cred_source,
+                                      secret_names=get_secret_names_for_namespace(name))
             logger.info("Bootstrapped checker in namespace %s", name)
         except Exception as exc:
             logger.error("Failed to bootstrap checker in %s: %s", name, exc)
@@ -115,7 +117,8 @@ def _reconcile_checkers() -> dict:
     Returns a dict of namespace -> {deployed, reason} for status reporting.
     """
     from kubeic_operator.deployer import (
-        CHECKER_DEPLOYMENT, deploy_checker, teardown_checker, get_secret_names_for_namespace,
+        CHECKER_DEPLOYMENT, deploy_checker_serialised, teardown_checker,
+        get_secret_names_for_namespace,
     )
     from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
 
@@ -146,9 +149,12 @@ def _reconcile_checkers() -> dict:
             interval = policy.get("availability", {}).get("intervalMinutes", 30)
             cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
             try:
-                deploy_checker(namespace=name, check_interval_minutes=interval,
-                               credential_source=cred_source,
-                               secret_names=get_secret_names_for_namespace(name))
+                # Paced for the same reason as bootstrap: on a fresh cluster
+                # reconcile is the one creating every checker.
+                deploy_checker_serialised(name, blocking=True,
+                                          check_interval_minutes=interval,
+                                          credential_source=cred_source,
+                                          secret_names=get_secret_names_for_namespace(name))
                 logger.info("Reconciled: deployed checker in %s", name)
             except Exception as exc:
                 logger.error("Failed to deploy checker in %s: %s", name, exc)
@@ -246,6 +252,30 @@ def _run_cluster_audit() -> None:
 
 
 def _audit_loop() -> None:
+    # Publish the cluster-wide metrics first. The pre-release and version-spread
+    # checks need nothing from the checkers, and the paced rollout below can take
+    # many minutes on a large cluster — running it first would leave the operator
+    # exporting no metrics for that whole window.
+    try:
+        _run_cluster_audit()
+    except Exception:
+        logger.exception("Initial cluster audit failed")
+
+    # Bootstrap runs here rather than in on_startup because it is now paced:
+    # readiness-gating 50+ namespaces takes minutes, and kopf does not begin
+    # watching anything until the startup handler returns. Blocking there would
+    # leave the operator blind to namespace events for the whole rollout.
+    try:
+        _bootstrap_checkers()
+    except Exception:
+        logger.exception("Checker bootstrap failed")
+    try:
+        namespace_status = _reconcile_checkers()
+        if namespace_status:
+            _write_iap_status(namespace_status)
+    except Exception:
+        logger.exception("Initial checker reconciliation failed")
+
     while True:
         time.sleep(SCAN_INTERVAL)
         try:
@@ -276,8 +306,7 @@ def on_startup(settings: kopf.OperatorSettings, **kwargs):
         k8s_config.load_incluster_config()
     except k8s_config.ConfigException:
         k8s_config.load_kube_config()
+    # The audit thread owns bootstrap and reconcile. Returning promptly is what
+    # lets kopf start watching namespaces while the paced rollout is still
+    # working through the cluster.
     threading.Thread(target=_audit_loop, daemon=True, name="audit-loop").start()
-    _bootstrap_checkers()
-    namespace_status = _reconcile_checkers()
-    if namespace_status:
-        _write_iap_status(namespace_status)
