@@ -217,18 +217,24 @@ class TestCentralCheckerReporting:
         # Proves the cluster-wide list actually works under the ClusterRole, and
         # that metrics are labelled by subject namespace rather than by the
         # checker's own.
-        def has_foreign_series():
+        #
+        # The poll waits for *this* namespace specifically, not for any series at
+        # all. The checker snapshots the pod list once per cycle, so a namespace
+        # created after the current cycle began cannot appear until the next one —
+        # and polling for "some series exist" returns on the first scrape, from a
+        # cycle that predates the fixture.
+        def audited_namespace_covered():
             samples = _samples(read_metrics(operator_namespace, central_pod), "kube_image_available")
-            return {
+            namespaces = {
                 line.split('namespace="', 1)[1].split('"', 1)[0]
                 for line in samples if 'namespace="' in line
-            } or None
+            }
+            return namespaces if audited_namespace in namespaces else None
 
         namespaces = poll_for(
-            has_foreign_series, timeout=240, interval=15,
-            what="central checker to publish availability series",
+            audited_namespace_covered, timeout=300, interval=15,
+            what=f"central checker to publish series for {audited_namespace}",
         )
-        assert audited_namespace in namespaces
         assert len(namespaces) > 1, f"only saw {namespaces}; expected several namespaces"
 
     def test_an_opted_out_namespace_never_appears(
