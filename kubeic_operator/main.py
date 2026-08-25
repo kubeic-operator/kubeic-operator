@@ -48,26 +48,80 @@ class _NoWriteProgressStorage(kopf.ProgressStorage):
     def touch(self, **kwargs):
         pass
 
-    def clear(self, **kwargs):
-        pass
+    def clear(self, *, essence):
+        # clear() is a transform, not a void method: kopf feeds both sides of
+        # its diff through it (processing.py) and expects the essence back with
+        # any progress annotations stripped. Returning None nulled `new` as well
+        # as `old`, which meant diffbase_storage.store() was never reached —
+        # it is guarded by `if cause.new is not None`. That defeated diff-base
+        # tracking entirely, whatever the diff-base storage did. See #65.
+        #
+        # We write no progress annotations, so there is nothing to strip; defer
+        # to the base implementation, which deep-copies so callers cannot mutate
+        # a stored essence.
+        return super().clear(essence=essence)
 
 
-class _NoWriteDiffBaseStorage(kopf.DiffBaseStorage):
-    """Diff-base storage that discards state and writes nothing to Kubernetes.
+class _InMemoryDiffBaseStorage(kopf.DiffBaseStorage):
+    """Diff-base storage kept in this process rather than on the object.
 
-    Kopf's default AnnotationsDiffBaseStorage patches watched objects to record
-    the last-seen state for change detection. Our namespace handlers don't use
-    on.update, so diff-base tracking is unnecessary and the patch permission
-    is deliberately withheld.
+    Kopf's default AnnotationsDiffBaseStorage records the last-handled essence
+    as an annotation on every watched object, which needs the namespace patch
+    permission this operator deliberately does not hold.
+
+    Returning None unconditionally — the previous behaviour — is not a neutral
+    stand-in for that. Kopf reads "no stored essence" as `Reason.CREATE`
+    (causes.py: `if old is None`), so *every* namespace event re-ran the create
+    handler: a label edit, an annotation change, the initial listing. Storing
+    the essence in memory restores real CREATE/UPDATE/NOOP detection without
+    needing to write to the object.
+
+    Losing this on restart is deliberate and safe. Bootstrap and reconcile
+    converge every namespace anyway, and the create handler is idempotent and
+    rollout-serialised. Note that it also means RESUME stays unreachable: a
+    fresh process has no essence for pre-existing namespaces, so they are still
+    classified as CREATE on the first listing after a restart.
 
     Methods must be plain (non-async) — Kopf calls them synchronously.
     """
 
-    def fetch(self, **kwargs):
-        return None
+    def __init__(self) -> None:
+        super().__init__()
+        # Plain dict: get/set/pop are atomic under the GIL, which is enough for
+        # the concurrent handler invocations kopf makes.
+        self._essences: dict[str, object] = {}
 
-    def store(self, **kwargs):
-        pass
+    @staticmethod
+    def _uid(body) -> str | None:
+        return (body.get("metadata") or {}).get("uid")
+
+    def fetch(self, *, body):
+        uid = self._uid(body)
+        return self._essences.get(uid) if uid else None
+
+    def store(self, *, body, patch, essence):
+        uid = self._uid(body)
+        if uid:
+            self._essences[uid] = essence
+
+    def retain(self, live_uids) -> int:
+        """Drop essences for objects that no longer exist, returning the count.
+
+        Kopf offers no eviction hook on this interface, so reconcile prunes
+        against the namespace list it already fetches. Without this the dict
+        grows for the operator's whole lifetime on clusters that churn
+        namespaces, such as per-build CI namespaces.
+        """
+        stale = self._essences.keys() - set(live_uids)
+        for uid in stale:
+            self._essences.pop(uid, None)
+        return len(stale)
+
+    def __len__(self) -> int:
+        return len(self._essences)
+
+
+DIFFBASE_STORAGE = _InMemoryDiffBaseStorage()
 
 
 def _get_default_policy() -> dict:
@@ -154,6 +208,12 @@ def _reconcile_checkers() -> dict:
     except client.ApiException as exc:
         logger.error("Failed to list namespaces during reconcile: %s", exc)
         return {}
+
+    # Kopf has no eviction hook on the diff-base interface, so prune here
+    # against the namespace list this pass already fetched.
+    evicted = DIFFBASE_STORAGE.retain({ns.metadata.uid for ns in namespaces})
+    if evicted:
+        logger.debug("Evicted %d diff-base entries for deleted namespaces", evicted)
 
     namespace_status = {}
     for ns in namespaces:
@@ -348,7 +408,7 @@ def on_startup(settings: kopf.OperatorSettings, **kwargs):
     # patch permissions we intentionally don't hold. In-memory storage is fine
     # for namespace handlers — they complete quickly and are idempotent on retry.
     settings.persistence.progress_storage = _NoWriteProgressStorage()
-    settings.persistence.diffbase_storage = _NoWriteDiffBaseStorage()
+    settings.persistence.diffbase_storage = DIFFBASE_STORAGE
     settings.persistence.finalizer = None
 
     start_http_server(METRICS_PORT)
