@@ -249,11 +249,11 @@ class TestRunClusterAudit:
         mock_spread.assert_not_called()
 
 
-def _failure_count(namespace, operation):
+def _failure_count(namespace, operation, error_class="internal"):
     from prometheus_client import REGISTRY
     return REGISTRY.get_sample_value(
         "kube_image_checker_reconcile_failures_total",
-        {"namespace": namespace, "operation": operation},
+        {"namespace": namespace, "operation": operation, "error_class": error_class},
     ) or 0.0
 
 
@@ -365,6 +365,103 @@ class TestReconcileFailureVisibility:
 
         records = [r for r in caplog.records if "Failed to deploy checker" in r.getMessage()]
         assert records and records[0].exc_info is not None
+
+
+class TestProbeResilience:
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_a_non_404_probe_error_does_not_abort_the_whole_pass(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+        mock_deploy, mock_wait, mock_secrets,
+    ):
+        # This used to re-raise, escaping the loop: every namespace after the
+        # failing one went unreconciled, and the pass aborted before the status
+        # was written, so the staleness was silent.
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = [
+            ApiException(status=403, reason="Forbidden"),
+            _404(),
+            _404(),
+        ]
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("forbidden"), _make_namespace("after-1"), _make_namespace("after-2"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["forbidden"]["deployed"] is False
+        assert "state unknown" in result["forbidden"]["reason"]
+        # The namespaces behind it were still reconciled.
+        assert result["after-1"]["deployed"] is True
+        assert result["after-2"]["deployed"] is True
+        assert mock_deploy.call_count == 2
+
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_probe_failure_is_counted_as_an_api_error(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+    ):
+        before = _failure_count("probe-ns", "probe", "api")
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = ApiException(status=503)
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("probe-ns"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        assert _failure_count("probe-ns", "probe", "api") == before + 1
+
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_a_404_still_means_no_checker_rather_than_a_failure(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+    ):
+        # 404 is the normal "not deployed yet" answer and must not be counted.
+        before = _failure_count("fresh-ns", "probe", "api")
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = _404()
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("fresh-ns"),
+        ]
+
+        with patch("kubeic_operator.deployer.deploy_checker"), \
+             patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True), \
+             patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None):
+            from kubeic_operator.main import _reconcile_checkers
+            result = _reconcile_checkers()
+
+        assert result["fresh-ns"]["deployed"] is True
+        assert _failure_count("fresh-ns", "probe", "api") == before
+
+
+class TestErrorClass:
+    def test_api_exceptions_are_operational(self):
+        from kubeic_operator.main import _error_class
+        assert _error_class(ApiException(status=403)) == "api"
+        assert _error_class(ApiException(status=503)) == "api"
+
+    def test_anything_else_is_an_operator_defect(self):
+        # The distinction #66 wanted from narrowing the except clauses, without
+        # giving up continue-on-failure across namespaces.
+        from kubeic_operator.main import _error_class
+        assert _error_class(TypeError("bad")) == "internal"
+        assert _error_class(AttributeError("bad")) == "internal"
+        assert _error_class(RuntimeError("bad")) == "internal"
 
 
 class TestDiffBaseEviction:

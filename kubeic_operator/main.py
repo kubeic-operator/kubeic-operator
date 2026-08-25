@@ -139,6 +139,26 @@ def _get_default_policy() -> dict:
         return {}
 
 
+def _error_class(exc: Exception) -> str:
+    """Whether a failure came from the API server or from our own code.
+
+    An ApiException is an operational condition — a 403 from an admission
+    webhook, a 409, a 503 — and retrying next pass is the right response. Any
+    other exception reaching a reconcile handler is a defect in this operator
+    and wants a human. Both stay non-fatal for the remaining namespaces; the
+    label is what tells them apart.
+    """
+    return "api" if isinstance(exc, client.ApiException) else "internal"
+
+
+def _record_failure(namespace: str, operation: str, exc: Exception) -> None:
+    """Log with a traceback and count a reconcile failure."""
+    logger.exception("Failed to %s checker in %s", operation, namespace)
+    kube_image_checker_reconcile_failures_total.labels(
+        namespace=namespace, operation=operation, error_class=_error_class(exc),
+    ).inc()
+
+
 def _failure_reason(exc: Exception) -> str:
     """Compact one-line description of an exception for the IAP status field.
 
@@ -182,11 +202,8 @@ def _bootstrap_checkers() -> None:
                                       check_interval_minutes=interval, credential_source=cred_source,
                                       secret_names=get_secret_names_for_namespace(name))
             logger.info("Bootstrapped checker in namespace %s", name)
-        except Exception:
-            logger.exception("Failed to bootstrap checker in %s", name)
-            kube_image_checker_reconcile_failures_total.labels(
-                namespace=name, operation="deploy",
-            ).inc()
+        except Exception as exc:
+            _record_failure(name, "deploy", exc)
 
 
 def _reconcile_checkers() -> dict:
@@ -226,9 +243,19 @@ def _reconcile_checkers() -> dict:
         try:
             apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, name)
             checker_exists = True
-        except client.ApiException as e:
-            if e.status != 404:
-                raise
+        except client.ApiException as exc:
+            if exc.status != 404:
+                # Previously this re-raised, which escaped the loop entirely:
+                # one namespace answering 403 or 503 left every namespace after
+                # it unreconciled, and aborted the pass before the status was
+                # written, so the staleness was silent. Skip this namespace and
+                # let the next pass retry it.
+                _record_failure(name, "probe", exc)
+                namespace_status[name] = {
+                    "deployed": False,
+                    "reason": f"state unknown: {_failure_reason(exc)}",
+                }
+                continue
 
         if should and not checker_exists:
             interval = policy.get("availability", {}).get("intervalMinutes", 30)
@@ -247,10 +274,7 @@ def _reconcile_checkers() -> dict:
                 # outcome rather than the intent. Reporting deployed: true here
                 # made a namespace that failed every pass indistinguishable
                 # from a healthy one.
-                logger.exception("Failed to deploy checker in %s", name)
-                kube_image_checker_reconcile_failures_total.labels(
-                    namespace=name, operation="deploy",
-                ).inc()
+                _record_failure(name, "deploy", exc)
                 namespace_status[name] = {
                     "deployed": False,
                     "reason": f"deploy failed: {_failure_reason(exc)}",
@@ -263,10 +287,7 @@ def _reconcile_checkers() -> dict:
                 teardown_checker_serialised(name, blocking=True)
                 logger.info("Reconciled: removed checker from %s", name)
             except Exception as exc:
-                logger.exception("Failed to teardown checker in %s", name)
-                kube_image_checker_reconcile_failures_total.labels(
-                    namespace=name, operation="teardown",
-                ).inc()
+                _record_failure(name, "teardown", exc)
                 # The checker is still there, so deployed stays true.
                 namespace_status[name] = {
                     "deployed": True,
