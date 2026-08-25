@@ -45,6 +45,40 @@ def test_namespace(kubectl):
 
 
 @pytest.fixture(scope="session")
+def read_metrics(kubectl):
+    """Scrape a pod's own /metrics from inside it.
+
+    urllib rather than curl or wget: the checker image is python:3.13-slim plus
+    skopeo, so python is the only HTTP client guaranteed to be present.
+    """
+    def _read(namespace, pod):
+        result = kubectl(
+            "exec", pod, "-n", namespace, "--",
+            "python", "-c",
+            "import urllib.request;"
+            "print(urllib.request.urlopen('http://localhost:9090/metrics', timeout=10).read().decode())",
+            timeout=45, check=False,
+        )
+        return result.stdout
+    return _read
+
+
+@pytest.fixture(scope="session")
+def poll_for():
+    """Retry until a callable returns something truthy, then return it."""
+    def _poll(fn, timeout, interval=10, what="condition"):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = fn()
+            if last:
+                return last
+            time.sleep(interval)
+        pytest.fail(f"Timed out after {timeout}s waiting for {what}; last saw: {last!r}")
+    return _poll
+
+
+@pytest.fixture(scope="session")
 def operator_pod(kubectl, operator_namespace):
     result = kubectl(
         "get", "pods", "-n", operator_namespace,

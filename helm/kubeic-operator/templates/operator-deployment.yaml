@@ -36,6 +36,16 @@ spec:
               value: {{ .Release.Namespace | quote }}
             - name: CHECKER_ENABLED
               value: {{ .Values.checker.enabled | quote }}
+            - name: CHECKER_MODE
+              value: {{ include "kubeic-operator.checkerMode" . | quote }}
+            # Referenced, never created: Helm owns the central checker. The
+            # operator needs the ServiceAccount name to bind it into audited
+            # namespaces, and the Deployment name to report whether the cluster
+            # is actually being audited.
+            - name: CENTRAL_CHECKER_SERVICE_ACCOUNT
+              value: {{ include "kubeic-operator.centralCheckerName" . | quote }}
+            - name: CENTRAL_CHECKER_DEPLOYMENT
+              value: {{ include "kubeic-operator.centralCheckerName" . | quote }}
             - name: CHECKER_IMAGE
               value: {{ include "kubeic-operator.checkerImage" . | quote }}
             - name: CHECKER_SERVICE

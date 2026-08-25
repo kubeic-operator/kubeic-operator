@@ -170,14 +170,84 @@ def _failure_reason(exc: Exception) -> str:
     return text[:200]
 
 
+def _not_audited_reason(labels: dict, policy: dict) -> str:
+    """Why a namespace is not being audited, for the IAP status field."""
+    from kubeic_operator.deployer import CHECKER_ENABLED
+
+    if not CHECKER_ENABLED:
+        return "checkers disabled"
+    excluded_labels = policy.get("namespaceSelector", {}).get("excludeLabels", {})
+    for key, value in excluded_labels.items():
+        if labels.get(key) == value:
+            return f"excluded by label {key}={value}"
+    return "excluded"
+
+
+def _central_checker_state(apps_v1) -> str:
+    """State of the Helm-owned central checker Deployment: ready, unavailable or missing.
+
+    Read rather than reconciled — the operator deliberately does not own this
+    Deployment. Reporting it is still worth a call per pass: in central mode
+    every namespace's coverage depends on this one pod, so without it the IAP
+    status could only say "no checker here" for the whole cluster.
+    """
+    from kubeic_operator.deployer import CENTRAL_CHECKER_DEPLOYMENT
+
+    operator_ns = os.environ.get("OPERATOR_NAMESPACE", "kubeic-operator")
+    try:
+        deployment = apps_v1.read_namespaced_deployment(CENTRAL_CHECKER_DEPLOYMENT, operator_ns)
+    except client.ApiException as exc:
+        if exc.status != 404:
+            logger.warning("Cannot read central checker Deployment %s: %s", CENTRAL_CHECKER_DEPLOYMENT, exc)
+            return "unavailable"
+        logger.warning(
+            "Central mode is enabled but Deployment %s/%s does not exist; no images are being audited",
+            operator_ns, CENTRAL_CHECKER_DEPLOYMENT,
+        )
+        return "missing"
+    return "ready" if (deployment.status.available_replicas or 0) > 0 else "unavailable"
+
+
+def _central_namespace_status(
+    audited: bool, labels: dict, policy: dict, central_state: str, grant_error: str | None,
+) -> dict:
+    """Per-namespace IAP status when one cluster-wide checker covers every namespace.
+
+    `deployed` keeps meaning "this namespace is being audited", so here it
+    tracks the single central Deployment rather than a checker of the
+    namespace's own. Reporting it per namespace rather than once keeps the
+    status field's shape identical across modes, so anything reading it does
+    not need to know which mode the cluster is in.
+    """
+    if not audited:
+        return {"deployed": False, "reason": _not_audited_reason(labels, policy)}
+    if grant_error:
+        # The checker is running but cannot read this namespace's pull secrets,
+        # so private images here will read as unavailable. Not "deployed".
+        return {"deployed": False, "reason": f"secret grant failed: {grant_error}"}
+    if central_state == "missing":
+        return {"deployed": False, "reason": "central checker Deployment not found"}
+    if central_state != "ready":
+        return {"deployed": False, "reason": "central checker unavailable"}
+    return {"deployed": True, "reason": "audited by central checker"}
+
+
 def _bootstrap_checkers() -> None:
     from kubeic_operator.deployer import (
-        CHECKER_ENABLED, deploy_checker_serialised, get_secret_names_for_namespace,
+        CENTRAL_MODE, CHECKER_ENABLED, deploy_checker_serialised, get_secret_names_for_namespace,
     )
-    from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
+    from kubeic_operator.handlers.namespace import _should_deploy_checker, _get_effective_policy
 
     if not CHECKER_ENABLED:
         logger.info("Checkers disabled (checker.enabled=false); skipping bootstrap")
+        return
+
+    if CENTRAL_MODE:
+        # Nothing to pace: there are no per-namespace checker pods to create.
+        # Reconcile, which runs immediately after this, converges the central
+        # checker's per-namespace secret grants and drains any checkers left
+        # over from perNamespace mode.
+        logger.info("Central mode (checker.mode=central); skipping per-namespace bootstrap")
         return
 
     v1 = client.CoreV1Api()
@@ -191,7 +261,7 @@ def _bootstrap_checkers() -> None:
         name = ns.metadata.name
         labels = ns.metadata.labels or {}
         policy = _get_effective_policy(name)
-        if not _should_audit(name, labels, policy):
+        if not _should_deploy_checker(name, labels, policy):
             continue
         interval = policy.get("availability", {}).get("intervalMinutes", 30)
         cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
@@ -212,11 +282,14 @@ def _reconcile_checkers() -> dict:
     Returns a dict of namespace -> {deployed, reason} for status reporting.
     """
     from kubeic_operator.deployer import (
-        CHECKER_DEPLOYMENT, CHECKER_ENABLED, deploy_checker_serialised,
+        CENTRAL_MODE, CHECKER_DEPLOYMENT, CHECKER_ENABLED, deploy_checker_serialised,
+        ensure_central_secret_access, teardown_central_secret_access,
         teardown_checker_serialised,
         get_secret_names_for_namespace,
     )
-    from kubeic_operator.handlers.namespace import _should_audit, _get_effective_policy
+    from kubeic_operator.handlers.namespace import (
+        _should_audit, _should_deploy_checker, _get_effective_policy,
+    )
 
     v1 = client.CoreV1Api()
     apps_v1 = client.AppsV1Api()
@@ -232,12 +305,33 @@ def _reconcile_checkers() -> dict:
     if evicted:
         logger.debug("Evicted %d diff-base entries for deleted namespaces", evicted)
 
+    # One probe per pass, not per namespace: in central mode every namespace's
+    # coverage comes from this single Deployment.
+    central_state = _central_checker_state(apps_v1) if CENTRAL_MODE and CHECKER_ENABLED else "missing"
+
     namespace_status = {}
     for ns in namespaces:
         name = ns.metadata.name
         labels = ns.metadata.labels or {}
         policy = _get_effective_policy(name)
-        should = _should_audit(name, labels, policy)
+        audited = _should_audit(name, labels, policy)
+        should = _should_deploy_checker(name, labels, policy)
+
+        # Central mode binds the one checker into each audited namespace so it
+        # can read that namespace's pull secrets, and unbinds it everywhere
+        # else. Done before the pod bookkeeping below because the two are
+        # independent: during a switch from perNamespace the grants need to
+        # exist while the old checkers are still draining.
+        grant_error = None
+        if CENTRAL_MODE:
+            try:
+                if audited:
+                    ensure_central_secret_access(name, get_secret_names_for_namespace(name))
+                elif teardown_central_secret_access(name):
+                    logger.info("Reconciled: revoked central checker secret access to %s", name)
+            except Exception as exc:
+                _record_failure(name, "secret-grant", exc)
+                grant_error = _failure_reason(exc)
 
         checker_exists = False
         try:
@@ -251,10 +345,15 @@ def _reconcile_checkers() -> dict:
                 # written, so the staleness was silent. Skip this namespace and
                 # let the next pass retry it.
                 _record_failure(name, "probe", exc)
-                namespace_status[name] = {
-                    "deployed": False,
-                    "reason": f"state unknown: {_failure_reason(exc)}",
-                }
+                # In central mode this probe only looks for a leftover
+                # perNamespace checker, so failing it says nothing about whether
+                # the namespace is being audited — the central checker answers
+                # that. The failure is still counted above.
+                namespace_status[name] = (
+                    _central_namespace_status(audited, labels, policy, central_state, grant_error)
+                    if CENTRAL_MODE
+                    else {"deployed": False, "reason": f"state unknown: {_failure_reason(exc)}"}
+                )
                 continue
 
         if should and not checker_exists:
@@ -294,18 +393,21 @@ def _reconcile_checkers() -> dict:
                     "reason": f"teardown failed: {_failure_reason(exc)}",
                 }
                 continue
-            if not CHECKER_ENABLED:
-                reason = "checkers disabled"
-            else:
-                reason = "excluded"
-                excluded_ns = policy.get("namespaceSelector", {}).get("excludeLabels", {})
-                for k, v in excluded_ns.items():
-                    if labels.get(k) == v:
-                        reason = f"excluded by label {k}={v}"
-                        break
-            namespace_status[name] = {"deployed": False, "reason": reason}
+            namespace_status[name] = {
+                "deployed": False,
+                "reason": "central mode" if CENTRAL_MODE else _not_audited_reason(labels, policy),
+            }
         elif should:
             namespace_status[name] = {"deployed": True}
+
+        # In central mode the branches above only ever drain checkers left from
+        # perNamespace mode, so whatever they concluded describes a pod that is
+        # meant to be gone. The namespace's real coverage is the central
+        # checker, so that is what the status reports.
+        if CENTRAL_MODE:
+            namespace_status[name] = _central_namespace_status(
+                audited, labels, policy, central_state, grant_error,
+            )
 
     return namespace_status
 

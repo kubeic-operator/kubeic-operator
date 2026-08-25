@@ -4,9 +4,11 @@ import kopf
 from kubernetes import client
 
 from kubeic_operator.deployer import (
+    CENTRAL_MODE,
     CHECKER_ENABLED,
     EXCLUDED_NAMESPACES,
     deploy_checker_serialised,
+    ensure_central_secret_access,
     get_secret_names_for_namespace,
     teardown_checker_serialised,
 )
@@ -58,9 +60,13 @@ def _get_operator_namespace() -> str:
 
 
 def _should_audit(namespace: str, labels: dict | None, policy: dict) -> bool:
-    # Single choke point for "should a checker exist here", so disabling
-    # checkers needs no separate teardown path: _reconcile_checkers already
-    # removes a checker wherever this returns False and one exists.
+    """Whether this namespace's images should be audited at all.
+
+    Independent of *how* they get audited. In central mode this still answers
+    True for an ordinary namespace — the auditing is done by the one cluster-wide
+    checker — and it is what decides whether that checker is granted access to
+    the namespace's pull secrets.
+    """
     if not CHECKER_ENABLED:
         return False
 
@@ -76,6 +82,20 @@ def _should_audit(namespace: str, labels: dict | None, policy: dict) -> bool:
                 return False
 
     return True
+
+
+def _should_deploy_checker(namespace: str, labels: dict | None, policy: dict) -> bool:
+    """Whether a per-namespace checker Deployment should exist in this namespace.
+
+    Single choke point for "should a checker pod exist here", so neither
+    disabling checkers nor switching to central mode needs a teardown path of
+    its own: _reconcile_checkers already removes a checker wherever this returns
+    False and one exists. Switching mode to central makes this False everywhere
+    at once, and the next reconcile pass drains the cluster.
+    """
+    if CENTRAL_MODE:
+        return False
+    return _should_audit(namespace, labels, policy)
 
 
 # No @kopf.on.resume here: it is unreachable in this operator. Kopf reads the
@@ -94,6 +114,15 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
     policy = _get_effective_policy(namespace)
 
     if not _should_audit(namespace, labels, policy):
+        return
+
+    if CENTRAL_MODE:
+        # No pod to deploy — the cluster-wide checker picks the namespace up on
+        # its next sweep. It cannot read the namespace's pull secrets until it
+        # is bound in, though, and waiting for the next reconcile pass to do
+        # that would make a new namespace's private images look unavailable for
+        # up to a full scan interval.
+        ensure_central_secret_access(namespace, get_secret_names_for_namespace(namespace))
         return
 
     availability = policy.get("availability", {})

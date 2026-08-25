@@ -856,3 +856,342 @@ class TestTerminatedPodsExcluded:
         finally:
             metrics.kube_image_available.clear()
             metrics.kube_image_credential_valid.clear()
+
+
+def _namespace(name, labels=None):
+    ns = MagicMock()
+    ns.metadata.name = name
+    ns.metadata.labels = labels
+    return ns
+
+
+def _namespace_list(*namespaces):
+    return MagicMock(items=list(namespaces))
+
+
+class TestParseExcludeLabels:
+    def _parse(self, raw):
+        from kubeic_checker.main import _parse_exclude_labels
+        with patch.dict("os.environ", {"EXCLUDE_LABELS": raw}):
+            return _parse_exclude_labels()
+
+    def test_reads_a_json_object(self):
+        assert self._parse('{"audit": "disabled"}') == {"audit": "disabled"}
+
+    def test_empty_means_no_exclusions(self):
+        # Helm renders an unset value as "", not as an absent variable.
+        assert self._parse("") == {}
+        assert self._parse("   ") == {}
+
+    def test_empty_object_means_no_exclusions(self):
+        assert self._parse("{}") == {}
+
+    def test_malformed_json_falls_back_to_no_exclusions(self):
+        # Raising here would crash the checker at import and stop all auditing,
+        # which is worse than auditing a namespace that asked not to be.
+        assert self._parse("{not json") == {}
+
+    def test_non_object_json_falls_back_to_no_exclusions(self):
+        assert self._parse('["audit"]') == {}
+        assert self._parse('"audit"') == {}
+
+    def test_coerces_non_string_values(self):
+        # Helm can render a bare `true` or a number into the JSON; label
+        # comparison is string-to-string, so both sides must be strings.
+        assert self._parse('{"audit": true, "tier": 3}') == {"audit": "True", "tier": "3"}
+
+
+class TestResolveExcludedNamespaces:
+    def setup_method(self):
+        # Module-level cache: without resetting it, one test's successful list
+        # would satisfy the next test's failure path.
+        import kubeic_checker.main as checker_main
+        checker_main._last_excluded = None
+
+    teardown_method = setup_method
+
+    def _resolve(self, static=frozenset(), labels=None, namespaces=None, list_error=None):
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        if list_error is not None:
+            mock_v1.list_namespace.side_effect = list_error
+        else:
+            mock_v1.list_namespace.return_value = namespaces or _namespace_list()
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", static),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", labels or {}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            return _resolve_excluded_namespaces(), mock_v1
+
+    def test_returns_the_static_list(self):
+        excluded, _ = self._resolve(static=frozenset({"kube-public", "kube-node-lease"}))
+        assert excluded == {"kube-public", "kube-node-lease"}
+
+    def test_skips_the_namespace_list_when_no_labels_are_configured(self):
+        # The label lookup is the only reason this needs namespaces get/list.
+        # With no labels configured it must not spend an API call per cycle.
+        _, mock_v1 = self._resolve(static=frozenset({"kube-public"}))
+        mock_v1.list_namespace.assert_not_called()
+
+    def test_excludes_a_namespace_carrying_the_label(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(
+                _namespace("opted-out", {"audit": "disabled"}),
+                _namespace("normal", {"team": "platform"}),
+            ),
+        )
+        assert excluded == {"opted-out"}
+
+    def test_requires_the_label_value_to_match(self):
+        # `audit: enabled` must not be read as an opt-out.
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("keen", {"audit": "enabled"})),
+        )
+        assert excluded == set()
+
+    def test_any_one_of_several_labels_excludes(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled", "kubeic.io/skip": "true"},
+            namespaces=_namespace_list(
+                _namespace("by-first", {"audit": "disabled"}),
+                _namespace("by-second", {"kubeic.io/skip": "true"}),
+                _namespace("by-neither", {}),
+            ),
+        )
+        assert excluded == {"by-first", "by-second"}
+
+    def test_handles_a_namespace_with_no_labels(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("bare", None)),
+        )
+        assert excluded == set()
+
+    def test_unions_the_static_list_with_label_matches(self):
+        excluded, _ = self._resolve(
+            static=frozenset({"kube-public"}),
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("opted-out", {"audit": "disabled"})),
+        )
+        assert excluded == {"kube-public", "opted-out"}
+
+    def test_raises_when_the_list_fails_and_nothing_is_cached(self):
+        # Failing open would audit namespaces that explicitly opted out. The
+        # caller treats the raise as a failed cycle and retries on the next one.
+        with pytest.raises(RuntimeError):
+            self._resolve(
+                labels={"audit": "disabled"},
+                list_error=RuntimeError("apiserver unavailable"),
+            )
+
+    def test_reuses_the_previous_answer_when_the_list_fails(self):
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.return_value = _namespace_list(
+            _namespace("opted-out", {"audit": "disabled"}),
+        )
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            assert _resolve_excluded_namespaces() == {"opted-out"}
+
+            # A transient failure on the next cycle must not silently re-include
+            # the namespace that opted out.
+            mock_v1.list_namespace.side_effect = RuntimeError("transient")
+            assert _resolve_excluded_namespaces() == {"opted-out"}
+
+    def test_a_relabelled_namespace_is_picked_up_on_the_next_cycle(self):
+        # Recomputed per cycle rather than cached for the pod's lifetime, so an
+        # opt-out applied today takes effect within one interval.
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.return_value = _namespace_list(_namespace("app", {}))
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            assert _resolve_excluded_namespaces() == set()
+
+            mock_v1.list_namespace.return_value = _namespace_list(
+                _namespace("app", {"audit": "disabled"}),
+            )
+            assert _resolve_excluded_namespaces() == {"app"}
+
+
+class TestGetPodsExclusion:
+    @patch("kubeic_checker.main.client")
+    def test_drops_pods_from_excluded_namespaces(self, mock_client_module):
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([
+            _make_mock_pod(name="keep", namespace="app"),
+            _make_mock_pod(name="drop", namespace="opted-out"),
+        ])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("", exclude=frozenset({"opted-out"}))
+
+        assert [p["metadata"]["name"] for p in result] == ["keep"]
+
+    @patch("kubeic_checker.main.client")
+    def test_excludes_across_every_page(self, mock_client_module):
+        # The filter is applied per page, so it must not be defeated by an
+        # excluded namespace appearing only in a later page.
+        first = MagicMock(items=[_make_mock_pod(name="keep", namespace="app")])
+        first.metadata._continue = "tok-1"
+        second = MagicMock(items=[_make_mock_pod(name="drop", namespace="opted-out")])
+        second.metadata._continue = ""
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.side_effect = [first, second]
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("", exclude=frozenset({"opted-out"}))
+
+        assert [p["metadata"]["name"] for p in result] == ["keep"]
+
+    @patch("kubeic_checker.main.client")
+    def test_no_exclusions_by_default(self, mock_client_module):
+        # perNamespace mode passes no exclude set, and must be unaffected.
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.return_value = _pod_page([
+            _make_mock_pod(name="a", namespace="testns"),
+        ])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        assert len(_get_pods("testns")) == 1
+
+
+class TestCentralCycleHonoursExclusions:
+    """A whole cycle in central mode, proving an excluded namespace produces
+    neither a registry call nor a metric.
+
+    The exclusion parity gap this closes: in perNamespace mode an excluded
+    namespace never gets a checker, so nothing enforces it in code. A central
+    checker lists every pod in the cluster, so without this filter switching
+    mode would silently start auditing every namespace that had opted out.
+    """
+
+    def setup_method(self):
+        from kubeic_operator import metrics
+        metrics.kube_image_available.clear()
+        metrics.kube_image_credential_valid.clear()
+        import kubeic_checker.main as checker_main
+        checker_main._last_excluded = None
+
+    teardown_method = setup_method
+
+    def _run_central(self, pods, namespaces, static=frozenset(), labels=None):
+        """Run one central-mode cycle; returns the fake registry it talked to.
+
+        Both images are public, so anything reaching the registry succeeds — an
+        excluded image being absent from inspect_calls therefore means it was
+        filtered out, not that it merely failed.
+        """
+        registry = _FakeRegistry({}, public_repos={
+            "docker://r.corp.io/org/included:v1",
+            "docker://r.corp.io/org/excluded:v1",
+        })
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page(pods)
+        mock_v1.list_namespace.return_value = namespaces
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.CENTRAL_MODE", True),
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", static),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", labels or {}),
+            patch("kubeic_checker.availability.time.sleep"),
+            patch("kubeic_checker.availability.subprocess.run", side_effect=registry),
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            _run_one_cycle()
+        return registry
+
+    @staticmethod
+    def _available(namespace, image, pod):
+        from prometheus_client import REGISTRY
+        return REGISTRY.get_sample_value("kube_image_available", {
+            "image": image, "registry": "r.corp.io",
+            "image_name": image.split("/", 1)[1].rsplit(":", 1)[0],
+            "namespace": namespace, "pod": pod, "container": "main", "error_class": "",
+        })
+
+    def test_a_label_excluded_namespace_is_neither_inspected_nor_measured(self):
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+        namespaces = _namespace_list(
+            _namespace("included", {}),
+            _namespace("opted-out", {"audit": "disabled"}),
+        )
+
+        self._run_central(pods, namespaces, labels={"audit": "disabled"})
+
+        assert self._available("included", "r.corp.io/org/included:v1", "in") == 1
+        # Not merely a different value — the series must not exist at all.
+        assert self._available("opted-out", "r.corp.io/org/excluded:v1", "out") is None
+
+    def test_a_statically_excluded_namespace_is_not_audited(self):
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="kube-public",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+
+        self._run_central(pods, _namespace_list(), static=frozenset({"kube-public"}))
+
+        assert self._available("included", "r.corp.io/org/included:v1", "in") == 1
+        assert self._available("kube-public", "r.corp.io/org/excluded:v1", "out") is None
+
+    def test_an_excluded_image_is_never_sent_to_the_registry(self):
+        # Auditing an opted-out namespace would also mean authenticating against
+        # its registries, which is a side effect the opt-out is meant to prevent.
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+        namespaces = _namespace_list(
+            _namespace("included", {}), _namespace("opted-out", {"audit": "disabled"}),
+        )
+
+        registry = self._run_central(pods, namespaces, labels={"audit": "disabled"})
+
+        inspected = {ref for ref, _ in registry.inspect_calls}
+        assert inspected == {"docker://r.corp.io/org/included:v1"}
+
+    def test_a_namespace_list_failure_fails_the_cycle_rather_than_auditing_everything(self):
+        # With no cached answer the cycle must abort, not fall open. The loop's
+        # own exception handling keeps the process alive.
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.side_effect = RuntimeError("apiserver unavailable")
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ])
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.CENTRAL_MODE", True),
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.availability.subprocess.run") as mock_run,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            _run_one_cycle()  # KeyboardInterrupt from sleep, not RuntimeError
+
+        mock_run.assert_not_called()
+        assert self._available("opted-out", "r.corp.io/org/excluded:v1", "out") is None

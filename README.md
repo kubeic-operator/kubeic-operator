@@ -19,7 +19,13 @@ Kubernetes operator that audits running pod images for availability, pre-release
 
 ## Architecture
 
-The operator deploys a checker pod into each audited namespace. Checkers handle image availability and credential checks locally (using namespace-scoped secrets access). The operator handles cluster-wide checks (pre-release age, version spread) that only need pod specs.
+The operator handles cluster-wide checks (pre-release age, version spread) that only need pod specs. Image availability and credential checks need registry access and pull secrets, so they run in a separate checker workload.
+
+There are two layouts, chosen with `checker.mode`.
+
+### `perNamespace` (default)
+
+The operator deploys a checker pod into each audited namespace, each reading only its own namespace's pods and secrets.
 
 ```text
 Operator (cluster-scoped)          Per-namespace Checkers
@@ -30,6 +36,36 @@ Operator (cluster-scoped)          Per-namespace Checkers
  - exposes /metrics                  - digest verification
                                     - exposes /metrics
 ```
+
+### `central`
+
+One checker for the whole cluster, owned by the chart rather than by the operator, and no per-namespace checkers at all.
+
+```text
+Operator (cluster-scoped)          Central Checker (one per cluster)
+ - watches namespaces               - lists all pods, in pages
+ - grants/revokes secret access     - reads imagePullSecrets per namespace,
+   per namespace                       via the grants the operator creates
+ - pre-release age checks           - applies namespace exclusions itself
+ - version spread checks            - skopeo inspect / list-tags, paced
+ - exposes /metrics                   across the interval
+                                    - exposes /metrics
+```
+
+This trades detection latency for memory. Measured across a nine-cluster estate, 222 per-namespace checkers held 13.35 GiB resident, roughly 61 MiB of which is a Python interpreter floor paid once per pod rather than per unit of work. One checker per cluster is around 70 MiB.
+
+Switching mode needs no migration step: every namespace stops wanting a checker of its own, and the operator's ordinary reconcile drains the existing ones one at a time, at the same pace as any other rollout.
+
+**The central checker gets no cluster-wide `secrets` access.** That would hand every secret in the cluster to a pod that runs `skopeo` against arbitrary registries — strictly worse than the per-namespace checkers it replaces, each of which could only read its own namespace. Instead the operator creates a `kubeic-checker-central` Role and RoleBinding in each audited namespace, so the checker's reach is the union of the namespaces actually being audited. This is also what keeps `noSecretNamespaces` and `namespaceSecrets` working, since a ClusterRole's `resourceNames` are cluster-wide names and cannot express "these secret names, but only in this namespace".
+
+Two things behave differently in central mode:
+
+| | `perNamespace` | `central` |
+|---|---|---|
+| `availability.intervalMinutes`, `credentialSource.type` | per-namespace `ImageAuditPolicy` can override | Helm `policy` values only — there is no per-namespace checker to configure |
+| `excludedNamespaces`, `namespaceSelector.excludeLabels` | enforced by not deploying a checker | applied by the checker itself, from Helm values. A namespace excluded *only* by its own namespace-scoped `ImageAuditPolicy` is still audited |
+| `noSecretNamespaces`, `namespaceSecrets` | Role shape per namespace | unchanged — enforced by the per-namespace grants above |
+| `ImageAuditPolicy` status `deployed` | this namespace's own checker | the single central Deployment, with reason `audited by central checker` |
 
 ## Installation
 
@@ -77,8 +113,10 @@ operator:
   podLabels: {}
   podAnnotations: {}
 
-# Checker settings (per-namespace deployments)
+# Checker settings
 checker:
+  # perNamespace (one checker per audited namespace) or central (one per cluster)
+  mode: perNamespace
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/checker
     tag: "0.0.1-alpha.8"
@@ -90,6 +128,11 @@ checker:
   # namespaceSecrets:
   #   kube-system:
   #     - my-pull-secret
+  # Only used when mode is central
+  central:
+    resources:
+      requests: {cpu: 50m, memory: 256Mi}
+      limits: {cpu: 500m, memory: 512Mi}
 ```
 
 Per-namespace overrides:
@@ -272,11 +315,21 @@ genuinely cannot pull surfaces as `ImagePullBackOff`, which this chart does not 
 # Install dependencies
 pip install -e ".[dev]"
 
-# Run tests
-pytest tests/ -v
+# Run unit tests
+pytest tests/unit/ -v
 
-# Render Helm chart locally
+# Run integration tests (needs a cluster with the chart installed)
+pytest tests/integration/ -v -m "not central"
+
+# Central-mode integration tests drain every per-namespace checker, so they
+# need the release upgraded first and cannot share a cluster with the above
+helm upgrade kubeic-operator ./helm/kubeic-operator --reuse-values \
+  --set checker.mode=central --wait
+pytest tests/integration/test_central_mode.py -v -m central
+
+# Render Helm chart locally, in either mode
 helm template test helm/kubeic-operator
+helm template test helm/kubeic-operator --set checker.mode=central
 ```
 
 ## Licence

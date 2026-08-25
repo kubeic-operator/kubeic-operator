@@ -5,6 +5,7 @@ from kubernetes.client import ApiException
 from kubeic_operator.handlers.namespace import (
     _get_effective_policy,
     _should_audit,
+    _should_deploy_checker,
     on_namespace_create,
     on_namespace_delete,
 )
@@ -170,3 +171,86 @@ class TestOnNamespaceDelete:
         # Non-blocking: the namespace is going away, so Kubernetes GCs the
         # checker anyway if a rollout holds the lock.
         mock_teardown.assert_called_once_with("my-app", blocking=False)
+
+
+class TestShouldDeployChecker:
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", False)
+    def test_matches_should_audit_in_per_namespace_mode(self):
+        assert _should_deploy_checker("my-app", {}, {}) is True
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", False)
+    @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-public"})
+    def test_still_honours_exclusions_in_per_namespace_mode(self):
+        assert _should_deploy_checker("kube-public", {}, {}) is False
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    def test_false_for_every_namespace_in_central_mode(self):
+        # This is what makes switching mode free: _reconcile_checkers already
+        # removes a checker wherever this is False and one exists, so the whole
+        # per-namespace fleet drains with no separate migration path.
+        assert _should_deploy_checker("my-app", {}, {}) is False
+        assert _should_deploy_checker("another", {"audit": "enabled"}, {}) is False
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    def test_central_mode_does_not_stop_a_namespace_being_audited(self):
+        # The two predicates are deliberately different answers: no pod here,
+        # but the namespace is still audited by the central checker, which is
+        # what grants it secret access.
+        assert _should_deploy_checker("my-app", {}, {}) is False
+        assert _should_audit("my-app", {}, {}) is True
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    def test_disabled_checkers_still_win_in_central_mode(self):
+        assert _should_deploy_checker("my-app", {}, {}) is False
+        assert _should_audit("my-app", {}, {}) is False
+
+
+class TestOnNamespaceCreateCentralMode:
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.handlers.namespace.ensure_central_secret_access")
+    @patch("kubeic_operator.handlers.namespace.deploy_checker_serialised")
+    def test_grants_secret_access_and_deploys_no_pod(
+        self, mock_deploy, mock_grant, mock_policy, mock_secrets,
+    ):
+        meta = MagicMock()
+        meta.name = "my-app"
+        meta.labels = {}
+
+        on_namespace_create(body={}, meta=meta)
+
+        # Done eagerly rather than left to the next reconcile: until the central
+        # checker is bound in, this namespace's private images read as
+        # unavailable, and a scan interval is long enough to alert on.
+        mock_grant.assert_called_once_with("my-app", None)
+        mock_deploy.assert_not_called()
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-public"})
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.handlers.namespace.ensure_central_secret_access")
+    def test_grants_nothing_for_an_excluded_namespace(self, mock_grant, mock_policy):
+        meta = MagicMock()
+        meta.name = "kube-public"
+        meta.labels = {}
+
+        on_namespace_create(body={}, meta=meta)
+
+        mock_grant.assert_not_called()
+
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True)
+    @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=[])
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.handlers.namespace.ensure_central_secret_access")
+    def test_passes_through_no_secret_configuration(self, mock_grant, mock_policy, mock_secrets):
+        # noSecretNamespaces keeps working in central mode; the deployer reads []
+        # as "remove any grant".
+        meta = MagicMock()
+        meta.name = "kube-system"
+        meta.labels = {}
+
+        on_namespace_create(body={}, meta=meta)
+
+        mock_grant.assert_called_once_with("kube-system", [])
