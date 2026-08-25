@@ -211,7 +211,7 @@ there is no rule that silently cannot alert.
 | `kube_image_version_count` | Gauge | registry, image_name |
 | `kube_image_version_pod_count` | Gauge | registry, image_name, tag, namespace |
 | `kube_image_version_spread_violation` | Gauge | registry, image_name |
-| `kube_image_checker_reconcile_failures_total` | Counter | namespace, operation |
+| `kube_image_checker_reconcile_failures_total` | Counter | namespace, operation, error_class |
 
 ### Checker metrics (per-namespace, port 9090)
 
@@ -224,9 +224,16 @@ there is no rule that silently cannot alert.
 
 ### Reconciliation failures
 
-`kube_image_checker_reconcile_failures_total` counts checker deploy and teardown attempts that
-raised. It is a Counter rather than a Gauge specifically because the gauges above are cleared
-and repopulated every cycle, which would erase an intermittent failure before anyone saw it.
+`kube_image_checker_reconcile_failures_total` counts checker probe, deploy and teardown attempts
+that raised. It is a Counter rather than a Gauge specifically because the gauges above are
+cleared and repopulated every cycle, which would erase an intermittent failure before anyone
+saw it.
+
+`error_class` separates the two cases that want different responses. `api` is an API server
+condition — a 403 from an admission webhook, a 409, a 503 — which may clear on its own and is
+retried next pass. `internal` is a defect in the operator and will not clear by itself. Neither
+is fatal to the other namespaces in the pass: a namespace that cannot be probed or deployed is
+recorded and skipped, and the rest are still reconciled.
 
 The per-namespace outcome is also written to the `cluster-defaults` ImageAuditPolicy status,
 which records what actually happened rather than what was intended:

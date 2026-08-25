@@ -117,7 +117,7 @@ spec:
         # scrape labels collide with the metric's namespace label.
         - alert: ImageAuditReconcileFailing
           expr: |
-            max by (cluster, namespace, operation) (
+            max by (cluster, namespace, operation, error_class) (
               label_replace(
                 increase(kube_image_checker_reconcile_failures_total[30m]),
                 "namespace", "$1", "exported_namespace", "(.+)")
@@ -126,8 +126,8 @@ spec:
           labels:
             severity: warning
           annotations:
-            summary: "Checker {{`{{ $labels.operation }}`}} failing in {{`{{ $labels.namespace }}`}}"
-            description: "The operator could not {{`{{ $labels.operation }}`}} the checker in {{`{{ $labels.namespace }}`}} over the last 30 minutes. The ImageAuditPolicy status for that namespace carries the reason; the operator log has the traceback. Audit coverage for that namespace is degraded or absent until it succeeds."
+            summary: "Checker {{`{{ $labels.operation }}`}} failing in {{`{{ $labels.namespace }}`}} ({{`{{ $labels.error_class }}`}})"
+            description: "The operator could not {{`{{ $labels.operation }}`}} the checker in {{`{{ $labels.namespace }}`}} over the last 30 minutes. error_class=api is an API server condition — a 403 from an admission webhook, a 409, a 503 — and may clear on its own; error_class=internal is a defect in the operator and will not. The ImageAuditPolicy status for that namespace carries the reason and the operator log has the traceback. Audit coverage for that namespace is degraded or absent until it succeeds."
 
         {{- if .Values.checker.enabled }}
         - alert: RegistryCredentialInvalid

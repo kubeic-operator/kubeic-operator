@@ -79,10 +79,16 @@ kube_image_created_timestamp_seconds = Gauge(
 # cycle, which would erase an intermittent failure before anyone saw it. This
 # must never be .clear()ed — cumulative is the point, so `increase()` catches
 # a namespace that fails occasionally as well as one that fails every pass.
+# error_class separates "the API server said no" from "this operator has a
+# bug", which need different responses. It is the same split the checker
+# already applies to kube_image_available, and it is how the intent behind
+# narrowing the except clauses is met without giving up continue-on-failure:
+# an internal error stays non-fatal for the other namespaces but is labelled
+# as the code defect it is.
 kube_image_checker_reconcile_failures_total = Counter(
     "kube_image_checker_reconcile_failures_total",
-    "Checker deploy or teardown attempts that raised during reconciliation",
-    ["namespace", "operation"],
+    "Checker probe, deploy or teardown attempts that raised during reconciliation",
+    ["namespace", "operation", "error_class"],
 )
 
 
