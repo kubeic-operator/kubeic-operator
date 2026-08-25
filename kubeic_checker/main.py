@@ -6,7 +6,7 @@ import tempfile
 from kubernetes import client, config
 from prometheus_client import start_http_server
 
-from kubeic_checker.availability import check_availability, write_auth_config
+from kubeic_checker.availability import check_availability, plan_inspections, write_auth_config
 from kubeic_checker.credentials import (
     resolve_all_credentials, build_image_credentials, ResolvedCredential,
 )
@@ -25,33 +25,146 @@ CREDENTIAL_SOURCE = os.environ.get("CREDENTIAL_SOURCE", "pullSecret")
 METRICS_PORT = int(os.environ.get("METRICS_PORT", "9090"))
 CREDENTIAL_TEST_IMAGE = os.environ.get("CREDENTIAL_TEST_IMAGE", "")
 SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
+# perNamespace (this checker owns one namespace) or central (one checker for the
+# whole cluster). Only affects the scope of the pod list; everything downstream
+# is already keyed by namespace.
+CHECKER_MODE = os.environ.get("CHECKER_MODE", "perNamespace")
+POD_PAGE_SIZE = int(os.environ.get("POD_PAGE_SIZE", "500"))
 
 
-def _get_pods(namespace: str) -> list[dict]:
+def _pace_sleep(seconds: float) -> None:
+    """The pacer's sleep, deliberately separate from the end-of-cycle sleep.
+
+    Two distinct seams: tests neutralise this one to run a cycle instantly,
+    while still using the cycle sleep to break out of the infinite loop. Calling
+    time.sleep through the module rather than binding it as a default argument
+    also keeps it patchable — a default would capture the real function at
+    import.
+    """
+    time.sleep(seconds)
+
+
+class _Pacer:
+    """Spreads a known quantity of work evenly across the time left in a cycle.
+
+    The checker used to do all its work back to back and then sleep out the
+    interval. Per namespace that is a few seconds of burst against a long idle;
+    for one checker covering a whole cluster it is many minutes of solid skopeo
+    followed by an equally long idle, on a single pod.
+
+    Pacing instead of batching also removes the reason to run skopeo
+    concurrently. Workers would have multiplied peak memory by the number of
+    them — and memory is the entire remaining argument for a central checker,
+    so buying throughput with it would be self-defeating.
+
+    Recomputed every call rather than fixed up front, so a slow item shortens
+    the following gaps instead of overrunning. If the work outlasts the
+    interval the delay simply reaches zero and the sweep runs flat out, which
+    is the right degradation: it refreshes less often rather than overlapping
+    with the next cycle.
+    """
+
+    def __init__(self, deadline: float, total: int) -> None:
+        self._deadline = deadline
+        self._remaining = max(total, 0)
+
+    def __call__(self) -> None:
+        self._remaining -= 1
+        if self._remaining <= 0:
+            return
+        time_left = self._deadline - time.monotonic()
+        if time_left <= 0:
+            return
+        _pace_sleep(time_left / self._remaining)
+
+
+def _trim_pod(pod) -> dict | None:
+    """Reduce an API pod to the fields the audit needs, or None to skip it.
+
+    Terminated pods never pull their image again; auditing them makes no
+    availability claim worth alerting on — and CI job pods carry ephemeral pull
+    secrets whose tokens die with the job, so checking a Failed job pod produces
+    a guaranteed-false auth_failure.
+    """
+    if pod.status.phase in ("Succeeded", "Failed"):
+        return None
+    return {
+        "metadata": {
+            "name": pod.metadata.name,
+            # From the object, not from a caller-supplied value: a cluster-wide
+            # list spans namespaces.
+            "namespace": pod.metadata.namespace,
+            "annotations": pod.metadata.annotations or {},
+        },
+        "spec": {
+            "containers": [{"name": c.name, "image": c.image} for c in (pod.spec.containers or [])],
+            "initContainers": [{"name": c.name, "image": c.image} for c in (pod.spec.init_containers or [])],
+            "imagePullSecrets": [{"name": s.name} for s in (pod.spec.image_pull_secrets or [])],
+        },
+    }
+
+
+def _get_pods(namespace: str = "", *, page_size: int = POD_PAGE_SIZE) -> list[dict]:
+    """List auditable pods, paginated. An empty namespace lists the whole cluster.
+
+    Paginated rather than one call because an unpaginated cluster-wide list
+    deserialises every pod at once, and CPython does not return freed heap to
+    the OS — that transient peak would become the pod's resident floor for the
+    rest of its life. Each page is trimmed and discarded, so only the small
+    dicts accumulate.
+    """
     v1 = client.CoreV1Api()
-    pods = v1.list_namespaced_pod(namespace)
+    result: list[dict] = []
+    continue_token = None
 
-    result = []
-    for pod in pods.items:
-        # Terminated pods never pull their image again; auditing them makes
-        # no availability claim worth alerting on — and CI job pods carry
-        # ephemeral pull secrets whose tokens die with the job, so checking
-        # a Failed job pod produces a guaranteed-false auth_failure.
-        if pod.status.phase in ("Succeeded", "Failed"):
+    while True:
+        kwargs = {"limit": page_size}
+        if continue_token:
+            kwargs["_continue"] = continue_token
+        if namespace:
+            page = v1.list_namespaced_pod(namespace, **kwargs)
+        else:
+            page = v1.list_pod_for_all_namespaces(**kwargs)
+
+        for pod in page.items:
+            trimmed = _trim_pod(pod)
+            if trimmed is not None:
+                result.append(trimmed)
+
+        # V1ListMeta._continue is a string or absent.
+        continue_token = getattr(page.metadata, "_continue", None)
+        if not continue_token:
+            return result
+
+
+def _probeable_credentials(creds: list[ResolvedCredential]) -> list[tuple[str, ResolvedCredential]]:
+    """The credentials _check_credential_validity will actually probe.
+
+    Deduplicated by namespace, registry and source, and excluding any that
+    carry neither an auth blob nor a username and password — those are dropped
+    without a skopeo call.
+
+    Shared with the caller so the pacer is sized on the work that will really
+    happen. Sizing it on the raw credential count makes every gap shorter than
+    it should be, so the sweep finishes early and the cycle goes back to
+    burst-then-idle for the part that was over-counted.
+    """
+    seen: set[str] = set()
+    probeable: list[tuple[str, ResolvedCredential]] = []
+    for cred in creds:
+        namespace = cred.namespace or NAMESPACE
+        key = f"{namespace}/{cred.registry}/{cred.source}"
+        if key in seen:
             continue
-        result.append({
-            "metadata": {"name": pod.metadata.name, "namespace": namespace, "annotations": pod.metadata.annotations or {}},
-            "spec": {
-                "containers": [{"name": c.name, "image": c.image} for c in (pod.spec.containers or [])],
-                "initContainers": [{"name": c.name, "image": c.image} for c in (pod.spec.init_containers or [])],
-                "imagePullSecrets": [{"name": s.name} for s in (pod.spec.image_pull_secrets or [])],
-            },
-        })
-    return result
+        seen.add(key)
+        if not cred.auth and not (cred.username and cred.password):
+            continue
+        probeable.append((namespace, cred))
+    return probeable
 
 
 def _check_credential_validity(
-    creds: list[ResolvedCredential], pods: list[dict],
+    creds: list[ResolvedCredential], pods: list[dict], pacer=None,
 ) -> None:
     """Test each credential using repo-level list-tags to verify auth access.
 
@@ -61,12 +174,17 @@ def _check_credential_validity(
     Namespace comes from each credential rather than from an ambient value, so
     the same secret name in two namespaces is tested — and reported — twice
     rather than collapsing into one result.
+
+    Results are collected and published in a single clear-then-set at the end.
+    Clearing up front and setting each series as its probe finished was fine
+    when the sweep was instantaneous, but under pacing it leaves the series
+    absent from /metrics for most of the cycle. Prometheus treats an absent
+    series as stale, so RegistryCredentialInvalid — critical, with a `for` of
+    interval + 10m — would have its pending timer reset every cycle and could
+    never fire.
     """
     from kubeic_checker.availability import _run_skopeo_list_tags, _run_skopeo_inspect
     from kubeic_checker.credentials import registry_from_image
-
-    kube_image_credential_valid.clear()
-    seen: set[str] = set()
 
     # (namespace, secret_name) -> images used by pods in that namespace which
     # reference that secret. Keyed by namespace too, or a repo path from one
@@ -89,24 +207,16 @@ def _check_credential_validity(
             if secret_name:
                 secret_images.setdefault((pod_ns, secret_name), set()).update(images)
 
-    for cred in creds:
-        namespace = cred.namespace or NAMESPACE
-        key = f"{namespace}/{cred.registry}/{cred.source}"
-        if key in seen:
-            continue
-        seen.add(key)
-
+    samples: list[tuple[dict, int]] = []
+    for namespace, cred in _probeable_credentials(creds):
         auth_data = {}
+        host = cred.registry.split("/")[0]
         if cred.auth:
-            host = cred.registry.split("/")[0]
             auth_data[host] = {"auth": cred.auth}
-        elif cred.username and cred.password:
+        else:
             import base64
             token = base64.b64encode(f"{cred.username}:{cred.password}".encode()).decode()
-            host = cred.registry.split("/")[0]
             auth_data[host] = {"auth": token}
-        else:
-            continue
 
         auth_fd, auth_path = tempfile.mkstemp(suffix=".json", prefix="cred-check-")
         os.close(auth_fd)
@@ -155,23 +265,53 @@ def _check_credential_validity(
             except OSError:
                 pass
 
-        kube_image_credential_valid.labels(
-            registry=cred.registry.split("/")[0], namespace=namespace, secret_name=secret_name
-        ).set(1 if valid else 0)
+        samples.append((
+            {
+                "registry": cred.registry.split("/")[0],
+                "namespace": namespace,
+                "secret_name": secret_name,
+            },
+            1 if valid else 0,
+        ))
+
+        if pacer is not None:
+            pacer()
+
+    # Atomic swap: the previous cycle's series stay visible right up until the
+    # new set replaces them.
+    kube_image_credential_valid.clear()
+    for labels, value in samples:
+        kube_image_credential_valid.labels(**labels).set(value)
 
 
 def run_check_loop():
-    """Main checker loop: resolve creds, check availability, expose metrics."""
+    """Main checker loop: resolve creds, check availability, expose metrics.
+
+    Work inside a cycle is paced to fill the interval rather than run flat out
+    and then idle, so one checker covering a whole cluster presents a level load
+    instead of a long burst. Metrics are still published once per cycle, by
+    clear-and-repopulate, so a scrape never sees a half-built set.
+
+    The trade is staleness: results are now gathered across the cycle instead of
+    at a single instant, so the oldest data point can be a full interval older
+    at publish time than it was before. Halving intervalMinutes restores the old
+    latency while keeping the level load.
+    """
     config.load_incluster_config()
     secrets_client = client.CoreV1Api()
 
-    logger.info("Starting checker for namespace %s (interval=%ds)", NAMESPACE, CHECK_INTERVAL)
+    scope = "the whole cluster" if CHECKER_MODE == "central" else f"namespace {NAMESPACE}"
+    logger.info(
+        "Starting checker for %s (mode=%s, target cycle=%ds)",
+        scope, CHECKER_MODE, CHECK_INTERVAL,
+    )
 
     while True:
+        cycle_deadline = time.monotonic() + CHECK_INTERVAL
         try:
-            pods = _get_pods(NAMESPACE)
+            pods = _get_pods("" if CHECKER_MODE == "central" else NAMESPACE)
             if not pods:
-                logger.info("No pods found in %s", NAMESPACE)
+                logger.info("No pods found in %s", scope)
             else:
                 # Filter out pods annotated to skip availability/digest/credentials
                 if SKIP_ANNOTATION:
@@ -188,16 +328,27 @@ def run_check_loop():
                 # tried in order on auth failure — never a single merged
                 # last-wins credential per registry host.
                 image_creds = build_image_credentials(auditable_pods, creds)
-                results = check_availability(auditable_pods, image_creds=image_creds)
+
+                # Size the whole cycle before starting it so both halves are
+                # paced against one deadline; otherwise the credential checks
+                # would burst at the end of every cycle.
+                plan = plan_inspections(auditable_pods, image_creds)
+                pacer = _Pacer(
+                    cycle_deadline, len(plan) + len(_probeable_credentials(creds)),
+                )
+
+                results = check_availability(
+                    auditable_pods, image_creds=image_creds, pacer=pacer,
+                )
                 update_availability_metrics(results)
-                _check_credential_validity(creds, auditable_pods)
+                _check_credential_validity(creds, auditable_pods, pacer=pacer)
 
                 unavailable = [r for r in results if not r.available]
                 digest_mismatches = [r for r in results if r.digest_match is False]
                 if unavailable:
                     logger.warning(
                         "%d/%d images unavailable in %s",
-                        len(unavailable), len(results), NAMESPACE,
+                        len(unavailable), len(results), scope,
                     )
                     seen_errors: set[tuple[str, str]] = set()
                     for r in unavailable:
@@ -214,16 +365,23 @@ def run_check_loop():
                     for r in digest_mismatches:
                         logger.warning(
                             "Digest mismatch for %s in %s/%s: pinned=%s registry=%s",
-                            r.image, NAMESPACE, r.pod,
+                            r.image, r.namespace, r.pod,
                             r.pinned_digest, r.registry_digest,
                         )
                 if not unavailable and not digest_mismatches:
-                    logger.info("All %d images available in %s", len(results), NAMESPACE)
+                    logger.info("All %d images available in %s", len(results), scope)
 
         except Exception as e:
             logger.error("Check cycle failed: %s", e)
 
-        time.sleep(CHECK_INTERVAL)
+        # Pacing spends most of the interval inside the sweep. Anything left —
+        # an empty cluster, a very small namespace, or a cycle that failed
+        # early — is slept out here so the cycle length stays the interval. A
+        # sweep that overran leaves this negative and the next cycle starts at
+        # once.
+        time_left = cycle_deadline - time.monotonic()
+        if time_left > 0:
+            time.sleep(time_left)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,10 @@ jobs:
     name: Integration Tests (kind)
     runs-on: ubuntu-latest
     needs: lint-and-unit
+    # The metrics tests poll a real checker across paced sweep cycles, so the
+    # job is minutes rather than seconds. Bounded explicitly so a hang fails in
+    # 30 minutes instead of running to the 6 hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
