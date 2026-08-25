@@ -51,12 +51,16 @@ def _get_pods(namespace: str) -> list[dict]:
 
 
 def _check_credential_validity(
-    creds: list[ResolvedCredential], namespace: str, pods: list[dict],
+    creds: list[ResolvedCredential], pods: list[dict],
 ) -> None:
     """Test each credential using repo-level list-tags to verify auth access.
 
     Only marks credentials invalid on authentication failures.
     Missing images or network errors do not affect credential validity.
+
+    Namespace comes from each credential rather than from an ambient value, so
+    the same secret name in two namespaces is tested — and reported — twice
+    rather than collapsing into one result.
     """
     from kubeic_checker.availability import _run_skopeo_list_tags, _run_skopeo_inspect
     from kubeic_checker.credentials import registry_from_image
@@ -64,9 +68,12 @@ def _check_credential_validity(
     kube_image_credential_valid.clear()
     seen: set[str] = set()
 
-    # Build secret_name -> set of images used by pods that reference that secret
-    secret_images: dict[str, set[str]] = {}
+    # (namespace, secret_name) -> images used by pods in that namespace which
+    # reference that secret. Keyed by namespace too, or a repo path from one
+    # namespace would be used to probe another namespace's credential.
+    secret_images: dict[tuple[str, str], set[str]] = {}
     for pod in pods:
+        pod_ns = pod["metadata"]["namespace"]
         pull_secrets = [
             ref.get("name", "")
             for ref in pod.get("spec", {}).get("imagePullSecrets", [])
@@ -80,9 +87,10 @@ def _check_credential_validity(
         }
         for secret_name in pull_secrets:
             if secret_name:
-                secret_images.setdefault(secret_name, set()).update(images)
+                secret_images.setdefault((pod_ns, secret_name), set()).update(images)
 
     for cred in creds:
+        namespace = cred.namespace or NAMESPACE
         key = f"{namespace}/{cred.registry}/{cred.source}"
         if key in seen:
             continue
@@ -108,7 +116,7 @@ def _check_credential_validity(
             secret_name = cred.source.split(":")[-1] if ":" in cred.source else cred.source
 
             # Find a matching image from pods to get the repo path
-            pod_images = secret_images.get(secret_name, set())
+            pod_images = secret_images.get((namespace, secret_name), set())
             cred_host = cred.registry.split("/")[0]
             matching = [
                 img for img in pod_images if registry_from_image(img) == cred_host
@@ -182,7 +190,7 @@ def run_check_loop():
                 image_creds = build_image_credentials(auditable_pods, creds)
                 results = check_availability(auditable_pods, image_creds=image_creds)
                 update_availability_metrics(results)
-                _check_credential_validity(creds, NAMESPACE, auditable_pods)
+                _check_credential_validity(creds, auditable_pods)
 
                 unavailable = [r for r in results if not r.available]
                 digest_mismatches = [r for r in results if r.digest_match is False]

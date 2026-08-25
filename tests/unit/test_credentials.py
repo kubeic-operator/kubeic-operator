@@ -68,6 +68,46 @@ class TestDecodeDockerSecret:
         assert result == {}
 
 
+class TestResolveAllCredentialsAcrossNamespaces:
+    def test_reads_each_secret_from_its_own_pods_namespace(self):
+        # Previously the namespace came from pods[0], so with a pod list
+        # spanning namespaces every secret was looked up in the first pod's
+        # namespace — mostly 404s, but a same-named secret elsewhere would
+        # silently resolve to the wrong credential.
+        mock_client = MagicMock()
+        mock_client.read_namespaced_secret.return_value = _mock_secret("r.io", "u:p")
+
+        resolve_all_credentials(
+            [_make_pod(["pull"], namespace="ns-a"), _make_pod(["pull"], namespace="ns-b")],
+            mock_client,
+        )
+
+        looked_up = {c[0] for c in mock_client.read_namespaced_secret.call_args_list}
+        assert looked_up == {("pull", "ns-a"), ("pull", "ns-b")}
+
+    def test_credentials_carry_the_namespace_they_came_from(self):
+        mock_client = MagicMock()
+        mock_client.read_namespaced_secret.return_value = _mock_secret("r.io", "u:p")
+
+        creds = resolve_all_credentials(
+            [_make_pod(["pull"], namespace="ns-a"), _make_pod(["pull"], namespace="ns-b")],
+            mock_client,
+        )
+
+        assert sorted(c.namespace for c in creds) == ["ns-a", "ns-b"]
+
+    def test_same_secret_in_one_namespace_is_still_read_once(self):
+        mock_client = MagicMock()
+        mock_client.read_namespaced_secret.return_value = _mock_secret("r.io", "u:p")
+
+        resolve_all_credentials(
+            [_make_pod(["pull"], namespace="ns-a"), _make_pod(["pull"], namespace="ns-a")],
+            mock_client,
+        )
+
+        assert mock_client.read_namespaced_secret.call_count == 1
+
+
 class TestResolveAllCredentials:
     def test_resolves_secret_referenced_by_pod(self):
         mock_client = MagicMock()
@@ -156,16 +196,16 @@ class TestRegistryFromImage:
 
 
 class TestBuildImageCredentials:
-    def _cred(self, registry, secret, user="u"):
+    def _cred(self, registry, secret, user="u", namespace="default"):
         from kubeic_checker.credentials import ResolvedCredential
         return ResolvedCredential(
             registry=registry, username=user, password="p",
-            source=f"pod:imagePullSecret:{secret}",
+            source=f"pod:imagePullSecret:{secret}", namespace=namespace,
         )
 
-    def _pod(self, image, secrets):
+    def _pod(self, image, secrets, namespace="default"):
         return {
-            "metadata": {"name": "pod-1", "namespace": "default"},
+            "metadata": {"name": "pod-1", "namespace": namespace},
             "spec": {
                 "containers": [{"name": "main", "image": image}],
                 "imagePullSecrets": [{"name": s} for s in secrets],
@@ -180,7 +220,7 @@ class TestBuildImageCredentials:
         ]
         pods = [self._pod("r.corp.io/org/app:v1", ["secret-a", "secret-b"])]
         result = build_image_credentials(pods, creds)
-        users = [c.username for c in result["r.corp.io/org/app:v1"]]
+        users = [c.username for c in result[("default", "r.corp.io/org/app:v1")]]
         assert users == ["a", "b"]  # pod's imagePullSecrets order, not resolve order
 
     def test_unreferenced_secret_not_used(self):
@@ -193,7 +233,7 @@ class TestBuildImageCredentials:
         ]
         pods = [self._pod("r.corp.io/org/app:v1", ["referenced"])]
         result = build_image_credentials(pods, creds)
-        sources = [c.source for c in result["r.corp.io/org/app:v1"]]
+        sources = [c.source for c in result[("default", "r.corp.io/org/app:v1")]]
         assert sources == ["pod:imagePullSecret:referenced"]
 
     def test_other_registry_not_matched(self):
@@ -201,14 +241,14 @@ class TestBuildImageCredentials:
         creds = [self._cred("ghcr.io", "secret-a")]
         pods = [self._pod("r.corp.io/org/app:v1", ["secret-a"])]
         result = build_image_credentials(pods, creds)
-        assert result["r.corp.io/org/app:v1"] == []
+        assert result[("default", "r.corp.io/org/app:v1")] == []
 
     def test_docker_hub_spellings_match(self):
         from kubeic_checker.credentials import build_image_credentials
         creds = [self._cred("https://index.docker.io/v1/", "hub-secret")]
         pods = [self._pod("nginx:1.25", ["hub-secret"])]
         result = build_image_credentials(pods, creds)
-        assert len(result["nginx:1.25"]) == 1
+        assert len(result[("default", "nginx:1.25")]) == 1
 
     def test_dedupes_across_pods(self):
         from kubeic_checker.credentials import build_image_credentials
@@ -218,7 +258,41 @@ class TestBuildImageCredentials:
             self._pod("r.corp.io/org/app:v1", ["secret-a"]),
         ]
         result = build_image_credentials(pods, creds)
-        assert len(result["r.corp.io/org/app:v1"]) == 1
+        assert len(result[("default", "r.corp.io/org/app:v1")]) == 1
+
+    def test_same_image_in_two_namespaces_gets_its_own_credentials(self):
+        # The central-mode bleed: with one checker per namespace, keying by
+        # image alone was fine because every pod shared a namespace. Spanning
+        # namespaces, it would hand namespace A's deploy token to namespace B.
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [
+            self._cred("r.corp.io", "token-a", user="a", namespace="ns-a"),
+            self._cred("r.corp.io", "token-b", user="b", namespace="ns-b"),
+        ]
+        pods = [
+            self._pod("r.corp.io/org/app:v1", ["token-a"], namespace="ns-a"),
+            self._pod("r.corp.io/org/app:v1", ["token-b"], namespace="ns-b"),
+        ]
+        result = build_image_credentials(pods, creds)
+
+        assert [c.username for c in result[("ns-a", "r.corp.io/org/app:v1")]] == ["a"]
+        assert [c.username for c in result[("ns-b", "r.corp.io/org/app:v1")]] == ["b"]
+
+    def test_same_secret_name_in_two_namespaces_stays_distinct(self):
+        # Per-project deploy tokens are routinely all called the same thing.
+        from kubeic_checker.credentials import build_image_credentials
+        creds = [
+            self._cred("r.corp.io", "gitlab-pull", user="a", namespace="ns-a"),
+            self._cred("r.corp.io", "gitlab-pull", user="b", namespace="ns-b"),
+        ]
+        pods = [
+            self._pod("r.corp.io/org/app:v1", ["gitlab-pull"], namespace="ns-a"),
+            self._pod("r.corp.io/org/app:v1", ["gitlab-pull"], namespace="ns-b"),
+        ]
+        result = build_image_credentials(pods, creds)
+
+        assert [c.username for c in result[("ns-a", "r.corp.io/org/app:v1")]] == ["a"]
+        assert [c.username for c in result[("ns-b", "r.corp.io/org/app:v1")]] == ["b"]
 
     def test_init_containers_included(self):
         from kubeic_checker.credentials import build_image_credentials
@@ -226,4 +300,4 @@ class TestBuildImageCredentials:
         pod = self._pod("r.corp.io/org/app:v1", ["secret-a"])
         pod["spec"]["initContainers"] = [{"name": "init", "image": "r.corp.io/org/init:v1"}]
         result = build_image_credentials([pod], creds)
-        assert len(result["r.corp.io/org/init:v1"]) == 1
+        assert len(result[("default", "r.corp.io/org/init:v1")]) == 1

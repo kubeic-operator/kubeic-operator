@@ -143,6 +143,7 @@ class TestCheckCredentialValidity:
         cred.auth = auth
         cred.username = username
         cred.password = password
+        cred.namespace = "ns"
         return cred
 
     def _make_pods(self, secrets_images):
@@ -168,7 +169,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.assert_called_once_with(
             registry="r.io", namespace="ns", secret_name="my-secret",
@@ -183,7 +184,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
 
@@ -196,7 +197,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
@@ -207,7 +208,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"other-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
 
@@ -222,7 +223,7 @@ class TestCheckCredentialValidity:
         cred.username = None
         cred.password = None
 
-        _check_credential_validity([cred], "ns", [])
+        _check_credential_validity([cred], [])
 
         mock_gauge.labels.assert_not_called()
 
@@ -235,7 +236,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         # Should be called with the test image, not a pod image
         call_args = mock_list_tags.call_args[0]
@@ -429,6 +430,7 @@ class TestCredentialValidityBranches:
         cred.auth = auth
         cred.username = username
         cred.password = password
+        cred.namespace = "ns"
         return cred
 
     def _pods(self, image="r.io/app/img", secret="my-secret"):
@@ -447,7 +449,7 @@ class TestCredentialValidityBranches:
         # A dockerconfig entry with no auth and no user/pass carries nothing
         # to test — it must not produce a gauge sample at all.
         cred = self._cred(auth=None, username=None, password=None)
-        _check_credential_validity([cred], "ns", self._pods())
+        _check_credential_validity([cred], self._pods())
         mock_gauge.labels.assert_not_called()
         mock_list_tags.assert_not_called()
 
@@ -458,7 +460,7 @@ class TestCredentialValidityBranches:
         # each must be probed against the registry exactly once per cycle.
         mock_list_tags.return_value = (True, None, "")
         cred = self._cred()
-        _check_credential_validity([cred, cred], "ns", self._pods())
+        _check_credential_validity([cred, cred], self._pods())
         assert mock_list_tags.call_count == 1
         assert mock_gauge.labels.call_count == 1
 
@@ -469,7 +471,7 @@ class TestCredentialValidityBranches:
         # blob (older tooling writes these) must still be testable.
         mock_list_tags.return_value = (True, None, "")
         cred = self._cred(auth=None, username="u", password="p")
-        _check_credential_validity([cred], "ns", self._pods())
+        _check_credential_validity([cred], self._pods())
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
     @patch("kubeic_checker.main.CREDENTIAL_TEST_IMAGE", "r.io/canary/probe")
@@ -477,7 +479,7 @@ class TestCredentialValidityBranches:
     @patch("kubeic_checker.availability._run_skopeo_list_tags")
     def test_configured_test_image_auth_failure_marks_invalid(self, mock_list_tags, mock_gauge):
         mock_list_tags.return_value = (False, "unauthorized", "auth_failure")
-        _check_credential_validity([self._cred()], "ns", self._pods())
+        _check_credential_validity([self._cred()], self._pods())
         mock_list_tags.assert_called_once()
         assert mock_list_tags.call_args[0][0] == "r.io/canary/probe"
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
@@ -494,7 +496,7 @@ class TestCredentialValidityBranches:
         # rate-limit shape.
         mock_list_tags.return_value = (False, "timeout", "network")
         mock_inspect.return_value = (True, None, {}, "")
-        _check_credential_validity([self._cred()], "ns", self._pods())
+        _check_credential_validity([self._cred()], self._pods())
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
 
