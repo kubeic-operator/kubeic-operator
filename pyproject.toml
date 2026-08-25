@@ -38,6 +38,9 @@ include = ["kubeic_operator*", "kubeic_checker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "central: integration tests that need the release upgraded to checker.mode=central",
+]
 
 [tool.coverage.run]
 relative_files = true

@@ -25,6 +25,49 @@ checker:
   # from the checker, so their alerts are omitted when this is false — only
   # ImageVersionSpreadTooHigh runs on operator metrics alone.
   enabled: true
+
+  # How checkers are laid out.
+  #
+  #   perNamespace  one checker Deployment per audited namespace (default)
+  #   central       one checker Deployment for the whole cluster, owned by this
+  #                 chart, and no per-namespace checkers at all
+  #
+  # Switching to central needs no migration step. Every namespace stops wanting
+  # a checker of its own, and the operator's normal reconcile drains the
+  # existing ones one at a time, at the same pace as any other rollout.
+  #
+  # Central mode buys memory. Measured across a nine-cluster estate, 222
+  # per-namespace checkers held 13.35 GiB resident, and ~61 MiB of each pod is a
+  # Python interpreter floor paid once per pod rather than per unit of work. One
+  # checker per cluster is ~70 MiB, roughly a 23x reduction.
+  #
+  # Three things behave differently in central mode:
+  #
+  #   * availability.intervalMinutes and credentialSource.type come from the
+  #     `policy` block below and nowhere else. A namespace-scoped
+  #     ImageAuditPolicy cannot override them, because there is no
+  #     per-namespace checker left to configure.
+  #   * excludedNamespaces and policy.namespaceSelector.excludeLabels are
+  #     applied by the central checker itself, from these values. A namespace
+  #     excluded *only* by its own namespace-scoped ImageAuditPolicy is still
+  #     audited; exclude it here, or by label, or stay on perNamespace.
+  #   * a NEW namespace takes up to two intervals to appear in the metrics,
+  #     rather than one. The central checker snapshots the pod list once at the
+  #     start of a cycle and publishes at the end of it, so a namespace created
+  #     mid-cycle is first listed by the next cycle and first reported when that
+  #     one finishes. At the default 30 minute interval that is up to an hour.
+  #     perNamespace has no such gap: the operator deploys a checker on the
+  #     namespace-create event and it lists its own namespace immediately.
+  #     The operator still grants the central checker access to the new
+  #     namespace's pull secrets straight away, so nothing is missing when the
+  #     sweep does arrive. Halve intervalMinutes to halve the gap.
+  #
+  # noSecretNamespaces and namespaceSecrets keep working unchanged. The central
+  # checker gets no cluster-wide secret access — the operator binds it into one
+  # namespace at a time, honouring both settings, so its reach is the union of
+  # the namespaces actually being audited rather than the whole cluster.
+  mode: perNamespace
+
   # Service name for checker metrics — must match across dashboard, RBAC, and operator code
   serviceName: kubeic-checker-metrics
   image:
@@ -67,6 +110,31 @@ checker:
   namespaceSecrets: {}
     # kube-system:
     #   - my-pull-secret
+
+  # The single cluster-wide checker. Only rendered when mode is central.
+  central:
+    resources:
+      requests:
+        # Measured per-namespace RSS is 60.2 MiB + 0.013 x containers (R2=0.915),
+        # so one checker covering a 600-container cluster projects to ~68 MiB.
+        # The request is set well above that on purpose: the projection comes
+        # from per-namespace pods, and a cluster-wide sweep's real peak — the
+        # paged pod list plus a skopeo child process — has not been soaked yet.
+        # Tighten once it has.
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        # CPU actuals across the estate were 0.33 cores for all 222 checkers
+        # combined, but the limit has to cover a single skopeo inspect burst, and
+        # throttling one would stretch the paced sweep past its interval.
+        cpu: 500m
+        memory: 512Mi
+    podLabels: {}
+    podAnnotations: {}
+    networkPolicy:
+      # Registry egress ports beyond 443. skopeo speaks HTTPS, so 443 covers the
+      # normal case; add e.g. 5000 for a plain in-cluster registry.
+      extraEgressPorts: []
 
 # Default audit policy (applied as cluster-defaults ImageAuditPolicy)
 policy:

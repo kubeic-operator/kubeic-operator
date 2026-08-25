@@ -667,3 +667,422 @@ class TestWriteIapStatus:
         _write_iap_status({"my-ns": {"deployed": True}})
 
         mock_api.patch_namespaced_custom_object_status.assert_called_once()
+
+
+def _central_deployment(available=1):
+    """A central checker Deployment as the API server would return it."""
+    dep = MagicMock()
+    dep.status.available_replicas = available
+    return dep
+
+
+def _apps_api(central=None, checker_exists=False, checker_error=None):
+    """AppsV1Api mock answering the two distinct reads reconcile makes.
+
+    Reconcile reads the central checker Deployment in the operator namespace and
+    the per-namespace checker Deployment in each namespace. Dispatching on the
+    name rather than returning one canned answer is what makes these tests
+    exercise the real branching instead of a single mock.
+    """
+    from kubeic_operator.deployer import CENTRAL_CHECKER_DEPLOYMENT
+
+    def read(name, namespace):
+        if name == CENTRAL_CHECKER_DEPLOYMENT:
+            if central is None:
+                raise _404()
+            return central
+        if checker_error is not None:
+            raise checker_error
+        if checker_exists:
+            return MagicMock()
+        raise _404()
+
+    api = MagicMock()
+    api.read_namespaced_deployment.side_effect = read
+    return api
+
+
+def _raise(exc):
+    raise exc
+
+
+def _central_patches(fn):
+    """The patch stack every central-mode reconcile test needs.
+
+    CENTRAL_MODE is read from two modules — deployer for reconcile itself, and
+    handlers.namespace for _should_deploy_checker — so both are patched.
+    _should_audit and _should_deploy_checker are deliberately NOT patched: the
+    point of these tests is that the real predicates disagree in central mode.
+
+    Listed innermost-first, which is the order mock arguments arrive in. The
+    two CENTRAL_MODE entries pass an explicit value, so they contribute no
+    argument and sit at the end.
+    """
+    for decorator in [
+        patch("kubeic_operator.deployer.deploy_checker"),
+        patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True),
+        patch("kubeic_operator.deployer.teardown_checker"),
+        patch("kubeic_operator.deployer.ensure_central_secret_access"),
+        patch("kubeic_operator.deployer.teardown_central_secret_access", return_value=False),
+        patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None),
+        patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={}),
+        patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", True),
+        patch("kubeic_operator.deployer.CENTRAL_MODE", True),
+    ]:
+        fn = decorator(fn)
+    return fn
+
+
+class TestCentralModeReconcile:
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_drains_per_namespace_checkers_without_a_teardown_path(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # The whole migration story: nothing calls a "switch to central" routine.
+        # _should_deploy_checker turns False everywhere, and the existing
+        # not-wanted-but-exists branch removes the checkers on its own.
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment(), checker_exists=True)
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("app-a"), _make_namespace("app-b"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert {c.args[0] for c in mock_teardown.call_args_list} == {"app-a", "app-b"}
+        mock_deploy.assert_not_called()
+        # Status must not read as "no checker here" — these namespaces are being
+        # audited, just not by a checker of their own.
+        assert result["app-a"] == {"deployed": True, "reason": "audited by central checker"}
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_never_deploys_a_checker_even_where_none_exists(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment(), checker_exists=False)
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        mock_deploy.assert_not_called()
+        mock_teardown.assert_not_called()
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_grants_secret_access_to_each_audited_namespace(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment())
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("app-a"), _make_namespace("app-b"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        assert {c.args[0] for c in mock_ensure.call_args_list} == {"app-a", "app-b"}
+        mock_revoke.assert_not_called()
+
+    @_central_patches
+    @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-public"})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_revokes_secret_access_from_an_excluded_namespace(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # The central checker must not keep read access to a namespace that has
+        # been excluded since the grant was made.
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment())
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("app-a"), _make_namespace("kube-public"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert [c.args[0] for c in mock_ensure.call_args_list] == ["app-a"]
+        assert [c.args[0] for c in mock_revoke.call_args_list] == ["kube-public"]
+        assert result["kube-public"] == {"deployed": False, "reason": "excluded"}
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_revokes_secret_access_from_a_label_excluded_namespace(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        mock_policy.return_value = {"namespaceSelector": {"excludeLabels": {"audit": "disabled"}}}
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment())
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("opted-out", labels={"audit": "disabled"}),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        mock_ensure.assert_not_called()
+        assert [c.args[0] for c in mock_revoke.call_args_list] == ["opted-out"]
+        # The reason must name the label, not just say "excluded" — that detail
+        # is how someone finds out why a namespace went quiet.
+        assert result["opted-out"]["reason"] == "excluded by label audit=disabled"
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_honours_no_secret_namespaces(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # The reason central mode does not simply take a cluster-wide
+        # secrets:get. kube-system is still audited, but with no secret access.
+        # What [] and None resolve from is covered by TestGetSecretNamesForNamespace;
+        # what matters here is that reconcile passes them straight through.
+        mock_secrets.side_effect = lambda ns: [] if ns == "kube-system" else None
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment())
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("kube-system"), _make_namespace("app-a"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        by_namespace = {c.args[0]: c.args[1] for c in mock_ensure.call_args_list}
+        assert by_namespace == {"kube-system": [], "app-a": None}
+        assert result["kube-system"]["deployed"] is True
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_reports_a_missing_central_deployment_rather_than_claiming_coverage(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # Helm owns that Deployment, so the operator cannot create it. Saying
+        # "deployed" while nothing is auditing would hide a broken install.
+        mock_apps_cls.return_value = _apps_api(central=None)
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["app-a"] == {
+            "deployed": False, "reason": "central checker Deployment not found",
+        }
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_reports_an_unavailable_central_deployment(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # Present but no ready replica: crash-looping, unschedulable, OOMKilled.
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment(available=0))
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["app-a"] == {"deployed": False, "reason": "central checker unavailable"}
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_probes_the_central_deployment_once_per_pass(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # Every namespace's coverage is the same one Deployment, so re-reading
+        # it per namespace would be one wasted API call per namespace per pass.
+        from kubeic_operator.deployer import CENTRAL_CHECKER_DEPLOYMENT
+
+        apps = _apps_api(central=_central_deployment())
+        mock_apps_cls.return_value = apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace(f"app-{i}") for i in range(5)
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        central_reads = [
+            c for c in apps.read_namespaced_deployment.call_args_list
+            if c.args[0] == CENTRAL_CHECKER_DEPLOYMENT
+        ]
+        assert len(central_reads) == 1
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_a_failed_grant_is_counted_and_does_not_stop_the_pass(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # One namespace answering 403 must not leave every namespace behind it
+        # unreconciled — the failure mode #67/#69 were about.
+        before = _failure_count("broken", "secret-grant", error_class="api")
+        mock_ensure.side_effect = lambda ns, names: (
+            _raise(ApiException(status=403)) if ns == "broken" else None
+        )
+        mock_apps_cls.return_value = _apps_api(central=_central_deployment())
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("broken"), _make_namespace("healthy"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert _failure_count("broken", "secret-grant", error_class="api") == before + 1
+        # The namespace after the failure was still processed.
+        assert result["healthy"] == {"deployed": True, "reason": "audited by central checker"}
+        # And the broken one is not reported as covered: without secret access
+        # its private images will read as unavailable.
+        assert result["broken"]["deployed"] is False
+        assert "secret grant failed" in result["broken"]["reason"]
+
+    @_central_patches
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_a_failed_checker_probe_does_not_mask_central_coverage(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # That probe only looks for a leftover perNamespace checker. Failing it
+        # says nothing about whether the namespace is being audited, so the
+        # status must still come from the central checker.
+        before = _failure_count("app-a", "probe", error_class="api")
+        mock_apps_cls.return_value = _apps_api(
+            central=_central_deployment(), checker_error=ApiException(status=403),
+        )
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert _failure_count("app-a", "probe", error_class="api") == before + 1
+        assert result["app-a"] == {"deployed": True, "reason": "audited by central checker"}
+
+    @_central_patches
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.deployer.CHECKER_ENABLED", False)
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_disabled_checkers_revoke_grants_and_skip_the_central_probe(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # checker.enabled: false has to win over the mode, and must not leave
+        # secret grants behind for a checker that is no longer running.
+        from kubeic_operator.deployer import CENTRAL_CHECKER_DEPLOYMENT
+
+        apps = _apps_api(central=_central_deployment())
+        mock_apps_cls.return_value = apps
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        mock_ensure.assert_not_called()
+        assert [c.args[0] for c in mock_revoke.call_args_list] == ["app-a"]
+        assert result["app-a"] == {"deployed": False, "reason": "checkers disabled"}
+        assert not [
+            c for c in apps.read_namespaced_deployment.call_args_list
+            if c.args[0] == CENTRAL_CHECKER_DEPLOYMENT
+        ]
+
+
+class TestPerNamespaceModeTouchesNoCentralRbac:
+    @patch("kubeic_operator.deployer.CENTRAL_MODE", False)
+    @patch("kubeic_operator.handlers.namespace.CENTRAL_MODE", False)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.teardown_central_secret_access")
+    @patch("kubeic_operator.deployer.ensure_central_secret_access")
+    @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_default_mode_makes_no_central_calls(
+        self, mock_core, mock_apps_cls, mock_deploy, mock_wait, mock_teardown,
+        mock_ensure, mock_revoke, mock_secrets, mock_policy,
+    ):
+        # The feature ships inert. In the default mode nothing central is read,
+        # written or probed, and checkers deploy exactly as before.
+        from kubeic_operator.deployer import CENTRAL_CHECKER_DEPLOYMENT
+
+        apps = _apps_api(checker_exists=False)
+        mock_apps_cls.return_value = apps
+        mock_core.return_value.list_namespace.return_value.items = [_make_namespace("app-a")]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        mock_ensure.assert_not_called()
+        mock_revoke.assert_not_called()
+        assert not [
+            c for c in apps.read_namespaced_deployment.call_args_list
+            if c.args[0] == CENTRAL_CHECKER_DEPLOYMENT
+        ]
+        mock_deploy.assert_called_once()
+        assert result["app-a"] == {"deployed": True}
+
+
+class TestBootstrapInCentralMode:
+    @patch("kubeic_operator.deployer.CENTRAL_MODE", True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_short_circuits_before_listing_namespaces(self, mock_core, mock_deploy):
+        # Bootstrap exists only to pace the creation of per-namespace checker
+        # pods. There are none to create, and reconcile — which runs straight
+        # after — is what converges the grants.
+        from kubeic_operator.main import _bootstrap_checkers
+        _bootstrap_checkers()
+
+        mock_deploy.assert_not_called()
+        mock_core.return_value.list_namespace.assert_not_called()
+
+
+class TestCentralNamespaceStatus:
+    def test_reports_the_label_that_excluded_a_namespace(self):
+        from kubeic_operator.main import _central_namespace_status
+
+        status = _central_namespace_status(
+            audited=False,
+            labels={"audit": "disabled"},
+            policy={"namespaceSelector": {"excludeLabels": {"audit": "disabled"}}},
+            central_state="ready",
+            grant_error=None,
+        )
+        assert status == {"deployed": False, "reason": "excluded by label audit=disabled"}
+
+    def test_a_grant_error_outranks_a_healthy_central_checker(self):
+        # The checker is up but blind to this namespace's pull secrets, so
+        # reporting it as covered would be wrong.
+        from kubeic_operator.main import _central_namespace_status
+
+        status = _central_namespace_status(
+            audited=True, labels={}, policy={}, central_state="ready", grant_error="403 Forbidden",
+        )
+        assert status["deployed"] is False
+        assert "403 Forbidden" in status["reason"]
+
+    def test_exclusion_outranks_a_grant_error(self):
+        # An excluded namespace has its grant revoked, and a revoke failure
+        # should read as an exclusion, not as a coverage problem.
+        from kubeic_operator.main import _central_namespace_status
+
+        status = _central_namespace_status(
+            audited=False, labels={}, policy={}, central_state="ready", grant_error="boom",
+        )
+        assert status == {"deployed": False, "reason": "excluded"}

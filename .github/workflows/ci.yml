@@ -102,7 +102,24 @@ jobs:
             --set scanIntervalSeconds=15
 
       - name: Run integration tests
-        run: pytest tests/integration/ -v --tb=short -x
+        run: pytest tests/integration/ -v --tb=short -x -m "not central"
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+      # Central mode last, and in place: it drains every per-namespace checker,
+      # so it cannot share a cluster with the tests above. Only a real API server
+      # can show that the operator is permitted to mint the per-namespace secret
+      # Roles the central checker depends on — a mocked RBAC client cannot.
+      - name: Upgrade to central checker mode
+        run: |
+          helm upgrade kubeic-operator ./helm/kubeic-operator \
+            --namespace kubeic-operator \
+            --reuse-values \
+            --set checker.mode=central \
+            --wait --timeout 5m
+
+      - name: Run central-mode integration tests
+        run: pytest tests/integration/test_central_mode.py -v --tb=short -m central
         env:
           KUBECONFIG: /home/runner/.kube/config
 
@@ -115,6 +132,10 @@ jobs:
           kubectl get pods -A || true
           echo "=== Checker pods ==="
           kubectl get pods -A -l app.kubernetes.io/component=checker || true
+          echo "=== Central checker logs ==="
+          kubectl logs -n kubeic-operator deployment/kubeic-operator-checker --tail=100 || true
+          echo "=== Central secret grants ==="
+          kubectl get roles,rolebindings -A -l app.kubernetes.io/component=checker || true
           echo "=== Events ==="
           kubectl get events -A --sort-by='.lastTimestamp' || true
 

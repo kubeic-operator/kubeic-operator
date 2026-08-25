@@ -1,10 +1,12 @@
 import logging
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
 from kubernetes.client import ApiException as K8sApiException
 
 from kubeic_operator.deployer import (
+    OPERATOR_NAMESPACE,
     _rollout_complete,
     _rollout_lock,
     wait_for_checker_ready,
@@ -20,9 +22,19 @@ from kubeic_operator.deployer import (
     _parse_json_env,
     _parse_bool_env,
     _parse_int_env,
+    _parse_mode_env,
+    _build_central_secret_role,
+    _build_central_secret_role_binding,
+    _labels_match,
+    _rule_signature,
+    ensure_central_secret_access,
+    teardown_central_secret_access,
     deploy_checker,
     teardown_checker,
     get_secret_names_for_namespace,
+    CENTRAL_CHECKER_SERVICE_ACCOUNT,
+    CENTRAL_CHECKER_ROLE,
+    CENTRAL_CHECKER_ROLE_BINDING,
     CHECKER_SERVICE_ACCOUNT,
     CHECKER_ROLE,
     CHECKER_ROLE_BINDING,
@@ -593,3 +605,300 @@ class TestAnnotationMerge:
 
         assert annotations["old-1"] is None
         assert annotations["old-2"] is None
+
+
+class TestParseModeEnv:
+    def test_unset_falls_back_to_default(self):
+        with patch.dict("os.environ", {}, clear=True):
+            assert _parse_mode_env("CHECKER_MODE") == "perNamespace"
+
+    def test_empty_string_falls_back_to_default(self):
+        # Helm renders a missing value as "", not as an absent variable.
+        with patch.dict("os.environ", {"CHECKER_MODE": ""}):
+            assert _parse_mode_env("CHECKER_MODE") == "perNamespace"
+
+    def test_reads_central(self):
+        with patch.dict("os.environ", {"CHECKER_MODE": "central"}):
+            assert _parse_mode_env("CHECKER_MODE") == "central"
+
+    def test_is_case_insensitive_and_normalises(self):
+        with patch.dict("os.environ", {"CHECKER_MODE": "  CeNtRaL  "}):
+            assert _parse_mode_env("CHECKER_MODE") == "central"
+
+    def test_unrecognised_value_falls_back_to_per_namespace(self):
+        # Defaulting to central on a typo would tear down every checker in the
+        # cluster, so an unknown mode must land on the safe side.
+        with patch.dict("os.environ", {"CHECKER_MODE": "centralised"}):
+            assert _parse_mode_env("CHECKER_MODE") == "perNamespace"
+
+
+class TestBuildCentralSecretRole:
+    def test_grants_unrestricted_secret_get_by_default(self):
+        role = _build_central_secret_role("my-app", None)
+
+        assert role.metadata.name == CENTRAL_CHECKER_ROLE
+        assert role.metadata.namespace == "my-app"
+        assert len(role.rules) == 1
+        rule = role.rules[0]
+        assert rule.resources == ["secrets"]
+        assert rule.verbs == ["get"]
+        assert rule.resource_names is None
+
+    def test_restricts_to_named_secrets(self):
+        role = _build_central_secret_role("my-app", ["pull-a", "pull-b"])
+
+        assert role.rules[0].resource_names == ["pull-a", "pull-b"]
+
+    def test_returns_none_for_no_secret_access(self):
+        # noSecretNamespaces: the caller reads None as "remove any grant".
+        assert _build_central_secret_role("kube-system", []) is None
+
+    def test_never_grants_pods_or_namespaces(self):
+        # Those come from the Helm-owned ClusterRole; repeating them per
+        # namespace would be pointless and would widen what the operator mints.
+        role = _build_central_secret_role("my-app", None)
+        granted = {resource for rule in role.rules for resource in rule.resources}
+        assert granted == {"secrets"}
+
+
+class TestBuildCentralSecretRoleBinding:
+    def test_subject_is_the_central_checker_in_the_operator_namespace(self):
+        rb = _build_central_secret_role_binding("my-app")
+
+        assert rb.metadata.namespace == "my-app"
+        assert len(rb.subjects) == 1
+        subject = rb.subjects[0]
+        assert subject.kind == "ServiceAccount"
+        assert subject.name == CENTRAL_CHECKER_SERVICE_ACCOUNT
+        # The one checker lives in the operator's namespace and is bound into
+        # each audited namespace from there. Pointing the subject at the audited
+        # namespace instead would name a ServiceAccount that does not exist, and
+        # RBAC would grant nothing while looking correct.
+        assert subject.namespace == OPERATOR_NAMESPACE
+
+    def test_role_ref_is_the_local_role_not_a_cluster_role(self):
+        # roleRef is immutable, so pointing at a local Role is what lets a
+        # namespace move between unrestricted and name-restricted access
+        # without deleting and recreating the binding.
+        rb = _build_central_secret_role_binding("my-app")
+
+        assert rb.role_ref.kind == "Role"
+        assert rb.role_ref.name == CENTRAL_CHECKER_ROLE
+
+
+class TestRuleSignature:
+    def test_detects_a_change_in_resource_names(self):
+        a = _build_central_secret_role("ns", ["one"])
+        b = _build_central_secret_role("ns", ["one", "two"])
+
+        assert _rule_signature(a.rules) != _rule_signature(b.rules)
+
+    def test_matches_an_identical_rule_set(self):
+        a = _build_central_secret_role("ns", ["one"])
+        b = _build_central_secret_role("ns", ["one"])
+
+        assert _rule_signature(a.rules) == _rule_signature(b.rules)
+
+    def test_treats_none_and_empty_resource_names_as_equal(self):
+        # The API server returns an absent resourceNames either way.
+        unrestricted = _build_central_secret_role("ns", None)
+        as_returned = MagicMock(
+            api_groups=[""], resources=["secrets"], verbs=["get"], resource_names=[],
+        )
+
+        assert _rule_signature(unrestricted.rules) == _rule_signature([as_returned])
+
+    def test_handles_no_rules(self):
+        assert _rule_signature(None) == []
+
+
+class TestLabelsMatch:
+    def test_subset_is_a_match(self):
+        # Labels applied by something else are left alone rather than fought over.
+        assert _labels_match({"a": "1", "extra": "x"}, {"a": "1"}) is True
+
+    def test_missing_label_is_drift(self):
+        assert _labels_match({"a": "1"}, {"a": "1", "b": "2"}) is False
+
+    def test_changed_value_is_drift(self):
+        assert _labels_match({"a": "1"}, {"a": "2"}) is False
+
+    def test_absent_labels_are_drift(self):
+        assert _labels_match(None, {"a": "1"}) is False
+
+
+class TestEnsureCentralSecretAccess:
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_creates_role_and_binding_when_absent(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.side_effect = K8sApiException(status=404)
+        mock_rbac.read_namespaced_role_binding.side_effect = K8sApiException(status=404)
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.create_namespaced_role.assert_called_once()
+        mock_rbac.create_namespaced_role_binding.assert_called_once()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_writes_nothing_when_already_converged(self, mock_rbac_cls):
+        # Reconcile calls this for every namespace on every pass, so an
+        # unconditional patch would be four writes per namespace per pass.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", None)
+        mock_rbac.read_namespaced_role_binding.return_value = _build_central_secret_role_binding("my-app")
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.patch_namespaced_role.assert_not_called()
+        mock_rbac.patch_namespaced_role_binding.assert_not_called()
+        mock_rbac.create_namespaced_role.assert_not_called()
+        mock_rbac.create_namespaced_role_binding.assert_not_called()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_patches_the_role_when_secret_names_change(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", ["old"])
+        mock_rbac.read_namespaced_role_binding.return_value = _build_central_secret_role_binding("my-app")
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", ["new"])
+
+        mock_rbac.patch_namespaced_role.assert_called_once()
+        # The binding did not change, so it is not rewritten alongside it.
+        mock_rbac.patch_namespaced_role_binding.assert_not_called()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_patches_the_role_when_labels_drift(self, mock_rbac_cls):
+        # A version bump changes the label set; one patch, then quiet again.
+        mock_rbac = MagicMock()
+        stale = _build_central_secret_role("my-app", None)
+        stale.metadata.labels = {"app.kubernetes.io/version": "ancient"}
+        mock_rbac.read_namespaced_role.return_value = stale
+        mock_rbac.read_namespaced_role_binding.return_value = _build_central_secret_role_binding("my-app")
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.patch_namespaced_role.assert_called_once()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_patches_the_binding_when_labels_drift(self, mock_rbac_cls):
+        # The binding's roleRef and subjects never change, so labels are the only
+        # thing that can drift on it — a version bump, or a hand-edit.
+        mock_rbac = MagicMock()
+        stale = _build_central_secret_role_binding("my-app")
+        stale.metadata.labels = {"app.kubernetes.io/version": "ancient"}
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", None)
+        mock_rbac.read_namespaced_role_binding.return_value = stale
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.patch_namespaced_role_binding.assert_called_once()
+        # The Role was already converged, so it is not rewritten alongside it.
+        mock_rbac.patch_namespaced_role.assert_not_called()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_reraises_a_non_404_binding_read_failure(self, mock_rbac_cls):
+        # A converged Role with an unreadable binding still means the namespace
+        # is not granted; reporting success would hide it.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", None)
+        mock_rbac.read_namespaced_role_binding.side_effect = K8sApiException(status=403)
+        mock_rbac_cls.return_value = mock_rbac
+
+        with pytest.raises(K8sApiException):
+            ensure_central_secret_access("my-app", None)
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_creates_only_the_binding_when_the_role_already_exists(self, mock_rbac_cls):
+        # Half-applied state, e.g. a previous pass that failed between the two
+        # writes. Converging each object independently is what recovers it.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", None)
+        mock_rbac.read_namespaced_role_binding.side_effect = K8sApiException(status=404)
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.create_namespaced_role_binding.assert_called_once()
+        mock_rbac.create_namespaced_role.assert_not_called()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_removes_the_grant_for_a_no_secret_namespace(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("kube-system", [])
+
+        mock_rbac.create_namespaced_role.assert_not_called()
+        mock_rbac.delete_namespaced_role.assert_called_once_with(CENTRAL_CHECKER_ROLE, "kube-system")
+        mock_rbac.delete_namespaced_role_binding.assert_called_once_with(
+            CENTRAL_CHECKER_ROLE_BINDING, "kube-system",
+        )
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_reraises_a_non_404_read_failure(self, mock_rbac_cls):
+        # Reconcile records the failure per namespace and carries on; swallowing
+        # it here would report the grant as converged when it is not.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.side_effect = K8sApiException(status=403)
+        mock_rbac_cls.return_value = mock_rbac
+
+        with pytest.raises(K8sApiException):
+            ensure_central_secret_access("my-app", None)
+
+
+class TestTeardownCentralSecretAccess:
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_deletes_binding_before_role(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        calls = []
+        mock_rbac.delete_namespaced_role_binding.side_effect = lambda *a: calls.append("rb")
+        mock_rbac.delete_namespaced_role.side_effect = lambda *a: calls.append("role")
+        mock_rbac_cls.return_value = mock_rbac
+
+        assert teardown_central_secret_access("my-app") is True
+        assert calls == ["rb", "role"]
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_reports_nothing_deleted_when_already_absent(self, mock_rbac_cls):
+        # Lets reconcile log a transition rather than a line per excluded
+        # namespace per pass.
+        mock_rbac = MagicMock()
+        mock_rbac.delete_namespaced_role.side_effect = K8sApiException(status=404)
+        mock_rbac.delete_namespaced_role_binding.side_effect = K8sApiException(status=404)
+        mock_rbac_cls.return_value = mock_rbac
+
+        assert teardown_central_secret_access("my-app") is False
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_reraises_a_non_404_delete_failure(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        mock_rbac.delete_namespaced_role_binding.side_effect = K8sApiException(status=403)
+        mock_rbac_cls.return_value = mock_rbac
+
+        with pytest.raises(K8sApiException):
+            teardown_central_secret_access("my-app")
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_completes_while_a_checker_rollout_holds_the_lock(self, mock_rbac_cls):
+        # It creates and destroys no pods, so it cannot contribute to the CNI
+        # burst behind #61 and must not queue behind a checker rollout. Run on a
+        # thread with a deadline: taking the lock would otherwise block forever
+        # and hang the suite rather than failing it.
+        mock_rbac_cls.return_value = MagicMock()
+        finished = threading.Event()
+
+        assert _rollout_lock.acquire(blocking=False) is True
+        try:
+            worker = threading.Thread(
+                target=lambda: (teardown_central_secret_access("my-app"), finished.set()),
+                daemon=True,
+            )
+            worker.start()
+            assert finished.wait(timeout=5), "teardown blocked on the rollout lock"
+        finally:
+            _rollout_lock.release()

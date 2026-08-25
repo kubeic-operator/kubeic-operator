@@ -15,6 +15,29 @@ CHECKER_ROLE_BINDING = "kubeic-checker"
 CHECKER_DEPLOYMENT = "kubeic-checker"
 CHECKER_SERVICE = os.environ.get("CHECKER_SERVICE", "kubeic-checker-metrics")
 OPERATOR_NAME = "kubeic-operator"
+OPERATOR_NAMESPACE = os.environ.get("OPERATOR_NAMESPACE", "kubeic-operator")
+
+# Central-mode resources. Named apart from the per-namespace CHECKER_ROLE and
+# CHECKER_ROLE_BINDING rather than reusing them: the two have different subjects
+# — a ServiceAccount local to the namespace, versus the central checker's in the
+# operator namespace — and a RoleBinding's roleRef and subjects are effectively
+# immutable, so a mode switch must create a separate object, not mutate one.
+CENTRAL_CHECKER_ROLE = "kubeic-checker-central"
+CENTRAL_CHECKER_ROLE_BINDING = "kubeic-checker-central"
+
+# Helm owns the central checker's Deployment, ServiceAccount, Service and
+# ClusterRole; the operator only ever references them by name. It cannot own
+# them: its own ClusterRole holds namespaced roles/rolebindings verbs but no
+# clusterroles/clusterrolebindings, so an operator-managed central checker would
+# mean widening the operator's grant to include the cluster-wide RBAC it hands
+# out — and would put the central rollout back on the very code path #61 exists
+# to remove.
+CENTRAL_CHECKER_SERVICE_ACCOUNT = os.environ.get(
+    "CENTRAL_CHECKER_SERVICE_ACCOUNT", "kubeic-operator-checker",
+)
+CENTRAL_CHECKER_DEPLOYMENT = os.environ.get(
+    "CENTRAL_CHECKER_DEPLOYMENT", "kubeic-operator-checker",
+)
 
 CHECKER_IMAGE = os.environ.get("CHECKER_IMAGE", "kubeic-checker:latest")
 RELEASE_NAME = os.environ.get("RELEASE_NAME", "kubeic-operator")
@@ -55,6 +78,36 @@ def _parse_bool_env(key: str, default: bool = True) -> bool:
 
 
 CHECKER_ENABLED = _parse_bool_env("CHECKER_ENABLED")
+
+CHECKER_MODES = ("perNamespace", "central")
+
+
+def _parse_mode_env(key: str, default: str = "perNamespace") -> str:
+    """Parse the checker mode, falling back to the default on anything unexpected.
+
+    Unset and empty both mean the default, for the same reason as
+    _parse_bool_env: Helm renders a missing value as "" rather than omitting the
+    variable. An unrecognised value falls back rather than raising, because
+    crashing the operator at import is worse than running the mode it ran
+    yesterday. The chart validates the value with `fail`, so a typo is caught at
+    install time instead of arriving here.
+
+    perNamespace is the safe fallback: it is the long-standing behaviour, and it
+    keeps auditing every namespace. Defaulting to central on a bad value would
+    silently tear down every checker in the cluster.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    for mode in CHECKER_MODES:
+        if raw.lower() == mode.lower():
+            return mode
+    logger.warning("Env %s=%r is not one of %s, falling back to %s", key, raw, CHECKER_MODES, default)
+    return default
+
+
+CHECKER_MODE = _parse_mode_env("CHECKER_MODE")
+CENTRAL_MODE = CHECKER_MODE == "central"
 
 
 def _parse_int_env(key: str, default: int, minimum: int = 0) -> int:
@@ -369,6 +422,182 @@ def get_secret_names_for_namespace(namespace: str) -> list[str] | None:
     if namespace in NO_SECRET_NAMESPACES:
         return []
     return None
+
+
+# --- Central mode: per-namespace secret grants for the one cluster-wide checker ---
+#
+# The central checker reads pods and namespaces through a ClusterRole, but NOT
+# secrets. A cluster-wide secrets:get would hand every secret in the cluster to
+# a pod that shells out to skopeo against arbitrary, sometimes untrusted
+# registries — a far larger blast radius than the per-namespace checkers it
+# replaces, each of which could only ever read its own namespace.
+#
+# Instead the operator binds the central checker into one namespace at a time,
+# which is also the only way to keep honouring noSecretNamespaces and
+# namespaceSecrets: a ClusterRole's resourceNames are cluster-wide names, so
+# "these secret names, but only in this namespace" cannot be expressed in one.
+
+
+def _build_central_secret_role(namespace: str, secret_names: list[str] | None) -> client.V1Role | None:
+    """Role letting the central checker read pull secrets in one namespace.
+
+    Returns None when the namespace is configured for no secret access at all,
+    which the caller treats as "remove any grant that exists".
+
+    Grants only secrets. Pods and namespaces come from the Helm-owned
+    ClusterRole, so there is no reason to repeat them per namespace.
+    """
+    if secret_names is not None and not secret_names:
+        return None
+
+    return client.V1Role(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="Role",
+        metadata=client.V1ObjectMeta(
+            name=CENTRAL_CHECKER_ROLE,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        rules=[
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["secrets"],
+                verbs=["get"],
+                resource_names=list(secret_names) if secret_names else None,
+            ),
+        ],
+    )
+
+
+def _build_central_secret_role_binding(namespace: str) -> client.V1RoleBinding:
+    """RoleBinding tying the central checker's ServiceAccount into one namespace.
+
+    roleRef always points at the local Role, never at a shared ClusterRole.
+    Referencing a ClusterRole for the unrestricted case would be fewer objects,
+    but roleRef is immutable: moving a namespace between unrestricted and
+    name-restricted access would then need a delete-and-recreate of the binding.
+    Pointing at a local Role means only the Role's rules ever change.
+    """
+    return client.V1RoleBinding(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="RoleBinding",
+        metadata=client.V1ObjectMeta(
+            name=CENTRAL_CHECKER_ROLE_BINDING,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        role_ref=client.V1RoleRef(
+            api_group="rbac.authorization.k8s.io",
+            kind="Role",
+            name=CENTRAL_CHECKER_ROLE,
+        ),
+        subjects=[
+            client.RbacV1Subject(
+                kind="ServiceAccount",
+                name=CENTRAL_CHECKER_SERVICE_ACCOUNT,
+                namespace=OPERATOR_NAMESPACE,
+            ),
+        ],
+    )
+
+
+def _rule_signature(rules) -> list[tuple]:
+    """Comparable form of a Role's rules, for drift detection."""
+    return [
+        (
+            tuple(rule.api_groups or []),
+            tuple(rule.resources or []),
+            tuple(rule.verbs or []),
+            tuple(rule.resource_names or []),
+        )
+        for rule in (rules or [])
+    ]
+
+
+def _labels_match(existing_labels: dict | None, desired_labels: dict) -> bool:
+    """Whether every desired label is already present with the desired value.
+
+    Subset rather than equality: labels applied by something else — a policy
+    engine, a user — are left alone rather than being fought over every pass.
+    """
+    current = existing_labels or {}
+    return all(current.get(key) == value for key, value in desired_labels.items())
+
+
+def ensure_central_secret_access(namespace: str, secret_names: list[str] | None = None) -> None:
+    """Converge the central checker's secret grant in one namespace.
+
+    Writes only on drift. Reconcile calls this for every namespace on every
+    pass, so unconditional patching would mean four API writes per namespace
+    per pass — on a 227-namespace estate that is a needless write storm that
+    also churns resourceVersions and wakes every RBAC watcher in the cluster.
+    """
+    rbac_v1 = client.RbacAuthorizationV1Api()
+
+    role = _build_central_secret_role(namespace, secret_names)
+    if role is None:
+        # Configured for no secret access: make sure nothing is left over from
+        # when it was configured differently.
+        if teardown_central_secret_access(namespace):
+            logger.info("Removed central checker secret grant from %s (no secret access configured)", namespace)
+        return
+
+    try:
+        existing = rbac_v1.read_namespaced_role(CENTRAL_CHECKER_ROLE, namespace)
+        if (
+            _rule_signature(existing.rules) != _rule_signature(role.rules)
+            or not _labels_match(existing.metadata.labels, role.metadata.labels)
+        ):
+            rbac_v1.patch_namespaced_role(CENTRAL_CHECKER_ROLE, namespace, role)
+            logger.info("Updated central checker secret Role in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            rbac_v1.create_namespaced_role(namespace, role)
+            logger.info("Created central checker secret Role in %s", namespace)
+        else:
+            raise
+
+    rb = _build_central_secret_role_binding(namespace)
+    try:
+        existing_rb = rbac_v1.read_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace)
+        if not _labels_match(existing_rb.metadata.labels, rb.metadata.labels):
+            # Labels only. roleRef and subjects are fixed for the life of the
+            # binding, and roleRef is immutable anyway.
+            rbac_v1.patch_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace, rb)
+            logger.info("Updated central checker secret RoleBinding in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            rbac_v1.create_namespaced_role_binding(namespace, rb)
+            logger.info("Created central checker secret RoleBinding in %s", namespace)
+        else:
+            raise
+
+
+def teardown_central_secret_access(namespace: str) -> bool:
+    """Remove the central checker's secret grant from a namespace.
+
+    Returns whether anything was actually deleted, so callers can log a
+    transition instead of a line per excluded namespace per reconcile pass.
+
+    Unlike checker teardown this takes no rollout lock: it creates and destroys
+    no pods, so it cannot contribute to the CNI burst behind #61.
+    """
+    rbac_v1 = client.RbacAuthorizationV1Api()
+    deleted = False
+    # Binding first: between the two deletes the grant is already gone either
+    # way, and removing the Role first would briefly leave a binding pointing
+    # at nothing.
+    for delete_fn in [
+        lambda: rbac_v1.delete_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace),
+        lambda: rbac_v1.delete_namespaced_role(CENTRAL_CHECKER_ROLE, namespace),
+    ]:
+        try:
+            delete_fn()
+            deleted = True
+        except ApiException as e:
+            if e.status != 404:
+                raise
+    return deleted
 
 
 def deploy_checker(

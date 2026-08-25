@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import time
@@ -29,7 +30,47 @@ SKIP_ANNOTATION = os.environ.get("SKIP_ANNOTATION", "")
 # whole cluster). Only affects the scope of the pod list; everything downstream
 # is already keyed by namespace.
 CHECKER_MODE = os.environ.get("CHECKER_MODE", "perNamespace")
+CENTRAL_MODE = CHECKER_MODE == "central"
 POD_PAGE_SIZE = int(os.environ.get("POD_PAGE_SIZE", "500"))
+
+
+def _parse_excluded_namespaces() -> frozenset[str]:
+    raw = os.environ.get("EXCLUDED_NAMESPACES", "")
+    return frozenset(ns.strip() for ns in raw.split(",") if ns.strip())
+
+
+def _parse_exclude_labels() -> dict[str, str]:
+    """Namespace labels that opt a namespace out of auditing.
+
+    Falls back to no exclusions on malformed input rather than raising: crashing
+    the checker at import would stop all auditing, which is worse than auditing
+    a namespace that asked not to be.
+    """
+    raw = os.environ.get("EXCLUDE_LABELS", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Failed to parse EXCLUDE_LABELS as JSON, ignoring namespace label exclusions")
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("EXCLUDE_LABELS must be a JSON object, got %s", type(parsed).__name__)
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()}
+
+
+# Both only apply in central mode. With one checker per namespace, an excluded
+# namespace simply never gets a checker, so the exclusion is enforced by the
+# operator not deploying anything. A central checker lists the whole cluster and
+# has to apply the same rule itself, or switching mode would silently start
+# auditing every namespace that had opted out.
+EXCLUDED_NAMESPACES = _parse_excluded_namespaces()
+EXCLUDE_LABELS = _parse_exclude_labels()
+
+# Last successfully computed exclusion set, used only when a later namespace
+# list fails. See _resolve_excluded_namespaces.
+_last_excluded: frozenset[str] | None = None
 
 
 def _pace_sleep(seconds: float) -> None:
@@ -104,7 +145,55 @@ def _trim_pod(pod) -> dict | None:
     }
 
 
-def _get_pods(namespace: str = "", *, page_size: int = POD_PAGE_SIZE) -> list[dict]:
+def _resolve_excluded_namespaces() -> frozenset[str]:
+    """Namespaces the central checker must not audit.
+
+    Mirrors the operator's _should_audit: the static exclusion list, plus any
+    namespace carrying one of the configured exclude labels. Reading the labels
+    needs a namespace list, which is why the central checker's ClusterRole
+    grants namespaces get/list.
+
+    Namespace-scoped ImageAuditPolicy overrides are deliberately NOT consulted.
+    The chart-level policy is the only source, so a namespace excluded solely by
+    its own ImageAuditPolicy is still audited in central mode — there is no
+    per-namespace checker left to configure from a per-namespace policy.
+
+    A failed namespace list falls back to the previous cycle's answer, and
+    raises if there is no previous answer, rather than quietly auditing
+    namespaces that had opted out. The caller treats that as a failed cycle and
+    retries on the next one.
+    """
+    global _last_excluded
+
+    excluded = set(EXCLUDED_NAMESPACES)
+    if not EXCLUDE_LABELS:
+        return frozenset(excluded)
+
+    try:
+        namespaces = client.CoreV1Api().list_namespace()
+    except Exception as exc:
+        if _last_excluded is None:
+            raise
+        logger.warning(
+            "Cannot list namespaces (%s); reusing the previous exclusion set of %d namespaces",
+            type(exc).__name__, len(_last_excluded),
+        )
+        return _last_excluded
+
+    for ns in namespaces.items:
+        labels = ns.metadata.labels or {}
+        for key, value in EXCLUDE_LABELS.items():
+            if labels.get(key) == value:
+                excluded.add(ns.metadata.name)
+                break
+
+    _last_excluded = frozenset(excluded)
+    return _last_excluded
+
+
+def _get_pods(
+    namespace: str = "", *, page_size: int = POD_PAGE_SIZE, exclude: frozenset[str] = frozenset(),
+) -> list[dict]:
     """List auditable pods, paginated. An empty namespace lists the whole cluster.
 
     Paginated rather than one call because an unpaginated cluster-wide list
@@ -112,6 +201,9 @@ def _get_pods(namespace: str = "", *, page_size: int = POD_PAGE_SIZE) -> list[di
     the OS — that transient peak would become the pod's resident floor for the
     rest of its life. Each page is trimmed and discarded, so only the small
     dicts accumulate.
+
+    Excluded namespaces are dropped before trimming, so an opted-out namespace
+    costs nothing beyond the bytes the API server already sent.
     """
     v1 = client.CoreV1Api()
     result: list[dict] = []
@@ -127,6 +219,8 @@ def _get_pods(namespace: str = "", *, page_size: int = POD_PAGE_SIZE) -> list[di
             page = v1.list_pod_for_all_namespaces(**kwargs)
 
         for pod in page.items:
+            if pod.metadata.namespace in exclude:
+                continue
             trimmed = _trim_pod(pod)
             if trimmed is not None:
                 result.append(trimmed)
@@ -300,16 +394,27 @@ def run_check_loop():
     config.load_incluster_config()
     secrets_client = client.CoreV1Api()
 
-    scope = "the whole cluster" if CHECKER_MODE == "central" else f"namespace {NAMESPACE}"
+    scope = "the whole cluster" if CENTRAL_MODE else f"namespace {NAMESPACE}"
     logger.info(
         "Starting checker for %s (mode=%s, target cycle=%ds)",
         scope, CHECKER_MODE, CHECK_INTERVAL,
     )
+    if CENTRAL_MODE:
+        logger.info(
+            "Excluding %d named namespaces and any namespace labelled %s",
+            len(EXCLUDED_NAMESPACES), EXCLUDE_LABELS or "(none configured)",
+        )
 
     while True:
         cycle_deadline = time.monotonic() + CHECK_INTERVAL
         try:
-            pods = _get_pods("" if CHECKER_MODE == "central" else NAMESPACE)
+            if CENTRAL_MODE:
+                # Recomputed every cycle: namespaces are created, deleted and
+                # relabelled while this pod lives, and a 30 minute cycle is long
+                # enough for a fresh opt-out to matter.
+                pods = _get_pods("", exclude=_resolve_excluded_namespaces())
+            else:
+                pods = _get_pods(NAMESPACE)
             if not pods:
                 logger.info("No pods found in %s", scope)
             else:

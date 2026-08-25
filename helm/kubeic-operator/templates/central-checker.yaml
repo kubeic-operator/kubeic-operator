@@ -1,0 +1,208 @@
+{{- if and .Values.checker.enabled (eq (include "kubeic-operator.checkerMode" .) "central") }}
+{{- $name := include "kubeic-operator.centralCheckerName" . }}
+# The one cluster-wide checker, replacing the per-namespace fleet.
+#
+# Owned by Helm rather than by the operator, deliberately. The operator's
+# ClusterRole holds namespaced roles/rolebindings verbs but no clusterroles or
+# clusterrolebindings, so for the operator to create the RBAC below it would
+# first have to be granted it — and an operator that can mint ClusterRoles is a
+# much larger thing to trust than one that cannot. It would also put this
+# Deployment back on the operator's rollout path, which is what #61 exists to
+# keep checker pods off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+rules:
+  # The sweep itself: every pod in the cluster, listed in pages.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # Namespace labels, to apply namespaceSelector.excludeLabels. A per-namespace
+  # checker never needed this because the operator enforced exclusions by not
+  # deploying one; a cluster-wide checker has to enforce them itself.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list"]
+  # NOTE: no secrets. A cluster-wide secrets:get would hand every secret in the
+  # cluster to a pod that runs skopeo against arbitrary, sometimes untrusted
+  # registries — strictly worse than the per-namespace checkers this replaces,
+  # each of which could only read its own namespace. Instead the operator creates
+  # a Role and RoleBinding named kubeic-checker-central in each audited
+  # namespace, which is also the only way to keep honouring noSecretNamespaces
+  # and namespaceSecrets: a ClusterRole's resourceNames are cluster-wide names,
+  # so "these secret names, but only in this namespace" cannot be expressed here.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+# Discovered by the existing checker ServiceMonitor, which selects on
+# component: checker across all namespaces — so no ServiceMonitor of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+spec:
+  selector:
+    {{- include "kubeic-operator.centralCheckerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+spec:
+  replicas: 1
+  revisionHistoryLimit: {{ .Values.checker.revisionHistoryLimit }}
+  strategy:
+    # Recreate, not RollingUpdate. This is a singleton sweeper whose whole output
+    # is a set of gauges rebuilt once per cycle; two pods overlapping would have
+    # both scraped as separate targets, publishing two versions of the same
+    # series. A brief gap costs nothing against a cycle measured in tens of
+    # minutes, and the pod holds no state worth draining.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kubeic-operator.centralCheckerSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kubeic-operator.centralCheckerLabels" . | nindent 8 }}
+        {{- with .Values.checker.central.podLabels }}
+        {{ toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.checker.central.podAnnotations }}
+      annotations:
+        {{ toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      # Same reasoning as the per-namespace checkers: the checker is a sleep loop
+      # with no SIGTERM handler, so it always burns the full grace period, and it
+      # holds nothing that needs flushing.
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: checker
+          image: {{ include "kubeic-operator.checkerImage" . }}
+          imagePullPolicy: {{ .Values.checker.image.pullPolicy }}
+          env:
+            - name: CHECKER_MODE
+              value: central
+            - name: CHECK_INTERVAL_MINUTES
+              value: {{ .Values.policy.availability.intervalMinutes | quote }}
+            - name: CREDENTIAL_SOURCE
+              value: {{ .Values.policy.credentialSource.type | quote }}
+            - name: SKIP_ANNOTATION
+              value: {{ .Values.policy.skipAnnotation | default "" | quote }}
+            # Exclusions the operator applies by not deploying a checker in
+            # perNamespace mode. Passed through so the central checker can apply
+            # the same two rules to the cluster-wide pod list itself.
+            - name: EXCLUDED_NAMESPACES
+              value: {{ .Values.checker.excludedNamespaces | join "," | quote }}
+            - name: EXCLUDE_LABELS
+              value: {{ .Values.policy.namespaceSelector.excludeLabels | default dict | toJson | quote }}
+          ports:
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.checker.central.resources | nindent 12 }}
+          volumeMounts:
+            # skopeo auth files are written here and die with the pod.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# The operator's NetworkPolicy selects component: operator only, so the central
+# checker needs its own. Per-namespace checkers have never had one — they are
+# spread across namespaces the chart does not own — which is another small thing
+# central mode improves rather than matches.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubeic-operator.centralCheckerLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "kubeic-operator.centralCheckerSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow Prometheus to scrape metrics
+    - ports:
+        - port: 9090
+          protocol: TCP
+  egress:
+    # Allow DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Kubernetes API (443 for the ClusterIP, 6443 direct/post-DNAT with Cilium)
+    # and registry HTTPS, which skopeo needs for every inspect and list-tags.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+        {{- range .Values.checker.central.networkPolicy.extraEgressPorts }}
+        - port: {{ . }}
+          protocol: TCP
+        {{- end }}
+{{- end }}
+{{- end }}
