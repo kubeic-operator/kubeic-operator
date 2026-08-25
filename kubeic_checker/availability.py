@@ -212,10 +212,37 @@ def _dedupe_key(image: str, candidates: list) -> tuple:
     return (image, tuple(_credential_fingerprint(c) for c in candidates))
 
 
+def plan_inspections(
+    pods: list[dict],
+    image_creds: dict[tuple[str, str], list] | None = None,
+) -> dict[tuple, tuple[str, list]]:
+    """The distinct inspections a pod list implies: key -> (ref, candidates).
+
+    Exposed so a caller can size the work before starting it, which is what
+    lets the sweep be paced evenly across its interval rather than run flat out
+    and then idle.
+    """
+    plan: dict[tuple, tuple[str, list]] = {}
+    for pod in pods:
+        namespace = pod["metadata"]["namespace"]
+        containers = pod.get("spec", {}).get("containers", [])
+        init_containers = pod.get("spec", {}).get("initContainers", [])
+        for container in list(containers) + list(init_containers):
+            image = container["image"]
+            candidates = (
+                image_creds.get((namespace, image), []) if image_creds is not None else []
+            )
+            key = _dedupe_key(image, candidates)
+            if key not in plan:
+                plan[key] = (_inspect_ref(image), candidates)
+    return plan
+
+
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
     image_creds: dict[tuple[str, str], list] | None = None,
+    pacer=None,
 ) -> list[AvailabilityResult]:
     """Check image availability for all containers in the given pods.
 
@@ -229,6 +256,9 @@ def check_availability(
         image_creds: Map of (namespace, image) -> ordered ResolvedCredential
             candidates (from build_image_credentials). Candidates are tried per
             image in kubelet order, advancing only on auth failure.
+        pacer: Optional zero-argument callable invoked after each inspection.
+            Used to spread the sweep across its interval instead of running it
+            flat out; see _Pacer in the checker entrypoint.
 
     Returns:
         One AvailabilityResult per container.
@@ -237,23 +267,13 @@ def check_availability(
 
     # Inspect each unique image once per distinct credential set.
     seen_images: dict[tuple, tuple[bool, str | None, dict | None, str]] = {}
-    for pod in pods:
-        namespace = pod["metadata"]["namespace"]
-        containers = pod.get("spec", {}).get("containers", [])
-        init_containers = pod.get("spec", {}).get("initContainers", [])
-        for container in list(containers) + list(init_containers):
-            image = container["image"]
-            if image_creds is not None:
-                candidates = image_creds.get((namespace, image), [])
-                key = _dedupe_key(image, candidates)
-                if key not in seen_images:
-                    seen_images[key] = _inspect_with_candidates(
-                        _inspect_ref(image), candidates,
-                    )
-            else:
-                key = (image, ())
-                if key not in seen_images:
-                    seen_images[key] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
+    for key, (ref, candidates) in plan_inspections(pods, image_creds).items():
+        if image_creds is not None:
+            seen_images[key] = _inspect_with_candidates(ref, candidates)
+        else:
+            seen_images[key] = _run_skopeo_inspect(ref, auth_file)
+        if pacer is not None:
+            pacer()
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]
