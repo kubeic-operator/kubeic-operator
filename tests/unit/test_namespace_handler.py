@@ -116,7 +116,7 @@ class TestGetEffectivePolicy:
 class TestOnNamespaceCreate:
     @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=None)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
-    @patch("kubeic_operator.handlers.namespace.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace.deploy_checker_serialised")
     def test_deploys_checker_for_normal_namespace(self, mock_deploy, mock_policy, mock_secrets):
         mock_policy.return_value = {}
         meta = MagicMock()
@@ -128,7 +128,7 @@ class TestOnNamespaceCreate:
 
     @patch("kubeic_operator.handlers.namespace.EXCLUDED_NAMESPACES", {"kube-system"})
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
-    @patch("kubeic_operator.handlers.namespace.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace.deploy_checker_serialised")
     def test_skips_excluded_namespace(self, mock_deploy, mock_policy):
         mock_policy.return_value = {}
         meta = MagicMock()
@@ -140,7 +140,7 @@ class TestOnNamespaceCreate:
 
     @patch("kubeic_operator.handlers.namespace.get_secret_names_for_namespace", return_value=None)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy")
-    @patch("kubeic_operator.handlers.namespace.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace.deploy_checker_serialised")
     def test_passes_policy_settings_to_deployer(self, mock_deploy, mock_policy, mock_secrets):
         mock_policy.return_value = {
             "availability": {"intervalMinutes": 60},
@@ -152,7 +152,8 @@ class TestOnNamespaceCreate:
 
         on_namespace_create(body={}, meta=meta)
         mock_deploy.assert_called_once_with(
-            namespace="my-app",
+            "my-app",
+            blocking=False,
             check_interval_minutes=60,
             credential_source="workloadIdentity",
             secret_names=None,
@@ -160,10 +161,12 @@ class TestOnNamespaceCreate:
 
 
 class TestOnNamespaceDelete:
-    @patch("kubeic_operator.handlers.namespace.teardown_checker")
+    @patch("kubeic_operator.handlers.namespace.teardown_checker_serialised")
     def test_tears_down_checker(self, mock_teardown):
         meta = MagicMock()
         meta.name = "my-app"
 
         on_namespace_delete(body={}, meta=meta)
-        mock_teardown.assert_called_once_with("my-app")
+        # Non-blocking: the namespace is going away, so Kubernetes GCs the
+        # checker anyway if a rollout holds the lock.
+        mock_teardown.assert_called_once_with("my-app", blocking=False)

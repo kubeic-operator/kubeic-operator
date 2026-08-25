@@ -131,6 +131,7 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 | `prometheusRule.enabled` | Deploy Prometheus alert rules | `true` |
 | `prometheusRule.labels` | Labels for PrometheusRule selection | `{}` |
 | `networkPolicy.enabled` | Deploy network policy for checker pods | `true` |
+| `checker.readyTimeoutSeconds` | Per-namespace wait during a serialised rollout | `90` |
 | `checker.revisionHistoryLimit` | Old ReplicaSets kept per checker Deployment | `2` |
 | `crds.install` | Install CRDs with the chart | `false` |
 
@@ -141,6 +142,39 @@ on an existing install is safe: the Deployment controller reaps the excess on it
 and because `revisionHistoryLimit` lives on the Deployment spec rather than the pod template,
 changing it does not restart any checker.
 
+### Checker rollouts are serialised
+
+Every checker pod template carries `app.kubernetes.io/version`, so bumping the checker image
+changes all N templates and Kubernetes would roll every checker at once. On a cluster with many
+audited namespaces that lands a large batch of pod sandbox creations on whichever nodes the
+scheduler picks, which is enough to exhaust a CNI plugin's memory and strand unrelated
+workloads.
+
+The operator therefore deploys checkers **one namespace at a time**, waiting for each rollout to
+complete before starting the next. The wait mirrors `kubectl rollout status` rather than just
+checking `readyReplicas` — a single-replica Deployment surges to two pods, so the old pod is
+still Ready immediately after the patch and a naive check would not serialise anything.
+
+- A namespace that does not roll out within `checker.readyTimeoutSeconds` is logged and skipped,
+  so one wedged namespace cannot stall the rest.
+- Bootstrap runs on the operator's background thread, not the startup handler, so the operator
+  keeps watching namespace events while a long rollout is in progress.
+- Cluster-wide metrics (pre-release, version spread) are published before the rollout begins,
+  since they need nothing from the checkers.
+- Checker pods carry a `preferred` `podAntiAffinity` across `kubernetes.io/hostname` with an
+  empty `namespaceSelector`, so the scheduler spreads them even when a burst comes from
+  something the operator did not do, such as a node drain. `topologySpreadConstraints` cannot
+  express this: a TSC `labelSelector` only counts pods in the same namespace, and each checker
+  is `replicas: 1` alone in its own.
+
+Teardown shares the same lock, so a mass removal — `checker.enabled: false` disables every
+namespace at once — cannot interleave with a deployment still in flight. It deliberately does
+not wait for pods to disappear: deletion is asynchronous and grace-period bound, so waiting
+would stall reconciliation for roughly the grace period times the namespace count while
+gaining little, as a burst of CNI teardowns has none of the retry amplification that makes a
+burst of creations self-sustaining. Checker pods instead use a 5 second
+`terminationGracePeriodSeconds` — the checker is a sleep loop with no SIGTERM handler and
+nothing to flush, so the 30 second default was time spent holding a node slot for no reason.
 ### Disabling checkers
 
 `checker.enabled: false` stops the operator deploying checker pods and tears down any that

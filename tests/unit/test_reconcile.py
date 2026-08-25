@@ -1,5 +1,6 @@
 from unittest.mock import patch, MagicMock
 
+import pytest
 from kubernetes.client import ApiException
 
 
@@ -17,13 +18,14 @@ def _404():
 class TestReconcileCheckers:
     @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
     @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
     @patch("kubeic_operator.deployer.deploy_checker")
     @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
     @patch("kubeic_operator.main.client.AppsV1Api")
     @patch("kubeic_operator.main.client.CoreV1Api")
     def test_deploys_checker_when_missing(self, mock_core, mock_apps_cls, mock_policy,
-                                          mock_should, mock_deploy, mock_teardown, mock_secrets):
+                                          mock_should, mock_deploy, mock_wait, mock_teardown, mock_secrets):
         mock_apps = MagicMock()
         mock_apps.read_namespaced_deployment.side_effect = _404()
         mock_apps_cls.return_value = mock_apps
@@ -39,13 +41,14 @@ class TestReconcileCheckers:
         assert result["my-app"]["deployed"] is True
 
     @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
     @patch("kubeic_operator.deployer.deploy_checker")
     @patch("kubeic_operator.handlers.namespace._should_audit", return_value=False)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
     @patch("kubeic_operator.main.client.AppsV1Api")
     @patch("kubeic_operator.main.client.CoreV1Api")
     def test_teardowns_checker_when_excluded(self, mock_core, mock_apps_cls, mock_policy,
-                                             mock_should, mock_deploy, mock_teardown):
+                                             mock_should, mock_deploy, mock_wait, mock_teardown):
         mock_core.return_value.list_namespace.return_value.items = [
             _make_namespace("excluded-ns", {"audit": "disabled"}),
         ]
@@ -58,13 +61,14 @@ class TestReconcileCheckers:
         assert result["excluded-ns"]["deployed"] is False
 
     @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
     @patch("kubeic_operator.deployer.deploy_checker")
     @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
     @patch("kubeic_operator.main.client.AppsV1Api")
     @patch("kubeic_operator.main.client.CoreV1Api")
     def test_no_action_when_state_correct(self, mock_core, mock_apps_cls, mock_policy,
-                                          mock_should, mock_deploy, mock_teardown):
+                                          mock_should, mock_deploy, mock_wait, mock_teardown):
         mock_core.return_value.list_namespace.return_value.items = [
             _make_namespace("my-app"),
         ]
@@ -77,6 +81,7 @@ class TestReconcileCheckers:
         assert result["my-app"]["deployed"] is True
 
     @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
     @patch("kubeic_operator.deployer.deploy_checker")
     @patch("kubeic_operator.handlers.namespace._should_audit", return_value=False)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
@@ -84,7 +89,7 @@ class TestReconcileCheckers:
     @patch("kubeic_operator.main.client.CoreV1Api")
     def test_no_action_when_excluded_and_no_checker(self, mock_core, mock_apps_cls,
                                                     mock_policy, mock_should,
-                                                    mock_deploy, mock_teardown):
+                                                    mock_deploy, mock_wait, mock_teardown):
         mock_apps = MagicMock()
         mock_apps.read_namespaced_deployment.side_effect = _404()
         mock_apps_cls.return_value = mock_apps
@@ -100,6 +105,7 @@ class TestReconcileCheckers:
         assert "excluded-ns" not in result
 
     @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
     @patch("kubeic_operator.deployer.deploy_checker")
     @patch("kubeic_operator.handlers.namespace._should_audit", return_value=False)
     @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={
@@ -109,7 +115,7 @@ class TestReconcileCheckers:
     @patch("kubeic_operator.main.client.CoreV1Api")
     def test_excluded_reason_includes_matching_label(self, mock_core, mock_apps_cls,
                                                      mock_policy, mock_should,
-                                                     mock_deploy, mock_teardown):
+                                                     mock_deploy, mock_wait, mock_teardown):
         mock_core.return_value.list_namespace.return_value.items = [
             _make_namespace("my-ns", {"audit": "disabled"}),
         ]
@@ -242,6 +248,77 @@ class TestRunClusterAudit:
         mock_spread.assert_not_called()
 
 
+class _StopLoop(Exception):
+    """Breaks out of the audit loop's infinite while."""
+
+
+class TestRolloutPacing:
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_bootstrap_waits_for_each_checker_before_starting_the_next(
+        self, mock_core, mock_policy, mock_should, mock_secrets,
+    ):
+        # The whole point of #61: deploys must not overlap. Asserting the call
+        # order proves serialisation, where asserting "wait was called" would
+        # still pass if all three deploys fired first.
+        calls = []
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("a"), _make_namespace("b"), _make_namespace("c"),
+        ]
+
+        def _deploy(**kwargs):
+            calls.append(("deploy", kwargs["namespace"]))
+
+        def _wait(namespace, **kwargs):
+            calls.append(("wait", namespace))
+            return True
+
+        with patch("kubeic_operator.deployer.deploy_checker", side_effect=_deploy), \
+             patch("kubeic_operator.deployer.wait_for_checker_ready", side_effect=_wait):
+            from kubeic_operator.main import _bootstrap_checkers
+            _bootstrap_checkers()
+
+        assert calls == [
+            ("deploy", "a"), ("wait", "a"),
+            ("deploy", "b"), ("wait", "b"),
+            ("deploy", "c"), ("wait", "c"),
+        ]
+
+    @patch("kubeic_operator.main._write_iap_status")
+    @patch("kubeic_operator.main._reconcile_checkers", return_value={})
+    @patch("kubeic_operator.main._bootstrap_checkers")
+    @patch("kubeic_operator.main._run_cluster_audit")
+    @patch("kubeic_operator.main.time.sleep", side_effect=_StopLoop)
+    def test_audit_loop_bootstraps_before_its_first_sleep(
+        self, mock_sleep, mock_audit, mock_bootstrap, mock_reconcile, mock_status,
+    ):
+        # Bootstrap moved off the kopf startup handler onto this thread, so it
+        # must run immediately rather than after the first SCAN_INTERVAL.
+        from kubeic_operator.main import _audit_loop
+        with pytest.raises(_StopLoop):
+            _audit_loop()
+
+        mock_bootstrap.assert_called_once()
+        mock_reconcile.assert_called_once()
+        # Metrics must not wait on the paced rollout.
+        mock_audit.assert_called_once()
+
+    @patch("kubeic_operator.main._write_iap_status")
+    @patch("kubeic_operator.main._reconcile_checkers", return_value={})
+    @patch("kubeic_operator.main._bootstrap_checkers", side_effect=RuntimeError("boom"))
+    @patch("kubeic_operator.main._run_cluster_audit")
+    @patch("kubeic_operator.main.time.sleep", side_effect=_StopLoop)
+    def test_audit_loop_survives_a_failing_bootstrap(
+        self, mock_sleep, mock_audit, mock_bootstrap, mock_reconcile, mock_status,
+    ):
+        # A crash here would kill the only thread that deploys checkers.
+        from kubeic_operator.main import _audit_loop
+        with pytest.raises(_StopLoop):
+            _audit_loop()
+
+        mock_reconcile.assert_called_once()
 class TestCheckerEnabledFlag:
     @patch("kubeic_operator.deployer.CHECKER_ENABLED", False)
     @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)

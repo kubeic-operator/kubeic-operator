@@ -41,6 +41,13 @@ checker:
   podLabels: {}
   podAnnotations: {}
 
+  # Checker rollouts are serialised one namespace at a time: every checker pod
+  # template carries the version label, so a version bump would otherwise roll
+  # all of them simultaneously. This bounds how long to wait for each one before
+  # moving on; a namespace that exceeds it is logged and skipped rather than
+  # stalling every namespace behind it.
+  readyTimeoutSeconds: 90
+
   # Old ReplicaSets retained per checker Deployment. Kubernetes defaults to 10,
   # which with one Deployment per namespace makes ReplicaSets the largest class
   # of object this operator creates, growing by one per namespace per version

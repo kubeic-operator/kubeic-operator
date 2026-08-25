@@ -6,9 +6,9 @@ from kubernetes import client
 from kubeic_operator.deployer import (
     CHECKER_ENABLED,
     EXCLUDED_NAMESPACES,
-    deploy_checker,
+    deploy_checker_serialised,
     get_secret_names_for_namespace,
-    teardown_checker,
+    teardown_checker_serialised,
 )
 
 logger = logging.getLogger("kubeic-operator.handlers.namespace")
@@ -78,10 +78,16 @@ def _should_audit(namespace: str, labels: dict | None, policy: dict) -> bool:
     return True
 
 
+# No @kopf.on.resume here: it is unreachable in this operator. Kopf reads the
+# previous essence from the diffbase storage (processing.py), and
+# _NoWriteDiffBaseStorage.fetch() always returns None, so every event takes the
+# `old is None -> Reason.CREATE` branch — including pre-existing namespaces on
+# the initial listing, which kopf explicitly documents as "creation never mixes
+# with resuming". This handler therefore fires for every namespace at startup,
+# which is why it must not deploy unpaced.
 @kopf.on.create("", "v1", "namespaces")
-@kopf.on.resume("", "v1", "namespaces")
 def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
-    """Deploy checker when a new namespace is created (or on operator startup)."""
+    """Deploy a checker for a namespace, unless a paced rollout is under way."""
     namespace = meta.name
     labels = meta.labels or {}
 
@@ -94,8 +100,12 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
     interval = availability.get("intervalMinutes", 30)
     cred_source = policy.get("credentialSource", {}).get("type", "pullSecret")
 
-    deploy_checker(
-        namespace=namespace,
+    # blocking=False: kopf fires this concurrently for every namespace on
+    # startup, so all but one return immediately instead of bursting. Whatever
+    # is skipped here is deployed by the next reconcile pass.
+    deploy_checker_serialised(
+        namespace,
+        blocking=False,
         check_interval_minutes=interval,
         credential_source=cred_source,
         secret_names=get_secret_names_for_namespace(namespace),
@@ -105,4 +115,7 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
 @kopf.on.delete("", "v1", "namespaces", optional=True)
 def on_namespace_delete(body: dict, meta: kopf.Meta, **kwargs) -> None:
     """Tear down checker when a namespace is deleted."""
-    teardown_checker(meta.name)
+    # blocking=False, and skipping is harmless: the namespace itself is going
+    # away, so Kubernetes garbage-collects everything in it regardless. This
+    # call only tidies up early.
+    teardown_checker_serialised(meta.name, blocking=False)
