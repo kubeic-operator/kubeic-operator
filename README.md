@@ -122,6 +122,7 @@ helm install kubeic-operator oci://ghcr.io/kubeic-operator/kubeic-operator \
 
 | Value | Description | Default |
 | --- | --- | --- |
+| `checker.enabled` | Deploy checker pods at all (see below) | `true` |
 | `serviceMonitor.enabled` | Deploy a ServiceMonitor for checker pods | `true` |
 | `serviceMonitor.interval` | Scrape interval | `30s` |
 | `serviceMonitor.labels` | Labels for ServiceMonitor discovery | `{}` |
@@ -166,6 +167,37 @@ still Ready immediately after the patch and a naive check would not serialise an
   express this: a TSC `labelSelector` only counts pods in the same namespace, and each checker
   is `replicas: 1` alone in its own.
 
+Teardown shares the same lock, so a mass removal — `checker.enabled: false` disables every
+namespace at once — cannot interleave with a deployment still in flight. It deliberately does
+not wait for pods to disappear: deletion is asynchronous and grace-period bound, so waiting
+would stall reconciliation for roughly the grace period times the namespace count while
+gaining little, as a burst of CNI teardowns has none of the retry amplification that makes a
+burst of creations self-sustaining. Checker pods instead use a 5 second
+`terminationGracePeriodSeconds` — the checker is a sleep loop with no SIGTERM handler and
+nothing to flush, so the 30 second default was time spent holding a node slot for no reason.
+### Disabling checkers
+
+`checker.enabled: false` stops the operator deploying checker pods and tears down any that
+already exist on the next reconcile. The operator keeps running the cluster-wide checks that
+need only pod specs.
+
+This is a bigger reduction in coverage than it looks, because pre-release *age* is a joint
+metric: the operator knows a tag is pre-release, but only the checker knows when the image was
+published. Five of the six alerts are therefore omitted when checkers are disabled, and only
+`ImageVersionSpreadTooHigh` remains:
+
+| Alert | Survives `checker.enabled: false` |
+| --- | --- |
+| ImageVersionSpreadTooHigh | yes — operator metrics only |
+| ImageMissingFromRegistry | no |
+| ImageAuditCheckerDegraded | no |
+| ImageDigestMismatch | no |
+| PrereleaseImageRunningTooLong | no — needs `kube_image_created_timestamp_seconds` |
+| RegistryCredentialInvalid | no |
+
+The rules are omitted from the `PrometheusRule` rather than left in place to fire never, so
+there is no rule that silently cannot alert.
+
 ## Prometheus metrics
 
 ### Operator metrics (cluster-wide, port 9090)
@@ -197,7 +229,7 @@ The Helm chart deploys a `PrometheusRule` with six alerts:
 | ImageMissingFromRegistry | warning | interval + 10m | `kube_image_available{error_class="not_found"} == 0` |
 | ImageAuditCheckerDegraded | warning | interval + 10m | `kube_image_available{error_class=~"auth_failure\|network"} == 0`, counted per namespace/registry |
 | ImageDigestMismatch | warning | 30m | `kube_image_digest_match == 0` |
-| PrereleaseImageRunningTooLong | warning | 1h | `kube_image_prerelease_age_days > maxAgeDays` |
+| PrereleaseImageRunningTooLong | warning | 1h | `kube_image_created_timestamp_seconds` age `> maxAgeDays`, joined to `kube_image_is_prerelease == 1` |
 | ImageVersionSpreadTooHigh | warning | 30m | `kube_image_version_spread_violation == 1` |
 | RegistryCredentialInvalid | critical | interval + 10m | `kube_image_credential_valid == 0` |
 

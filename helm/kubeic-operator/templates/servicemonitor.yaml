@@ -45,6 +45,7 @@ spec:
       port: 9090
       targetPort: metrics
       protocol: TCP
+{{- if .Values.checker.enabled }}
 ---
 # --- Checker ServiceMonitor (discovers checker Services in ALL namespaces) ---
 apiVersion: monitoring.coreos.com/v1
@@ -76,4 +77,5 @@ spec:
           targetLabel: cluster
           replacement: {{ .Values.serviceMonitor.clusterName | quote }}
       {{- end }}
+{{- end }}
 {{- end }}

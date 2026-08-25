@@ -41,6 +41,22 @@ CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
 CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
 
 
+def _parse_bool_env(key: str, default: bool = True) -> bool:
+    """Parse a boolean env var, treating unset *and* empty as the default.
+
+    Helm renders a missing value as an empty string rather than omitting the
+    env var, so "" must fall back to the default instead of reading as false —
+    otherwise a chart typo silently disables checkers fleet-wide.
+    """
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+CHECKER_ENABLED = _parse_bool_env("CHECKER_ENABLED")
+
+
 def _parse_int_env(key: str, default: int, minimum: int = 0) -> int:
     """Parse a non-negative integer env var, falling back to the default.
 
@@ -258,6 +274,14 @@ def _build_deployment(
                 ),
                 spec=client.V1PodSpec(
                     service_account_name=CHECKER_SERVICE_ACCOUNT,
+                    # The checker is a sleep loop that installs no SIGTERM
+                    # handler, so it never exits early and always burns the full
+                    # grace period before SIGKILL. It holds nothing that needs
+                    # flushing — metrics are in memory and authfiles live in an
+                    # emptyDir that dies with the pod — so the default 30s is
+                    # dead time during which N terminating pods hold their node
+                    # slots and CNI state after a mass teardown.
+                    termination_grace_period_seconds=5,
                     # Spread checkers across nodes. topologySpreadConstraints
                     # cannot do this: a TSC labelSelector only counts pods in
                     # the *same* namespace, and each checker is replicas:1 alone
@@ -510,6 +534,31 @@ def deploy_checker_serialised(namespace: str, *, blocking: bool = True, **kwargs
     try:
         deploy_checker(namespace=namespace, **kwargs)
         wait_for_checker_ready(namespace)
+        return True
+    finally:
+        _rollout_lock.release()
+
+
+def teardown_checker_serialised(namespace: str, *, blocking: bool = True) -> bool:
+    """Tear down a checker under the same lock that serialises deployments.
+
+    Teardown is already sequential per namespace, so this is not about rate —
+    it is about not interleaving with a deployment. `checker.enabled: false`
+    makes every namespace fail _should_audit at once, so reconcile walks the
+    whole cluster tearing down while the namespace handler may still be
+    deploying; without a shared lock those two can race the same namespace and
+    leave a half-removed checker behind.
+
+    Deliberately does not wait for the pods to disappear. Pod deletion is
+    asynchronous and grace-period bound, so waiting would stall the audit thread
+    for roughly grace x N with little gained: a CNI DEL burst has none of the
+    retry amplification that makes an ADD burst self-sustaining (#61).
+    """
+    if not _rollout_lock.acquire(blocking=blocking):
+        logger.info("Checker rollout in progress; deferring teardown of %s to reconcile", namespace)
+        return False
+    try:
+        teardown_checker(namespace)
         return True
     finally:
         _rollout_lock.release()

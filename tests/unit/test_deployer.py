@@ -9,6 +9,7 @@ from kubeic_operator.deployer import (
     _rollout_lock,
     wait_for_checker_ready,
     deploy_checker_serialised,
+    teardown_checker_serialised,
     _build_service_account,
     _build_role,
     _build_role_binding,
@@ -17,6 +18,7 @@ from kubeic_operator.deployer import (
     _selector_labels,
     _common_labels,
     _parse_json_env,
+    _parse_bool_env,
     _parse_int_env,
     deploy_checker,
     teardown_checker,
@@ -205,6 +207,13 @@ class TestBuildDeployment:
         assert term.namespace_selector is not None
         assert term.namespace_selector.match_labels is None
         assert term.namespace_selector.match_expressions is None
+
+    def test_termination_grace_period_is_shortened(self):
+        # The checker installs no SIGTERM handler, so it always burns the whole
+        # grace period. The default 30s is dead time that keeps N terminating
+        # pods holding node slots after a mass teardown.
+        deploy = _build_deployment("my-ns")
+        assert deploy.spec.template.spec.termination_grace_period_seconds == 5
 
     def test_anti_affinity_is_preferred_not_required(self):
         # Checkers always outnumber nodes, so a required term would leave them
@@ -430,6 +439,29 @@ class TestDeployCheckerSerialised:
             deploy_checker_serialised("my-ns", blocking=True)
         assert _rollout_lock.acquire(blocking=False)
         _rollout_lock.release()
+class TestParseBoolEnv:
+    def test_returns_default_when_env_not_set(self):
+        assert _parse_bool_env("NONEXISTENT_TEST_KEY_12345") is True
+        assert _parse_bool_env("NONEXISTENT_TEST_KEY_12345", default=False) is False
+
+    def test_empty_string_falls_back_to_default(self):
+        # Helm renders a missing value as "" rather than omitting the env var,
+        # so "" must not read as false and silently disable checkers.
+        with patch("kubeic_operator.deployer.os.environ.get", return_value=""):
+            assert _parse_bool_env("TEST_KEY") is True
+        with patch("kubeic_operator.deployer.os.environ.get", return_value="   "):
+            assert _parse_bool_env("TEST_KEY") is True
+
+    def test_parses_truthy_values(self):
+        for raw in ("true", "True", "TRUE", "1", "yes", "on", " true "):
+            with patch("kubeic_operator.deployer.os.environ.get", return_value=raw):
+                assert _parse_bool_env("TEST_KEY") is True, raw
+
+    def test_parses_falsy_values(self):
+        for raw in ("false", "False", "0", "no", "off", "nonsense"):
+            with patch("kubeic_operator.deployer.os.environ.get", return_value=raw):
+                assert _parse_bool_env("TEST_KEY") is False, raw
+
 class TestParseIntEnv:
     def test_returns_default_when_env_not_set(self):
         assert _parse_int_env("NONEXISTENT_TEST_KEY_12345", 2) == 2
@@ -458,6 +490,45 @@ class TestParseIntEnv:
         # 0 is a legitimate revisionHistoryLimit (keep no old ReplicaSets).
         with patch("kubeic_operator.deployer.os.environ.get", return_value="0"):
             assert _parse_int_env("TEST_KEY", 2) == 0
+
+
+class TestTeardownCheckerSerialised:
+    @patch("kubeic_operator.deployer.teardown_checker")
+    def test_tears_down_under_the_lock(self, mock_teardown):
+        assert teardown_checker_serialised("my-ns", blocking=True) is True
+        mock_teardown.assert_called_once_with("my-ns")
+
+    @patch("kubeic_operator.deployer.teardown_checker")
+    def test_non_blocking_skips_while_a_deploy_holds_the_lock(self, mock_teardown):
+        # checker.enabled: false makes every namespace fail _should_audit at
+        # once, so a mass teardown can collide with an in-flight deploy.
+        with _rollout_lock:
+            assert teardown_checker_serialised("my-ns", blocking=False) is False
+        mock_teardown.assert_not_called()
+
+    @patch("kubeic_operator.deployer.teardown_checker", side_effect=RuntimeError("boom"))
+    def test_releases_the_lock_when_teardown_raises(self, mock_teardown):
+        with pytest.raises(RuntimeError):
+            teardown_checker_serialised("my-ns", blocking=True)
+        assert _rollout_lock.acquire(blocking=False)
+        _rollout_lock.release()
+
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.deploy_checker")
+    def test_shares_one_lock_with_deployment(self, mock_deploy, mock_teardown, mock_wait):
+        # Deploy and teardown must contend for the same lock, or reconcile could
+        # tear down a namespace the handler is mid-way through deploying.
+        seen = []
+
+        def _deploy(**kwargs):
+            seen.append(teardown_checker_serialised(kwargs["namespace"], blocking=False))
+
+        mock_deploy.side_effect = _deploy
+        deploy_checker_serialised("my-ns", blocking=True)
+
+        assert seen == [False]
+        mock_teardown.assert_not_called()
 
 
 class TestAnnotationMerge:

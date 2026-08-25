@@ -15,7 +15,6 @@ spec:
   versionSpread:
     threshold: {{ .Values.policy.versionSpread.threshold }}
   availability:
-    enabled: {{ .Values.policy.availability.enabled }}
     intervalMinutes: {{ .Values.policy.availability.intervalMinutes }}
   {{- with .Values.policy.namespaceSelector }}
   namespaceSelector:

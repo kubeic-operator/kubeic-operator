@@ -4,10 +4,11 @@ import kopf
 from kubernetes import client
 
 from kubeic_operator.deployer import (
+    CHECKER_ENABLED,
     EXCLUDED_NAMESPACES,
     deploy_checker_serialised,
     get_secret_names_for_namespace,
-    teardown_checker,
+    teardown_checker_serialised,
 )
 
 logger = logging.getLogger("kubeic-operator.handlers.namespace")
@@ -57,6 +58,12 @@ def _get_operator_namespace() -> str:
 
 
 def _should_audit(namespace: str, labels: dict | None, policy: dict) -> bool:
+    # Single choke point for "should a checker exist here", so disabling
+    # checkers needs no separate teardown path: _reconcile_checkers already
+    # removes a checker wherever this returns False and one exists.
+    if not CHECKER_ENABLED:
+        return False
+
     if namespace in EXCLUDED_NAMESPACES:
         return False
 
@@ -108,4 +115,7 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
 @kopf.on.delete("", "v1", "namespaces", optional=True)
 def on_namespace_delete(body: dict, meta: kopf.Meta, **kwargs) -> None:
     """Tear down checker when a namespace is deleted."""
-    teardown_checker(meta.name)
+    # blocking=False, and skipping is harmless: the namespace itself is going
+    # away, so Kubernetes garbage-collects everything in it regardless. This
+    # call only tidies up early.
+    teardown_checker_serialised(meta.name, blocking=False)

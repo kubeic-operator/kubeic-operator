@@ -32,6 +32,17 @@ class TestShouldAudit:
         policy = {"namespaceSelector": {"excludeLabels": {"audit": "disabled"}}}
         assert _should_audit("my-app", None, policy) is True
 
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", False)
+    def test_returns_false_for_every_namespace_when_checkers_disabled(self):
+        # The gate lives here so _reconcile_checkers tears down existing
+        # checkers via its normal not-should-but-exists path.
+        assert _should_audit("my-app", {}, {}) is False
+        assert _should_audit("another", {"audit": "enabled"}, {}) is False
+
+    @patch("kubeic_operator.handlers.namespace.CHECKER_ENABLED", True)
+    def test_normal_namespace_still_audited_when_checkers_enabled(self):
+        assert _should_audit("my-app", {}, {}) is True
+
 
 class TestGetEffectivePolicy:
     @patch("kubeic_operator.handlers.namespace.client.CustomObjectsApi")
@@ -150,10 +161,12 @@ class TestOnNamespaceCreate:
 
 
 class TestOnNamespaceDelete:
-    @patch("kubeic_operator.handlers.namespace.teardown_checker")
+    @patch("kubeic_operator.handlers.namespace.teardown_checker_serialised")
     def test_tears_down_checker(self, mock_teardown):
         meta = MagicMock()
         meta.name = "my-app"
 
         on_namespace_delete(body={}, meta=meta)
-        mock_teardown.assert_called_once_with("my-app")
+        # Non-blocking: the namespace is going away, so Kubernetes GCs the
+        # checker anyway if a rollout holds the lock.
+        mock_teardown.assert_called_once_with("my-app", blocking=False)
