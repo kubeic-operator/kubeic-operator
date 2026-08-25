@@ -41,7 +41,7 @@ checker:
   # Python interpreter floor paid once per pod rather than per unit of work. One
   # checker per cluster is ~70 MiB, roughly a 23x reduction.
   #
-  # Two things behave differently in central mode:
+  # Three things behave differently in central mode:
   #
   #   * availability.intervalMinutes and credentialSource.type come from the
   #     `policy` block below and nowhere else. A namespace-scoped
@@ -51,6 +51,16 @@ checker:
   #     applied by the central checker itself, from these values. A namespace
   #     excluded *only* by its own namespace-scoped ImageAuditPolicy is still
   #     audited; exclude it here, or by label, or stay on perNamespace.
+  #   * a NEW namespace takes up to two intervals to appear in the metrics,
+  #     rather than one. The central checker snapshots the pod list once at the
+  #     start of a cycle and publishes at the end of it, so a namespace created
+  #     mid-cycle is first listed by the next cycle and first reported when that
+  #     one finishes. At the default 30 minute interval that is up to an hour.
+  #     perNamespace has no such gap: the operator deploys a checker on the
+  #     namespace-create event and it lists its own namespace immediately.
+  #     The operator still grants the central checker access to the new
+  #     namespace's pull secrets straight away, so nothing is missing when the
+  #     sweep does arrive. Halve intervalMinutes to halve the gap.
   #
   # noSecretNamespaces and namespaceSecrets keep working unchanged. The central
   # checker gets no cluster-wide secret access — the operator binds it into one

@@ -66,6 +66,9 @@ Two things behave differently in central mode:
 | `excludedNamespaces`, `namespaceSelector.excludeLabels` | enforced by not deploying a checker | applied by the checker itself, from Helm values. A namespace excluded *only* by its own namespace-scoped `ImageAuditPolicy` is still audited |
 | `noSecretNamespaces`, `namespaceSecrets` | Role shape per namespace | unchanged — enforced by the per-namespace grants above |
 | `ImageAuditPolicy` status `deployed` | this namespace's own checker | the single central Deployment, with reason `audited by central checker` |
+| time for a **new** namespace to appear in metrics | ~1 interval — the operator deploys a checker on the namespace-create event and it lists its own namespace at once | up to **2 intervals**, so up to an hour at the default 30m |
+
+That last row is inherent to one paced sweeper: the checker snapshots the pod list at the start of a cycle and publishes at the end of it, so a namespace created mid-cycle is first listed by the *next* cycle and first reported when that cycle finishes. The operator still grants the central checker access to the new namespace's pull secrets immediately, so nothing is missing once the sweep arrives. Halve `intervalMinutes` to halve the gap.
 
 ## Installation
 
