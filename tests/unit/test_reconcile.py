@@ -367,6 +367,40 @@ class TestReconcileFailureVisibility:
         assert records and records[0].exc_info is not None
 
 
+class TestDiffBaseEviction:
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_reconcile_prunes_essences_for_namespaces_that_are_gone(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+    ):
+        # Kopf has no eviction hook on the diff-base interface, so reconcile
+        # prunes against the namespace list it already fetches. Without this the
+        # dict grows for the operator's whole lifetime.
+        from kubeic_operator.main import DIFFBASE_STORAGE
+
+        live, dead = _make_namespace("live"), _make_namespace("dead")
+        live.metadata.uid = "uid-live"
+        dead.metadata.uid = "uid-dead"
+
+        DIFFBASE_STORAGE.store(
+            body={"metadata": {"uid": "uid-live"}}, patch={}, essence={"n": 1},
+        )
+        DIFFBASE_STORAGE.store(
+            body={"metadata": {"uid": "uid-dead"}}, patch={}, essence={"n": 2},
+        )
+
+        mock_apps_cls.return_value = MagicMock()
+        mock_core.return_value.list_namespace.return_value.items = [live]
+
+        from kubeic_operator.main import _reconcile_checkers
+        _reconcile_checkers()
+
+        assert DIFFBASE_STORAGE.fetch(body={"metadata": {"uid": "uid-live"}}) == {"n": 1}
+        assert DIFFBASE_STORAGE.fetch(body={"metadata": {"uid": "uid-dead"}}) is None
+
+
 class TestFailureReason:
     def test_collapses_newlines_and_includes_the_type(self):
         from kubeic_operator.main import _failure_reason
