@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -246,6 +247,137 @@ class TestRunClusterAudit:
 
         mock_prerelease.assert_not_called()
         mock_spread.assert_not_called()
+
+
+def _failure_count(namespace, operation):
+    from prometheus_client import REGISTRY
+    return REGISTRY.get_sample_value(
+        "kube_image_checker_reconcile_failures_total",
+        {"namespace": namespace, "operation": operation},
+    ) or 0.0
+
+
+class TestReconcileFailureVisibility:
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.teardown_checker")
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker", side_effect=RuntimeError("boom"))
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_failed_deploy_is_reported_as_not_deployed(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+        mock_deploy, mock_wait, mock_teardown, mock_secrets,
+    ):
+        # The bug this replaces: status said deployed: true even when every
+        # single pass failed, so the IAP could not distinguish a healthy
+        # namespace from a permanently broken one.
+        before = _failure_count("failing-ns", "deploy")
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = _404()
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("failing-ns"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["failing-ns"]["deployed"] is False
+        assert "deploy failed" in result["failing-ns"]["reason"]
+        assert "RuntimeError" in result["failing-ns"]["reason"]
+        assert _failure_count("failing-ns", "deploy") == before + 1
+
+    @patch("kubeic_operator.deployer.teardown_checker", side_effect=RuntimeError("boom"))
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=False)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_failed_teardown_still_reports_the_checker_as_deployed(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should, mock_teardown,
+    ):
+        # Teardown failed, so the checker is still running — reporting
+        # deployed: false would be the same class of lie in the other direction.
+        before = _failure_count("stuck-ns", "teardown")
+        mock_apps_cls.return_value = MagicMock()
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("stuck-ns"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["stuck-ns"]["deployed"] is True
+        assert "teardown failed" in result["stuck-ns"]["reason"]
+        assert _failure_count("stuck-ns", "teardown") == before + 1
+
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker")
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_one_failing_namespace_does_not_stop_the_others(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+        mock_deploy, mock_wait, mock_secrets,
+    ):
+        # Continue-on-failure is deliberate and must survive this change.
+        mock_deploy.side_effect = [RuntimeError("boom"), None, None]
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = _404()
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("bad"), _make_namespace("good-1"), _make_namespace("good-2"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        result = _reconcile_checkers()
+
+        assert result["bad"]["deployed"] is False
+        assert result["good-1"]["deployed"] is True
+        assert result["good-2"]["deployed"] is True
+
+    @patch("kubeic_operator.deployer.get_secret_names_for_namespace", return_value=None)
+    @patch("kubeic_operator.deployer.wait_for_checker_ready", return_value=True)
+    @patch("kubeic_operator.deployer.deploy_checker", side_effect=RuntimeError("boom"))
+    @patch("kubeic_operator.handlers.namespace._should_audit", return_value=True)
+    @patch("kubeic_operator.handlers.namespace._get_effective_policy", return_value={})
+    @patch("kubeic_operator.main.client.AppsV1Api")
+    @patch("kubeic_operator.main.client.CoreV1Api")
+    def test_failure_is_logged_with_a_traceback(
+        self, mock_core, mock_apps_cls, mock_policy, mock_should,
+        mock_deploy, mock_wait, mock_secrets, caplog,
+    ):
+        # logger.error("...: %s", exc) prints only str(exc); for a TypeError or
+        # AttributeError that is a bare message with no origin.
+        mock_apps = MagicMock()
+        mock_apps.read_namespaced_deployment.side_effect = _404()
+        mock_apps_cls.return_value = mock_apps
+        mock_core.return_value.list_namespace.return_value.items = [
+            _make_namespace("failing-ns"),
+        ]
+
+        from kubeic_operator.main import _reconcile_checkers
+        with caplog.at_level(logging.ERROR, logger="kubeic-operator"):
+            _reconcile_checkers()
+
+        records = [r for r in caplog.records if "Failed to deploy checker" in r.getMessage()]
+        assert records and records[0].exc_info is not None
+
+
+class TestFailureReason:
+    def test_collapses_newlines_and_includes_the_type(self):
+        from kubeic_operator.main import _failure_reason
+        reason = _failure_reason(ValueError("line one\nline two"))
+        assert "\n" not in reason
+        assert reason.startswith("ValueError: ")
+
+    def test_truncates_long_messages(self):
+        # ApiException stringifies to a full dump of headers and body.
+        from kubeic_operator.main import _failure_reason
+        assert len(_failure_reason(ValueError("x" * 5000))) == 200
 
 
 class _StopLoop(Exception):

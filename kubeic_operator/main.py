@@ -10,7 +10,11 @@ from prometheus_client import start_http_server
 
 from kubeic_operator.checks.prerelease import check_prerelease, filter_violations
 from kubeic_operator.checks.spread import aggregate_version_spread
-from kubeic_operator.metrics import update_prerelease_metrics, update_spread_metrics
+from kubeic_operator.metrics import (
+    kube_image_checker_reconcile_failures_total,
+    update_prerelease_metrics,
+    update_spread_metrics,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -81,6 +85,17 @@ def _get_default_policy() -> dict:
         return {}
 
 
+def _failure_reason(exc: Exception) -> str:
+    """Compact one-line description of an exception for the IAP status field.
+
+    ApiException stringifies to a multi-line dump of headers and body, which
+    would swamp the status object, so newlines are collapsed and the result
+    truncated.
+    """
+    text = f"{type(exc).__name__}: {exc}".strip().replace("\n", " ")
+    return text[:200]
+
+
 def _bootstrap_checkers() -> None:
     from kubeic_operator.deployer import (
         CHECKER_ENABLED, deploy_checker_serialised, get_secret_names_for_namespace,
@@ -113,8 +128,11 @@ def _bootstrap_checkers() -> None:
                                       check_interval_minutes=interval, credential_source=cred_source,
                                       secret_names=get_secret_names_for_namespace(name))
             logger.info("Bootstrapped checker in namespace %s", name)
-        except Exception as exc:
-            logger.error("Failed to bootstrap checker in %s: %s", name, exc)
+        except Exception:
+            logger.exception("Failed to bootstrap checker in %s", name)
+            kube_image_checker_reconcile_failures_total.labels(
+                namespace=name, operation="deploy",
+            ).inc()
 
 
 def _reconcile_checkers() -> dict:
@@ -163,9 +181,20 @@ def _reconcile_checkers() -> dict:
                                           credential_source=cred_source,
                                           secret_names=get_secret_names_for_namespace(name))
                 logger.info("Reconciled: deployed checker in %s", name)
+                namespace_status[name] = {"deployed": True}
             except Exception as exc:
-                logger.error("Failed to deploy checker in %s: %s", name, exc)
-            namespace_status[name] = {"deployed": True}
+                # Status is written inside the branches so it records the
+                # outcome rather than the intent. Reporting deployed: true here
+                # made a namespace that failed every pass indistinguishable
+                # from a healthy one.
+                logger.exception("Failed to deploy checker in %s", name)
+                kube_image_checker_reconcile_failures_total.labels(
+                    namespace=name, operation="deploy",
+                ).inc()
+                namespace_status[name] = {
+                    "deployed": False,
+                    "reason": f"deploy failed: {_failure_reason(exc)}",
+                }
         elif not should and checker_exists:
             try:
                 # Serialised so a mass teardown (checker.enabled: false turns
@@ -174,7 +203,16 @@ def _reconcile_checkers() -> dict:
                 teardown_checker_serialised(name, blocking=True)
                 logger.info("Reconciled: removed checker from %s", name)
             except Exception as exc:
-                logger.error("Failed to teardown checker in %s: %s", name, exc)
+                logger.exception("Failed to teardown checker in %s", name)
+                kube_image_checker_reconcile_failures_total.labels(
+                    namespace=name, operation="teardown",
+                ).inc()
+                # The checker is still there, so deployed stays true.
+                namespace_status[name] = {
+                    "deployed": True,
+                    "reason": f"teardown failed: {_failure_reason(exc)}",
+                }
+                continue
             if not CHECKER_ENABLED:
                 reason = "checkers disabled"
             else:
