@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timezone
 
-from prometheus_client import Gauge
+from prometheus_client import Counter, Gauge
 
 # Images created before this are treated as having no usable timestamp:
 # reproducible-build tooling (ko, Bazel, buildpacks) stamps epoch or other
@@ -70,6 +70,19 @@ kube_image_created_timestamp_seconds = Gauge(
     "kube_image_created_timestamp_seconds",
     "Unix timestamp of the image's registry Created field (absent when unavailable or unparseable)",
     ["image", "registry", "image_name", "namespace", "pod", "container"],
+)
+
+
+# --- Operator health ---
+
+# A Counter, not a Gauge: the gauges above are cleared and repopulated every
+# cycle, which would erase an intermittent failure before anyone saw it. This
+# must never be .clear()ed — cumulative is the point, so `increase()` catches
+# a namespace that fails occasionally as well as one that fails every pass.
+kube_image_checker_reconcile_failures_total = Counter(
+    "kube_image_checker_reconcile_failures_total",
+    "Checker deploy or teardown attempts that raised during reconciliation",
+    ["namespace", "operation"],
 )
 
 

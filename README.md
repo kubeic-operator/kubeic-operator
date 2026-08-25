@@ -183,12 +183,13 @@ need only pod specs.
 
 This is a bigger reduction in coverage than it looks, because pre-release *age* is a joint
 metric: the operator knows a tag is pre-release, but only the checker knows when the image was
-published. Five of the six alerts are therefore omitted when checkers are disabled, and only
-`ImageVersionSpreadTooHigh` remains:
+published. Five of the seven alerts are therefore omitted when checkers are disabled; the two
+sourced from operator metrics remain:
 
 | Alert | Survives `checker.enabled: false` |
 | --- | --- |
 | ImageVersionSpreadTooHigh | yes — operator metrics only |
+| ImageAuditReconcileFailing | yes — reconcile still runs, and teardowns can still fail |
 | ImageMissingFromRegistry | no |
 | ImageAuditCheckerDegraded | no |
 | ImageDigestMismatch | no |
@@ -210,6 +211,7 @@ there is no rule that silently cannot alert.
 | `kube_image_version_count` | Gauge | registry, image_name |
 | `kube_image_version_pod_count` | Gauge | registry, image_name, tag, namespace |
 | `kube_image_version_spread_violation` | Gauge | registry, image_name |
+| `kube_image_checker_reconcile_failures_total` | Counter | namespace, operation |
 
 ### Checker metrics (per-namespace, port 9090)
 
@@ -220,9 +222,26 @@ there is no rule that silently cannot alert.
 | `kube_image_created_timestamp_seconds` | Gauge | image, registry, image_name, namespace, pod, container |
 | `kube_image_credential_valid` | Gauge | registry, namespace, secret_name |
 
+### Reconciliation failures
+
+`kube_image_checker_reconcile_failures_total` counts checker deploy and teardown attempts that
+raised. It is a Counter rather than a Gauge specifically because the gauges above are cleared
+and repopulated every cycle, which would erase an intermittent failure before anyone saw it.
+
+The per-namespace outcome is also written to the `cluster-defaults` ImageAuditPolicy status,
+which records what actually happened rather than what was intended:
+
+```bash
+kubectl get iap cluster-defaults -n kubeic -o jsonpath='{.status.namespaces}'
+```
+
+A namespace whose deploy failed reports `deployed: false` with the reason; one whose teardown
+failed reports `deployed: true`, because the checker is still running. The operator log carries
+the full traceback for either.
+
 ## Alert rules
 
-The Helm chart deploys a `PrometheusRule` with six alerts:
+The Helm chart deploys a `PrometheusRule` with seven alerts:
 
 | Alert | Severity | For | Condition |
 | --- | --- | --- | --- |
@@ -231,6 +250,7 @@ The Helm chart deploys a `PrometheusRule` with six alerts:
 | ImageDigestMismatch | warning | 30m | `kube_image_digest_match == 0` |
 | PrereleaseImageRunningTooLong | warning | 1h | `kube_image_created_timestamp_seconds` age `> maxAgeDays`, joined to `kube_image_is_prerelease == 1` |
 | ImageVersionSpreadTooHigh | warning | 30m | `kube_image_version_spread_violation == 1` |
+| ImageAuditReconcileFailing | warning | 15m | `increase(kube_image_checker_reconcile_failures_total[30m]) > 0` |
 | RegistryCredentialInvalid | critical | interval + 10m | `kube_image_credential_valid == 0` |
 
 Alerts driven by the availability sweep use `for: policy.availability.intervalMinutes + 10m`.

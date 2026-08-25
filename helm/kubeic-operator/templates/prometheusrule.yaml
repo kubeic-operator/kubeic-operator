@@ -110,6 +110,25 @@ spec:
             summary: "Version spread on {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}}"
             description: "Image {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}} has too many distinct versions running simultaneously."
 
+        # Operator-sourced, and deliberately outside the checker.enabled guard:
+        # reconcile still runs with checkers disabled, and a teardown that keeps
+        # failing is exactly the case worth knowing about. The label_replace is
+        # needed for the same reason as the checker rules — the operator's own
+        # scrape labels collide with the metric's namespace label.
+        - alert: ImageAuditReconcileFailing
+          expr: |
+            max by (cluster, namespace, operation) (
+              label_replace(
+                increase(kube_image_checker_reconcile_failures_total[30m]),
+                "namespace", "$1", "exported_namespace", "(.+)")
+            ) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Checker {{`{{ $labels.operation }}`}} failing in {{`{{ $labels.namespace }}`}}"
+            description: "The operator could not {{`{{ $labels.operation }}`}} the checker in {{`{{ $labels.namespace }}`}} over the last 30 minutes. The ImageAuditPolicy status for that namespace carries the reason; the operator log has the traceback. Audit coverage for that namespace is degraded or absent until it succeeds."
+
         {{- if .Values.checker.enabled }}
         - alert: RegistryCredentialInvalid
           expr: |
