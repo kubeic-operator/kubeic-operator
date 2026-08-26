@@ -1195,3 +1195,130 @@ class TestCentralCycleHonoursExclusions:
 
         mock_run.assert_not_called()
         assert self._available("opted-out", "r.corp.io/org/excluded:v1", "out") is None
+
+
+class TestFirstCyclePublishesPromptly:
+    """The first sweep after startup must not take a whole interval.
+
+    Metrics are published only when a sweep finishes, so pacing the first sweep
+    across the interval like every other one leaves a restarted checker
+    exporting nothing for `intervalMinutes`. That is longer than any alert's
+    `for`, so every alert built on these metrics resolves on restart and the
+    downstream tickets close — a 30 minute cluster-wide blackout on sca1 during
+    the 0.3.0-alpha.8 rollout (#74).
+
+    These assert on *when the publish happens* against a fake clock, rather than
+    on sleep totals. Time-to-first-publish is the property that broke, and the
+    existing cycle tests cannot see it: they neutralise _pace_sleep so a cycle
+    always finishes instantly.
+    """
+
+    def setup_method(self):
+        from kubeic_operator import metrics
+        metrics.kube_image_available.clear()
+        metrics.kube_image_credential_valid.clear()
+
+    teardown_method = setup_method
+
+    def _run(self, cycles=2, interval=1800, first_cycle_seconds=60, images=6):
+        """Run `cycles` cycles on a fake clock.
+
+        Returns (publish_times, pace_totals): the clock reading at each publish,
+        and how much paced delay each cycle spent.
+        """
+        from kubeic_operator.metrics import update_availability_metrics as real_update
+
+        registry = _FakeRegistry({}, public_repos={
+            f"docker://r.corp.io/org/app-{i}:v1" for i in range(images)
+        })
+        pods = [
+            _make_mock_pod(name=f"p{i}", containers=[
+                {"name": "main", "image": f"r.corp.io/org/app-{i}:v1"}])
+            for i in range(images)
+        ]
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods)
+
+        # A clock the mocked sleeps advance. Without it the pacer recomputes
+        # time_left against a frozen clock, never sees its budget shrink, and
+        # the sleeps come out as a harmonic series instead of summing to the
+        # deadline — measuring the mock rather than the code.
+        clock = [0.0]
+        publishes = []
+        pace_totals = [0.0]
+
+        def pace(seconds):
+            clock[0] += seconds
+            pace_totals[-1] += seconds
+
+        def sleep(seconds):
+            # End-of-cycle sleep only. A fully paced cycle consumes the whole
+            # interval, leaving time_left at zero, so this is NOT reached every
+            # cycle and cannot be used as the cycle boundary.
+            clock[0] += seconds
+
+        def on_publish(results):
+            real_update(results)
+            publishes.append(clock[0])
+            if len(publishes) >= cycles:
+                raise KeyboardInterrupt
+            pace_totals.append(0.0)
+
+        from kubeic_checker.main import run_check_loop
+        # ONE patch of time.sleep: kubeic_checker.main.time and
+        # kubeic_checker.availability.time are the same module object, so
+        # patching both means whichever is applied last silently wins. Every
+        # image below resolves, so skopeo never retries into it.
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.NAMESPACE", "testns"),
+            patch("kubeic_checker.main.CHECK_INTERVAL", interval),
+            patch("kubeic_checker.main.FIRST_CYCLE_SECONDS", first_cycle_seconds),
+            patch("kubeic_checker.main.update_availability_metrics", side_effect=on_publish),
+            patch("kubeic_checker.main._pace_sleep", side_effect=pace),
+            patch("kubeic_checker.main.time.sleep", side_effect=sleep),
+            patch("kubeic_checker.main.time.monotonic", side_effect=lambda: clock[0]),
+            patch("kubeic_checker.availability.subprocess.run", side_effect=registry),
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            with pytest.raises(KeyboardInterrupt):
+                run_check_loop()
+        return publishes, pace_totals
+
+    def test_first_publish_lands_inside_the_short_window(self):
+        # The regression: this was ~1800, one full interval after startup.
+        publishes, _ = self._run(interval=1800, first_cycle_seconds=60)
+        assert publishes[0] <= 60, f"first publish at t+{publishes[0]:.0f}s, expected <= 60s"
+
+    def test_first_publish_is_a_small_fraction_of_the_interval(self):
+        publishes, _ = self._run(interval=1800, first_cycle_seconds=60)
+        assert publishes[0] < 1800 / 10, f"first publish at t+{publishes[0]:.0f}s of a 1800s interval"
+
+    def test_steady_state_still_paces_across_the_whole_interval(self):
+        # The fix must not undo #72: later sweeps still fill the interval,
+        # otherwise the checker returns to burst-then-idle.
+        _, pace_totals = self._run(interval=1800, first_cycle_seconds=60)
+        assert pace_totals[1] > 1800 / 2, f"second sweep paced over only {pace_totals[1]:.0f}s"
+
+    def test_first_sweep_is_far_shorter_than_later_ones(self):
+        _, pace_totals = self._run(interval=1800, first_cycle_seconds=60)
+        assert pace_totals[1] > pace_totals[0] * 5, (
+            f"first={pace_totals[0]:.0f}s second={pace_totals[1]:.0f}s — not compressed"
+        )
+
+    def test_short_intervals_clamp_to_the_interval(self):
+        # FIRST_CYCLE_SECONDS must never exceed the interval, or a checker on
+        # intervalMinutes=1 would pace its first sweep past its own cycle end.
+        publishes, _ = self._run(interval=30, first_cycle_seconds=60)
+        assert publishes[0] <= 30, f"first publish at t+{publishes[0]:.0f}s for a 30s interval"
+
+    def test_metrics_are_actually_published_by_the_first_cycle(self):
+        # The point of the exercise: something is scrapeable early.
+        from prometheus_client import REGISTRY
+        self._run(cycles=1, interval=1800, first_cycle_seconds=60)
+        assert REGISTRY.get_sample_value("kube_image_available", {
+            "image": "r.corp.io/org/app-0:v1", "registry": "r.corp.io",
+            "image_name": "org/app-0", "namespace": "testns",
+            "pod": "p0", "container": "main", "error_class": "",
+        }) == 1
