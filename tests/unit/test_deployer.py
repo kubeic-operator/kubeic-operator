@@ -741,6 +741,49 @@ class TestEnsureCentralSecretAccess:
         mock_rbac.create_namespaced_role_binding.assert_called_once()
 
     @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_tolerates_a_concurrent_create_of_the_role(self, mock_rbac_cls):
+        # This function takes no rollout lock, and at startup the namespace
+        # handler and the reconcile pass both call it for the same namespace.
+        # On a fresh central-mode install both read 404 and both create; the
+        # loser's 409 means the grant exists, which is the desired end state.
+        # Raising instead counted a reconcile failure and tripped
+        # ImageAuditReconcileFailing for 30 minutes off one occurrence.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.side_effect = K8sApiException(status=404)
+        mock_rbac.create_namespaced_role.side_effect = K8sApiException(status=409)
+        mock_rbac.read_namespaced_role_binding.return_value = _build_central_secret_role_binding("my-app")
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.create_namespaced_role.assert_called_once()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_tolerates_a_concurrent_create_of_the_binding(self, mock_rbac_cls):
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.return_value = _build_central_secret_role("my-app", None)
+        mock_rbac.read_namespaced_role_binding.side_effect = K8sApiException(status=404)
+        mock_rbac.create_namespaced_role_binding.side_effect = K8sApiException(status=409)
+        mock_rbac_cls.return_value = mock_rbac
+
+        ensure_central_secret_access("my-app", None)
+
+        mock_rbac.create_namespaced_role_binding.assert_called_once()
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
+    def test_still_raises_when_the_create_fails_for_another_reason(self, mock_rbac_cls):
+        # Only 409 is benign. A 403 from an admission webhook means the grant
+        # was never made and the namespace's private images will read as
+        # unavailable, so it must still surface as a reconcile failure.
+        mock_rbac = MagicMock()
+        mock_rbac.read_namespaced_role.side_effect = K8sApiException(status=404)
+        mock_rbac.create_namespaced_role.side_effect = K8sApiException(status=403)
+        mock_rbac_cls.return_value = mock_rbac
+
+        with pytest.raises(K8sApiException):
+            ensure_central_secret_access("my-app", None)
+
+    @patch("kubeic_operator.deployer.client.RbacAuthorizationV1Api")
     def test_writes_nothing_when_already_converged(self, mock_rbac_cls):
         # Reconcile calls this for every namespace on every pass, so an
         # unconditional patch would be four writes per namespace per pass.
