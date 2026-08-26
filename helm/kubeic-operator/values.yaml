@@ -208,6 +208,37 @@ prometheusRule:
   # Set this to the release name of your kube-prometheus-stack install:
   # release: kube-prometheus-stack
 
+  # How long an alert keeps firing after its series stops being reported.
+  #
+  # These alerts are built on gauges that a checker clears and repopulates once
+  # per sweep, so when a checker restarts its series briefly vanish. `for` does
+  # NOT protect against that: it gates pending -> firing only. Once an alert is
+  # firing, Prometheus drops it the moment the series is absent, whatever `for`
+  # says. So every checker restart resolved every alert it fed, and any
+  # downstream ticket closed with it.
+  #
+  # Measured on 2026-08-26: a chart upgrade rolled 57 checkers on one cluster and
+  # closed 32 firing alerts, which then needed 40-60 minutes each to re-arm. A
+  # single central checker restart closed its cluster's alerts in the same way.
+  #
+  # keep_firing_for holds the alert firing across that gap. The cost is that a
+  # genuinely resolved condition stays firing this much longer — acceptable for
+  # what these alerts describe (deleted tags, stale pre-release images, invalid
+  # credentials), none of which resolve on a timescale where minutes matter.
+  #
+  # Empty derives intervalMinutes + 5m, which covers the normal case (a restart
+  # publishes within ~2 minutes since #74) and also a first sweep that fails and
+  # has to wait a full interval for the next one. Set an explicit duration to
+  # override, or "0s" to disable.
+  #
+  # NOT applied to ImageAuditCheckerNotReporting: that alert exists to fire while
+  # metrics are absent, so holding it past recovery would only delay the all-clear.
+  #
+  # Caveat: mimirtool silently ignores keep_firing_for. These rules reach
+  # Prometheus as a PrometheusRule, which honours it, but if they are ever synced
+  # to a central Mimir ruler instead the setting will be dropped without warning.
+  keepFiringFor: ""
+
 # Network policy
 networkPolicy:
   enabled: true
