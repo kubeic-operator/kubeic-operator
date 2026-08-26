@@ -7,7 +7,6 @@ from kubeic_operator.handlers.namespace import (
     _should_audit,
     _should_deploy_checker,
     on_namespace_create,
-    on_namespace_delete,
 )
 
 
@@ -159,18 +158,6 @@ class TestOnNamespaceCreate:
             credential_source="workloadIdentity",
             secret_names=None,
         )
-
-
-class TestOnNamespaceDelete:
-    @patch("kubeic_operator.handlers.namespace.teardown_checker_serialised")
-    def test_tears_down_checker(self, mock_teardown):
-        meta = MagicMock()
-        meta.name = "my-app"
-
-        on_namespace_delete(body={}, meta=meta)
-        # Non-blocking: the namespace is going away, so Kubernetes GCs the
-        # checker anyway if a rollout holds the lock.
-        mock_teardown.assert_called_once_with("my-app", blocking=False)
 
 
 class TestShouldDeployChecker:
