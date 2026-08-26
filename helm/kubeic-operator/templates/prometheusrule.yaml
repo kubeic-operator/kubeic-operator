@@ -1,4 +1,13 @@
 {{- if .Values.prometheusRule.enabled }}
+{{/*
+  keep_firing_for holds an alert across the gap left by a checker restart.
+  `for` cannot: it gates pending -> firing only, so a firing alert is dropped the
+  instant its series goes absent. That closed 32 alerts on one cluster during a
+  routine chart upgrade. Empty derives intervalMinutes + 5m — enough for the
+  ~2 minute restart gap since #74, and for a failed first sweep that waits a
+  whole interval for the next one.
+*/}}
+{{- $keepFiring := .Values.prometheusRule.keepFiringFor | default (printf "%dm" (add .Values.policy.availability.intervalMinutes 5)) }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -31,6 +40,7 @@ spec:
                 "container", "$1", "exported_container", "(.+)")
             ) == 0
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -53,6 +63,11 @@ spec:
         # paced against FIRST_CYCLE_SECONDS rather than the whole interval
         # (#74), so a restart is a gap of about a minute, but the margin below
         # is kept generous so a slow rollout across many namespaces cannot page.
+        #
+        # Deliberately the ONE rule with no keep_firing_for. Every other rule
+        # here needs it because a firing alert is dropped the instant its series
+        # goes absent; this rule fires *because* the series are absent, so
+        # holding it past recovery would only delay the all-clear.
         - alert: ImageAuditCheckerNotReporting
           expr: |
             absent(kube_image_available)
@@ -71,6 +86,7 @@ spec:
                 "namespace", "$1", "exported_namespace", "(.+)")
             )
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -87,6 +103,7 @@ spec:
                 "container", "$1", "exported_container", "(.+)")
             ) == 0
           for: 30m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -117,6 +134,7 @@ spec:
               )
             ) > {{ .Values.policy.prerelease.maxAgeDays }}
           for: 1h
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -130,6 +148,7 @@ spec:
           expr: |
             max by (cluster, registry, image_name) (kube_image_version_spread_violation) == 1
           for: 30m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -149,6 +168,7 @@ spec:
                 "namespace", "$1", "exported_namespace", "(.+)")
             ) > 0
           for: 15m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -162,6 +182,7 @@ spec:
               label_replace(kube_image_credential_valid, "namespace", "$1", "exported_namespace", "(.+)")
             ) == 0
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: critical
           annotations:
