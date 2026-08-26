@@ -531,6 +531,10 @@ def ensure_central_secret_access(namespace: str, secret_names: list[str] | None 
     pass, so unconditional patching would mean four API writes per namespace
     per pass — on a 227-namespace estate that is a needless write storm that
     also churns resourceVersions and wakes every RBAC watcher in the cluster.
+
+    Safe to call concurrently for the same namespace, which the namespace-create
+    handler and the reconcile pass do at startup: the create paths below treat
+    409 as success, so whichever caller loses the race still ends up converged.
     """
     rbac_v1 = client.RbacAuthorizationV1Api()
 
@@ -552,8 +556,22 @@ def ensure_central_secret_access(namespace: str, secret_names: list[str] | None 
             logger.info("Updated central checker secret Role in %s", namespace)
     except ApiException as e:
         if e.status == 404:
-            rbac_v1.create_namespaced_role(namespace, role)
-            logger.info("Created central checker secret Role in %s", namespace)
+            try:
+                rbac_v1.create_namespaced_role(namespace, role)
+                logger.info("Created central checker secret Role in %s", namespace)
+            except ApiException as create_exc:
+                # 409: someone created it between our read and our create. This
+                # function takes no rollout lock, and the namespace-create
+                # handler and the reconcile pass both call it — at startup they
+                # overlap, so on a fresh central-mode install both see 404 for
+                # the same namespace and both create. The loser's 409 means the
+                # grant exists, which is all we wanted; anything else is real.
+                # Left unhandled it counted a reconcile failure and tripped
+                # ImageAuditReconcileFailing, whose 30m increase() window keeps
+                # firing for half an hour off a single occurrence.
+                if create_exc.status != 409:
+                    raise
+                logger.debug("Central checker secret Role in %s already created concurrently", namespace)
         else:
             raise
 
@@ -567,8 +585,16 @@ def ensure_central_secret_access(namespace: str, secret_names: list[str] | None 
             logger.info("Updated central checker secret RoleBinding in %s", namespace)
     except ApiException as e:
         if e.status == 404:
-            rbac_v1.create_namespaced_role_binding(namespace, rb)
-            logger.info("Created central checker secret RoleBinding in %s", namespace)
+            try:
+                rbac_v1.create_namespaced_role_binding(namespace, rb)
+                logger.info("Created central checker secret RoleBinding in %s", namespace)
+            except ApiException as create_exc:
+                # Same concurrent-create race as the Role above.
+                if create_exc.status != 409:
+                    raise
+                logger.debug(
+                    "Central checker secret RoleBinding in %s already created concurrently", namespace,
+                )
         else:
             raise
 
@@ -755,7 +781,9 @@ def deploy_checker_serialised(namespace: str, *, blocking: bool = True, **kwargs
     the lock, and the caller relies on the reconcile loop to pick the namespace
     up on its next pass. That is what keeps the namespace event handler from
     fanning out: on startup kopf fires it for every existing namespace at once,
-    and all but one of those return immediately.
+    and all but one of those return immediately. Untested against a real
+    cluster, though: the handler was never registered with kopf until
+    handlers/__init__.py began importing its modules at module scope.
     """
     if not _rollout_lock.acquire(blocking=blocking):
         logger.info("Checker rollout in progress; deferring %s to reconcile", namespace)

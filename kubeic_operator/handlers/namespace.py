@@ -10,7 +10,6 @@ from kubeic_operator.deployer import (
     deploy_checker_serialised,
     ensure_central_secret_access,
     get_secret_names_for_namespace,
-    teardown_checker_serialised,
 )
 
 logger = logging.getLogger("kubeic-operator.handlers.namespace")
@@ -100,11 +99,17 @@ def _should_deploy_checker(namespace: str, labels: dict | None, policy: dict) ->
 
 # No @kopf.on.resume here: it is unreachable in this operator. Kopf reads the
 # previous essence from the diffbase storage (processing.py), and
-# _NoWriteDiffBaseStorage.fetch() always returns None, so every event takes the
-# `old is None -> Reason.CREATE` branch — including pre-existing namespaces on
-# the initial listing, which kopf explicitly documents as "creation never mixes
-# with resuming". This handler therefore fires for every namespace at startup,
-# which is why it must not deploy unpaced.
+# _InMemoryDiffBaseStorage starts empty in every fresh process, so on the first
+# listing after a restart each pre-existing namespace still takes the
+# `old is None -> Reason.CREATE` branch, which kopf documents as "creation never
+# mixes with resuming". (Before #68 fetch() returned None *unconditionally*, so
+# every later event took that branch too. That is fixed: a label edit is now an
+# UPDATE, which nothing here claims.)
+#
+# So this handler fires once per namespace at startup, which is why it must not
+# deploy unpaced. Note "fires", not "has fired": nothing in this module was
+# imported at module scope until handlers/__init__.py started doing it, so the
+# decorators never ran and no handler here has yet seen a real cluster.
 @kopf.on.create("", "v1", "namespaces")
 def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
     """Deploy a checker for a namespace, unless a paced rollout is under way."""
@@ -131,7 +136,9 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
 
     # blocking=False: kopf fires this concurrently for every namespace on
     # startup, so all but one return immediately instead of bursting. Whatever
-    # is skipped here is deployed by the next reconcile pass.
+    # is skipped here is deployed by the next reconcile pass. The guard is a
+    # non-blocking Lock.acquire and so is sound by construction, but see the
+    # note above — it has never been exercised against a real cluster.
     deploy_checker_serialised(
         namespace,
         blocking=False,
@@ -141,10 +148,16 @@ def on_namespace_create(body: dict, meta: kopf.Meta, **kwargs) -> None:
     )
 
 
-@kopf.on.delete("", "v1", "namespaces", optional=True)
-def on_namespace_delete(body: dict, meta: kopf.Meta, **kwargs) -> None:
-    """Tear down checker when a namespace is deleted."""
-    # blocking=False, and skipping is harmless: the namespace itself is going
-    # away, so Kubernetes garbage-collects everything in it regardless. This
-    # call only tidies up early.
-    teardown_checker_serialised(meta.name, blocking=False)
+# No delete handler. There was one, and it could never have fired: kopf reaches
+# a DELETE cause only while its own finalizer is still on the object
+# (causes.py — `deletion_is_ongoing and not deletion_is_blocked` returns FREE
+# first), and this operator places no finalizer. `optional=True` sets
+# requires_finalizer=False (kopf/on.py), and on_startup sets
+# settings.persistence.finalizer = None outright. A deleting namespace
+# therefore resolves to Reason.FREE, which matches no handler.
+#
+# It cannot be made to work here either: blocking deletion needs a finalizer,
+# which needs the namespaces patch permission this operator deliberately does
+# not hold. Kubernetes garbage-collects everything in a deleted namespace
+# regardless, which is what the handler's own docstring said, so nothing is
+# lost by removing it.

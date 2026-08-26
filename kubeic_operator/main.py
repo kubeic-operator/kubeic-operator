@@ -8,6 +8,12 @@ import kopf
 from kubernetes import client, config as k8s_config
 from prometheus_client import start_http_server
 
+# Imported for the side effect, which is the whole point: importing the package
+# runs the @kopf.on.* decorators, and `kopf run` watches only what is registered
+# by the time this module — its entrypoint — finishes loading. Deleting this line
+# silently stops every handler from ever firing, with no error anywhere.
+# See kubeic_operator/handlers/__init__.py.
+from kubeic_operator import handlers  # noqa: F401
 from kubeic_operator.checks.prerelease import check_prerelease, filter_violations
 from kubeic_operator.checks.spread import aggregate_version_spread
 from kubeic_operator.metrics import (
