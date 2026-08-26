@@ -33,6 +33,19 @@ CHECKER_MODE = os.environ.get("CHECKER_MODE", "perNamespace")
 CENTRAL_MODE = CHECKER_MODE == "central"
 POD_PAGE_SIZE = int(os.environ.get("POD_PAGE_SIZE", "500"))
 
+# How long the FIRST sweep after startup may take, in seconds. Every later cycle
+# is paced across the whole interval; this one is not.
+#
+# Metrics are published only when a sweep finishes, so pacing the first sweep
+# like the rest would mean a restarted checker exports nothing for a full
+# interval. That is far longer than any alert's `for`, so every firing alert
+# resolves on restart and the downstream tickets close — which is exactly what a
+# 30 minute blackout on sca1 did during the 0.3.0-alpha.8 rollout (#74).
+#
+# Deliberately a short pacing window rather than no pacing at all: running the
+# first sweep flat out would reinstate the startup burst that #72 removed.
+FIRST_CYCLE_SECONDS = int(os.environ.get("FIRST_CYCLE_SECONDS", "60"))
+
 
 def _parse_excluded_namespaces() -> frozenset[str]:
     raw = os.environ.get("EXCLUDED_NAMESPACES", "")
@@ -390,6 +403,12 @@ def run_check_loop():
     at a single instant, so the oldest data point can be a full interval older
     at publish time than it was before. Halving intervalMinutes restores the old
     latency while keeping the level load.
+
+    The first sweep after startup is the exception, paced against a much shorter
+    deadline. Results are only published once a sweep completes, so pacing it
+    like the rest leaves a restarted checker exporting nothing for a whole
+    interval — long enough for every alert built on these metrics to resolve
+    (#74).
     """
     config.load_incluster_config()
     secrets_client = client.CoreV1Api()
@@ -405,8 +424,17 @@ def run_check_loop():
             len(EXCLUDED_NAMESPACES), EXCLUDE_LABELS or "(none configured)",
         )
 
+    first_cycle = True
     while True:
         cycle_deadline = time.monotonic() + CHECK_INTERVAL
+        # The pacer's deadline is not the cycle's. Every cycle still lasts a full
+        # interval — the sleep at the bottom sees to that — but the first sweep
+        # is compressed so there is something to scrape within a minute of
+        # startup rather than half an hour.
+        pace_deadline = (
+            time.monotonic() + min(FIRST_CYCLE_SECONDS, CHECK_INTERVAL)
+            if first_cycle else cycle_deadline
+        )
         try:
             if CENTRAL_MODE:
                 # Recomputed every cycle: namespaces are created, deleted and
@@ -439,7 +467,7 @@ def run_check_loop():
                 # would burst at the end of every cycle.
                 plan = plan_inspections(auditable_pods, image_creds)
                 pacer = _Pacer(
-                    cycle_deadline, len(plan) + len(_probeable_credentials(creds)),
+                    pace_deadline, len(plan) + len(_probeable_credentials(creds)),
                 )
 
                 results = check_availability(
@@ -479,11 +507,16 @@ def run_check_loop():
         except Exception as e:
             logger.error("Check cycle failed: %s", e)
 
+        # Cleared even when the cycle raised. A failed first sweep has already
+        # cost the fast-publish window, and repeating it every cycle would mean
+        # a checker that fails once never paces again.
+        first_cycle = False
+
         # Pacing spends most of the interval inside the sweep. Anything left —
-        # an empty cluster, a very small namespace, or a cycle that failed
-        # early — is slept out here so the cycle length stays the interval. A
-        # sweep that overran leaves this negative and the next cycle starts at
-        # once.
+        # an empty cluster, a very small namespace, a compressed first sweep, or
+        # a cycle that failed early — is slept out here so the cycle length
+        # stays the interval. A sweep that overran leaves this negative and the
+        # next cycle starts at once.
         time_left = cycle_deadline - time.monotonic()
         if time_left > 0:
             time.sleep(time_left)

@@ -37,6 +37,32 @@ spec:
             summary: "Image no longer in registry: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} runs an image that is no longer present in {{`{{ $labels.registry }}`}}. The pod keeps running, but it cannot be rescheduled, scaled or restarted until the tag is restored or the workload is moved to a tag that exists."
 
+        # ImageAuditCheckerDegraded below is about registries misbehaving, not
+        # about the checker disappearing. An absent series fires nothing, so
+        # without this rule a checker that is CrashLooping, evicted or wedged
+        # simply stops auditing in silence — the same class of quiet staleness
+        # #67/#69 fixed on the operator's reconcile path (#75).
+        #
+        # absent() only fires when NOTHING is reporting. In central mode that is
+        # exactly the failure that matters, because one pod covers the cluster.
+        # In perNamespace it will not notice one checker of many going dark;
+        # catching that needs the operator to export which namespaces it expects
+        # to be covered, which is the follow-up on #75.
+        #
+        # `for` must clear a normal restart. The first sweep after startup is
+        # paced against FIRST_CYCLE_SECONDS rather than the whole interval
+        # (#74), so a restart is a gap of about a minute, but the margin below
+        # is kept generous so a slow rollout across many namespaces cannot page.
+        - alert: ImageAuditCheckerNotReporting
+          expr: |
+            absent(kube_image_available)
+          for: {{ add .Values.policy.availability.intervalMinutes 15 }}m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No image audit results are being published"
+            description: "No kube_image_available series exist at all, so nothing in this cluster is being audited for image availability, digest drift or credential validity. Either every checker is down or the checkers are running but never completing a sweep. In checker.mode=central a single pod covers the whole cluster, so one failure produces this. Check the checker pods and their logs."
+
         - alert: ImageAuditCheckerDegraded
           expr: |
             count by (cluster, namespace, registry, error_class) (
