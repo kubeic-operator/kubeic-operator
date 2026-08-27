@@ -52,14 +52,28 @@ def read_metrics(kubectl):
     skopeo, so python is the only HTTP client guaranteed to be present.
     """
     def _read(namespace, pod):
-        result = kubectl(
-            "exec", pod, "-n", namespace, "--",
-            "python", "-c",
-            "import urllib.request;"
-            "print(urllib.request.urlopen('http://localhost:9090/metrics', timeout=10).read().decode())",
-            timeout=45, check=False,
+        # check=False returned "" on a failed exec, which is indistinguishable
+        # from a successful scrape of a checker that has not published yet.
+        # Callers poll this predicate, so a pod that had gone away produced a
+        # full-length timeout reporting "last saw: None" — the failure the
+        # 2026-08-27 run could not be diagnosed from. Retry a couple of times
+        # for a genuine blip, then say what actually went wrong.
+        attempts = []
+        for _ in range(3):
+            result = kubectl(
+                "exec", pod, "-n", namespace, "--",
+                "python", "-c",
+                "import urllib.request;"
+                "print(urllib.request.urlopen('http://localhost:9090/metrics', timeout=10).read().decode())",
+                timeout=45, check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            attempts.append(f"rc={result.returncode} {result.stderr.strip()[:200]}")
+        pytest.fail(
+            f"Could not scrape /metrics from {namespace}/{pod} after 3 attempts: "
+            + " | ".join(attempts)
         )
-        return result.stdout
     return _read
 
 
