@@ -45,6 +45,54 @@ def test_namespace(kubectl):
 
 
 @pytest.fixture(scope="session")
+def read_metrics(kubectl):
+    """Scrape a pod's own /metrics from inside it.
+
+    urllib rather than curl or wget: the checker image is python:3.13-slim plus
+    skopeo, so python is the only HTTP client guaranteed to be present.
+    """
+    def _read(namespace, pod):
+        # check=False returned "" on a failed exec, which is indistinguishable
+        # from a successful scrape of a checker that has not published yet.
+        # Callers poll this predicate, so a pod that had gone away produced a
+        # full-length timeout reporting "last saw: None" — the failure the
+        # 2026-08-27 run could not be diagnosed from. Retry a couple of times
+        # for a genuine blip, then say what actually went wrong.
+        attempts = []
+        for _ in range(3):
+            result = kubectl(
+                "exec", pod, "-n", namespace, "--",
+                "python", "-c",
+                "import urllib.request;"
+                "print(urllib.request.urlopen('http://localhost:9090/metrics', timeout=10).read().decode())",
+                timeout=45, check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout
+            attempts.append(f"rc={result.returncode} {result.stderr.strip()[:200]}")
+        pytest.fail(
+            f"Could not scrape /metrics from {namespace}/{pod} after 3 attempts: "
+            + " | ".join(attempts)
+        )
+    return _read
+
+
+@pytest.fixture(scope="session")
+def poll_for():
+    """Retry until a callable returns something truthy, then return it."""
+    def _poll(fn, timeout, interval=10, what="condition"):
+        deadline = time.time() + timeout
+        last = None
+        while time.time() < deadline:
+            last = fn()
+            if last:
+                return last
+            time.sleep(interval)
+        pytest.fail(f"Timed out after {timeout}s waiting for {what}; last saw: {last!r}")
+    return _poll
+
+
+@pytest.fixture(scope="session")
 def operator_pod(kubectl, operator_namespace):
     result = kubectl(
         "get", "pods", "-n", operator_namespace,

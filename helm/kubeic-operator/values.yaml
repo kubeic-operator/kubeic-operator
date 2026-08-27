@@ -2,7 +2,7 @@
 operator:
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/operator
-    tag: "0.2.1"
+    tag: "0.3.0-alpha.11"
     pullPolicy: IfNotPresent
   replicas: 1
   resources:
@@ -17,11 +17,62 @@ operator:
 
 # Checker settings (applied to per-namespace checker deployments)
 checker:
+  # Deploy checkers at all. When false the operator still runs the cluster-wide
+  # checks (pre-release, version spread) but deploys no checker pods, and any
+  # existing ones are torn down on the next reconcile.
+  #
+  # Availability, digest, credential-validity AND pre-release *age* all come
+  # from the checker, so their alerts are omitted when this is false — only
+  # ImageVersionSpreadTooHigh runs on operator metrics alone.
+  enabled: true
+
+  # How checkers are laid out.
+  #
+  #   perNamespace  one checker Deployment per audited namespace (default)
+  #   central       one checker Deployment for the whole cluster, owned by this
+  #                 chart, and no per-namespace checkers at all
+  #
+  # Switching to central needs no migration step. Every namespace stops wanting
+  # a checker of its own, and the operator's normal reconcile drains the
+  # existing ones one at a time, at the same pace as any other rollout.
+  #
+  # Central mode buys memory. Measured across a nine-cluster estate, 222
+  # per-namespace checkers held 13.35 GiB resident, and ~61 MiB of each pod is a
+  # Python interpreter floor paid once per pod rather than per unit of work. One
+  # checker per cluster is ~70 MiB, roughly a 23x reduction.
+  #
+  # Three things behave differently in central mode:
+  #
+  #   * availability.intervalMinutes and credentialSource.type come from the
+  #     `policy` block below and nowhere else. A namespace-scoped
+  #     ImageAuditPolicy cannot override them, because there is no
+  #     per-namespace checker left to configure.
+  #   * excludedNamespaces and policy.namespaceSelector.excludeLabels are
+  #     applied by the central checker itself, from these values. A namespace
+  #     excluded *only* by its own namespace-scoped ImageAuditPolicy is still
+  #     audited; exclude it here, or by label, or stay on perNamespace.
+  #   * a NEW namespace takes up to two intervals to appear in the metrics,
+  #     rather than one. The central checker snapshots the pod list once at the
+  #     start of a cycle and publishes at the end of it, so a namespace created
+  #     mid-cycle is first listed by the next cycle and first reported when that
+  #     one finishes. At the default 30 minute interval that is up to an hour.
+  #     perNamespace has no such gap: the operator deploys a checker on the
+  #     namespace-create event and it lists its own namespace immediately.
+  #     The operator still grants the central checker access to the new
+  #     namespace's pull secrets straight away, so nothing is missing when the
+  #     sweep does arrive. Halve intervalMinutes to halve the gap.
+  #
+  # noSecretNamespaces and namespaceSecrets keep working unchanged. The central
+  # checker gets no cluster-wide secret access — the operator binds it into one
+  # namespace at a time, honouring both settings, so its reach is the union of
+  # the namespaces actually being audited rather than the whole cluster.
+  mode: perNamespace
+
   # Service name for checker metrics — must match across dashboard, RBAC, and operator code
   serviceName: kubeic-checker-metrics
   image:
     repository: ghcr.io/kubeic-operator/kubeic-operator/checker
-    tag: "0.2.1"
+    tag: "0.3.0-alpha.11"
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -32,6 +83,19 @@ checker:
       memory: 128Mi
   podLabels: {}
   podAnnotations: {}
+
+  # Checker rollouts are serialised one namespace at a time: every checker pod
+  # template carries the version label, so a version bump would otherwise roll
+  # all of them simultaneously. This bounds how long to wait for each one before
+  # moving on; a namespace that exceeds it is logged and skipped rather than
+  # stalling every namespace behind it.
+  readyTimeoutSeconds: 90
+
+  # Old ReplicaSets retained per checker Deployment. Kubernetes defaults to 10,
+  # which with one Deployment per namespace makes ReplicaSets the largest class
+  # of object this operator creates, growing by one per namespace per version
+  # bump. Two is enough to roll back a single bad release.
+  revisionHistoryLimit: 2
 
   # Namespaces excluded from auditing entirely (no checker deployed)
   excludedNamespaces:
@@ -46,6 +110,31 @@ checker:
   namespaceSecrets: {}
     # kube-system:
     #   - my-pull-secret
+
+  # The single cluster-wide checker. Only rendered when mode is central.
+  central:
+    resources:
+      requests:
+        # Measured per-namespace RSS is 60.2 MiB + 0.013 x containers (R2=0.915),
+        # so one checker covering a 600-container cluster projects to ~68 MiB.
+        # The request is set well above that on purpose: the projection comes
+        # from per-namespace pods, and a cluster-wide sweep's real peak — the
+        # paged pod list plus a skopeo child process — has not been soaked yet.
+        # Tighten once it has.
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        # CPU actuals across the estate were 0.33 cores for all 222 checkers
+        # combined, but the limit has to cover a single skopeo inspect burst, and
+        # throttling one would stretch the paced sweep past its interval.
+        cpu: 500m
+        memory: 512Mi
+    podLabels: {}
+    podAnnotations: {}
+    networkPolicy:
+      # Registry egress ports beyond 443. skopeo speaks HTTPS, so 443 covers the
+      # normal case; add e.g. 5000 for a plain in-cluster registry.
+      extraEgressPorts: []
 
 # Default audit policy (applied as cluster-defaults ImageAuditPolicy)
 policy:
@@ -77,7 +166,6 @@ policy:
   versionSpread:
     threshold: 3
   availability:
-    enabled: true
     intervalMinutes: 30
   namespaceSelector:
     excludeLabels:
@@ -119,6 +207,37 @@ prometheusRule:
   # For kube-prometheus-stack, Prometheus selects rules by release label.
   # Set this to the release name of your kube-prometheus-stack install:
   # release: kube-prometheus-stack
+
+  # How long an alert keeps firing after its series stops being reported.
+  #
+  # These alerts are built on gauges that a checker clears and repopulates once
+  # per sweep, so when a checker restarts its series briefly vanish. `for` does
+  # NOT protect against that: it gates pending -> firing only. Once an alert is
+  # firing, Prometheus drops it the moment the series is absent, whatever `for`
+  # says. So every checker restart resolved every alert it fed, and any
+  # downstream ticket closed with it.
+  #
+  # Measured on 2026-08-26: a chart upgrade rolled 57 checkers on one cluster and
+  # closed 32 firing alerts, which then needed 40-60 minutes each to re-arm. A
+  # single central checker restart closed its cluster's alerts in the same way.
+  #
+  # keep_firing_for holds the alert firing across that gap. The cost is that a
+  # genuinely resolved condition stays firing this much longer — acceptable for
+  # what these alerts describe (deleted tags, stale pre-release images, invalid
+  # credentials), none of which resolve on a timescale where minutes matter.
+  #
+  # Empty derives intervalMinutes + 5m, which covers the normal case (a restart
+  # publishes within ~2 minutes since #74) and also a first sweep that fails and
+  # has to wait a full interval for the next one. Set an explicit duration to
+  # override, or "0s" to disable.
+  #
+  # NOT applied to ImageAuditCheckerNotReporting: that alert exists to fire while
+  # metrics are absent, so holding it past recovery would only delay the all-clear.
+  #
+  # Caveat: mimirtool silently ignores keep_firing_for. These rules reach
+  # Prometheus as a PrometheusRule, which honours it, but if they are ever synced
+  # to a central Mimir ruler instead the setting will be dropped without warning.
+  keepFiringFor: ""
 
 # Network policy
 networkPolicy:

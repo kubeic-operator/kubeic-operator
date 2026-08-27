@@ -13,6 +13,10 @@ class ResolvedCredential:
     password: str | None = None
     auth: str | None = None  # base64-encoded user:pass
     source: str = ""  # e.g. "pod:imagePullSecret:my-secret"
+    # The namespace the secret was read from. Carried on the credential rather
+    # than assumed from a single ambient namespace so one checker can hold
+    # credentials for many namespaces without them bleeding across.
+    namespace: str = ""
 
 
 def _decode_docker_secret(secret_data: dict) -> dict[str, dict]:
@@ -49,23 +53,30 @@ def resolve_all_credentials(
 ) -> list[ResolvedCredential]:
     """Resolve registry credentials by reading only secrets referenced as imagePullSecrets by pods.
 
-    Each unique secret name is read exactly once, regardless of how many pods reference it.
-    No secrets are read unless a pod in this namespace explicitly lists them as imagePullSecrets.
+    Each (namespace, secret name) pair is read exactly once, regardless of how many pods reference
+    it. No secret is read unless a pod in its own namespace explicitly lists it as an
+    imagePullSecret.
+
+    The pod list may span namespaces, so the namespace comes from each pod rather than from the
+    first one. Reading every secret out of `pods[0]`'s namespace would, for a multi-namespace
+    checker, look up names in the wrong place — mostly 404s, but a same-named secret in the wrong
+    namespace would resolve to the wrong credential.
     """
     if credential_source_type == "workloadIdentity" or not pods:
         return []
 
-    namespace = pods[0]["metadata"]["namespace"]
-
-    secret_names: set[str] = set()
+    # (namespace, secret_name) pairs, so the same secret name in two namespaces
+    # is two distinct reads rather than one shared result.
+    wanted: set[tuple[str, str]] = set()
     for pod in pods:
+        namespace = pod["metadata"]["namespace"]
         for ref in pod.get("spec", {}).get("imagePullSecrets", []):
             name = ref.get("name", "")
             if name:
-                secret_names.add(name)
+                wanted.add((namespace, name))
 
     credentials: list[ResolvedCredential] = []
-    for secret_name in secret_names:
+    for namespace, secret_name in sorted(wanted):
         try:
             secret = secrets_client.read_namespaced_secret(secret_name, namespace)
             decoded = _decode_docker_secret(secret.data or {})
@@ -76,6 +87,7 @@ def resolve_all_credentials(
                     password=creds.get("password"),
                     auth=creds.get("auth"),
                     source=f"pod:imagePullSecret:{secret_name}",
+                    namespace=namespace,
                 ))
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning("Failed to decode secret %s in %s: %s", secret_name, namespace, e)
@@ -100,22 +112,31 @@ def _normalize_registry_host(registry: str) -> str:
 def build_image_credentials(
     pods: list[dict],
     creds: list[ResolvedCredential],
-) -> dict[str, list[ResolvedCredential]]:
-    """Map each image to the credentials of the pull secrets its pods reference.
+) -> dict[tuple[str, str], list[ResolvedCredential]]:
+    """Map each (namespace, image) to the credentials of the pull secrets its pods reference.
 
     Mirrors kubelet semantics: a pod's imagePullSecrets are tried in order for
     its own images. Credentials from secrets a pod does not reference are never
     used for that pod's images — this is what prevents one namespace-wide
     credential from masking (or being masked by) another for the same registry
     host when per-project deploy tokens are in play.
+
+    Keyed by (namespace, image), not image alone. With one checker per namespace
+    those are equivalent, since every pod shares a namespace. For a checker
+    spanning namespaces they are not: two namespaces running the same image
+    reference with different deploy tokens would otherwise share one candidate
+    list, and namespace A's token would be tried against namespace B's image.
+    Secrets are also looked up per namespace, so the same secret *name* in two
+    namespaces stays two distinct credentials.
     """
-    by_secret: dict[str, list[ResolvedCredential]] = {}
+    by_secret: dict[tuple[str, str], list[ResolvedCredential]] = {}
     for cred in creds:
         secret_name = cred.source.split(":")[-1]
-        by_secret.setdefault(secret_name, []).append(cred)
+        by_secret.setdefault((cred.namespace, secret_name), []).append(cred)
 
-    image_creds: dict[str, list[ResolvedCredential]] = {}
+    image_creds: dict[tuple[str, str], list[ResolvedCredential]] = {}
     for pod in pods:
+        namespace = pod["metadata"]["namespace"]
         secret_names = [
             ref.get("name", "")
             for ref in pod.get("spec", {}).get("imagePullSecrets", [])
@@ -127,9 +148,9 @@ def build_image_credentials(
         for container in containers:
             image = container["image"]
             image_host = _normalize_registry_host(registry_from_image(image))
-            candidates = image_creds.setdefault(image, [])
+            candidates = image_creds.setdefault((namespace, image), [])
             for secret_name in secret_names:
-                for cred in by_secret.get(secret_name, []):
+                for cred in by_secret.get((namespace, secret_name), []):
                     if _normalize_registry_host(cred.registry) != image_host:
                         continue
                     if any(c.source == cred.source and c.registry == cred.registry for c in candidates):

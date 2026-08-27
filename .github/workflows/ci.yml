@@ -46,6 +46,10 @@ jobs:
     name: Integration Tests (kind)
     runs-on: ubuntu-latest
     needs: lint-and-unit
+    # The metrics tests poll a real checker across paced sweep cycles, so the
+    # job is minutes rather than seconds. Bounded explicitly so a hang fails in
+    # 30 minutes instead of running to the 6 hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
 
@@ -98,7 +102,24 @@ jobs:
             --set scanIntervalSeconds=15
 
       - name: Run integration tests
-        run: pytest tests/integration/ -v --tb=short -x
+        run: pytest tests/integration/ -v --tb=short -x -m "not central"
+        env:
+          KUBECONFIG: /home/runner/.kube/config
+
+      # Central mode last, and in place: it drains every per-namespace checker,
+      # so it cannot share a cluster with the tests above. Only a real API server
+      # can show that the operator is permitted to mint the per-namespace secret
+      # Roles the central checker depends on — a mocked RBAC client cannot.
+      - name: Upgrade to central checker mode
+        run: |
+          helm upgrade kubeic-operator ./helm/kubeic-operator \
+            --namespace kubeic-operator \
+            --reuse-values \
+            --set checker.mode=central \
+            --wait --timeout 5m
+
+      - name: Run central-mode integration tests
+        run: pytest tests/integration/test_central_mode.py -v --tb=short -m central
         env:
           KUBECONFIG: /home/runner/.kube/config
 
@@ -111,6 +132,23 @@ jobs:
           kubectl get pods -A || true
           echo "=== Checker pods ==="
           kubectl get pods -A -l app.kubernetes.io/component=checker || true
+          echo "=== Central checker logs ==="
+          kubectl logs -n kubeic-operator deployment/kubeic-operator-checker --tail=100 || true
+          echo "=== Central secret grants ==="
+          kubectl get roles,rolebindings -A -l app.kubernetes.io/component=checker || true
+          # The central reporting tests assert on which namespaces appear in
+          # kube_image_available. Without the checker's own /metrics here, a
+          # failure is indistinguishable from the scrape having returned
+          # nothing at all, which is exactly what made the 2026-08-27 run
+          # undiagnosable after the fact.
+          echo "=== Central checker /metrics: namespaces covered ==="
+          kubectl exec -n kubeic-operator deployment/kubeic-operator-checker -- \
+            python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:9090/metrics',timeout=10).read().decode())" \
+            2>/dev/null | grep '^kube_image_available' | sed -E 's/.*namespace="([^"]*)".*/\1/' | sort | uniq -c || true
+          echo "=== Central checker /metrics: kube_image_available (raw) ==="
+          kubectl exec -n kubeic-operator deployment/kubeic-operator-checker -- \
+            python -c "import urllib.request;print(urllib.request.urlopen('http://localhost:9090/metrics',timeout=10).read().decode())" \
+            2>/dev/null | grep '^kube_image_available' | head -60 || true
           echo "=== Events ==="
           kubectl get events -A --sort-by='.lastTimestamp' || true
 

@@ -38,13 +38,16 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["get", "list", "create"]
+  # kubeic-checker is the per-namespace checker's own grant; kubeic-checker-central
+  # is how the operator binds the one central checker into each audited namespace
+  # in central mode. Both are names the operator creates and owns.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles"]
-    resourceNames: ["kubeic-checker"]
+    resourceNames: ["kubeic-checker", "kubeic-checker-central"]
     verbs: ["update", "patch", "delete"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["rolebindings"]
-    resourceNames: ["kubeic-checker"]
+    resourceNames: ["kubeic-checker", "kubeic-checker-central"]
     verbs: ["update", "patch", "delete"]
   - apiGroups: [""]
     resources: ["serviceaccounts"]

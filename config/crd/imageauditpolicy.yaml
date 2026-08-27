@@ -69,9 +69,6 @@ spec:
                 availability:
                   type: object
                   properties:
-                    enabled:
-                      type: boolean
-                      default: true
                     intervalMinutes:
                       type: integer
                       minimum: 1
@@ -120,7 +117,11 @@ spec:
                         type: string
                   description: >-
                     Per-namespace checker state. Keys are namespace names.
-                    Each value indicates whether a checker is deployed and why.
+                    "deployed" means a checker is confirmed present: it is false
+                    when deployment failed, and false with a "state unknown"
+                    reason when the operator could not read the Deployment at
+                    all. A failed teardown leaves it true, because the checker
+                    is still running.
       additionalPrinterColumns:
         - name: Pre-release Max Age
           type: string

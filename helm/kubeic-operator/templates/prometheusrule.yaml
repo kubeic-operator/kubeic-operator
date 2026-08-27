@@ -1,4 +1,13 @@
 {{- if .Values.prometheusRule.enabled }}
+{{/*
+  keep_firing_for holds an alert across the gap left by a checker restart.
+  `for` cannot: it gates pending -> firing only, so a firing alert is dropped the
+  instant its series goes absent. That closed 32 alerts on one cluster during a
+  routine chart upgrade. Empty derives intervalMinutes + 5m — enough for the
+  ~2 minute restart gap since #74, and for a failed first sweep that waits a
+  whole interval for the next one.
+*/}}
+{{- $keepFiring := .Values.prometheusRule.keepFiringFor | default (printf "%dm" (add .Values.policy.availability.intervalMinutes 5)) }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -13,6 +22,7 @@ spec:
   groups:
     - name: image-audit
       rules:
+        {{- if .Values.checker.enabled }}
         # Exprs aggregate away the checker's own scrape identity so alerts
         # survive a checker restart, and rename exported_* back to the subject
         # workload. "(.+)" leaves the label untouched when exported_* is absent.
@@ -30,11 +40,43 @@ spec:
                 "container", "$1", "exported_container", "(.+)")
             ) == 0
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
             summary: "Image no longer in registry: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} container {{`{{ $labels.container }}`}} runs an image that is no longer present in {{`{{ $labels.registry }}`}}. The pod keeps running, but it cannot be rescheduled, scaled or restarted until the tag is restored or the workload is moved to a tag that exists."
+
+        # ImageAuditCheckerDegraded below is about registries misbehaving, not
+        # about the checker disappearing. An absent series fires nothing, so
+        # without this rule a checker that is CrashLooping, evicted or wedged
+        # simply stops auditing in silence — the same class of quiet staleness
+        # #67/#69 fixed on the operator's reconcile path (#75).
+        #
+        # absent() only fires when NOTHING is reporting. In central mode that is
+        # exactly the failure that matters, because one pod covers the cluster.
+        # In perNamespace it will not notice one checker of many going dark;
+        # catching that needs the operator to export which namespaces it expects
+        # to be covered, which is the follow-up on #75.
+        #
+        # `for` must clear a normal restart. The first sweep after startup is
+        # paced against FIRST_CYCLE_SECONDS rather than the whole interval
+        # (#74), so a restart is a gap of about a minute, but the margin below
+        # is kept generous so a slow rollout across many namespaces cannot page.
+        #
+        # Deliberately the ONE rule with no keep_firing_for. Every other rule
+        # here needs it because a firing alert is dropped the instant its series
+        # goes absent; this rule fires *because* the series are absent, so
+        # holding it past recovery would only delay the all-clear.
+        - alert: ImageAuditCheckerNotReporting
+          expr: |
+            absent(kube_image_available)
+          for: {{ add .Values.policy.availability.intervalMinutes 15 }}m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No image audit results are being published"
+            description: "No kube_image_available series exist at all, so nothing in this cluster is being audited for image availability, digest drift or credential validity. Either every checker is down or the checkers are running but never completing a sweep. In checker.mode=central a single pod covers the whole cluster, so one failure produces this. Check the checker pods and their logs."
 
         - alert: ImageAuditCheckerDegraded
           expr: |
@@ -44,6 +86,7 @@ spec:
                 "namespace", "$1", "exported_namespace", "(.+)")
             )
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -60,6 +103,7 @@ spec:
                 "container", "$1", "exported_container", "(.+)")
             ) == 0
           for: 30m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
@@ -90,31 +134,59 @@ spec:
               )
             ) > {{ .Values.policy.prerelease.maxAgeDays }}
           for: 1h
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
             summary: "Pre-release image published {{`{{ $value | printf \"%.0f\" }}`}}d ago: {{`{{ $labels.image }}`}}"
             description: "Pod {{`{{ $labels.namespace }}`}}/{{`{{ $labels.pod }}`}} is running pre-release tag {{`{{ $labels.tag }}`}} whose image was published more than {{ .Values.policy.prerelease.maxAgeDays }} days ago."
 
+        {{- end }}
+
+        # Operator-sourced: the only rule that still works with checkers disabled.
         - alert: ImageVersionSpreadTooHigh
           expr: |
             max by (cluster, registry, image_name) (kube_image_version_spread_violation) == 1
           for: 30m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: warning
           annotations:
             summary: "Version spread on {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}}"
             description: "Image {{`{{ $labels.registry }}`}}/{{`{{ $labels.image_name }}`}} has too many distinct versions running simultaneously."
 
+        # Operator-sourced, and deliberately outside the checker.enabled guard:
+        # reconcile still runs with checkers disabled, and a teardown that keeps
+        # failing is exactly the case worth knowing about. The label_replace is
+        # needed for the same reason as the checker rules — the operator's own
+        # scrape labels collide with the metric's namespace label.
+        - alert: ImageAuditReconcileFailing
+          expr: |
+            max by (cluster, namespace, operation, error_class) (
+              label_replace(
+                increase(kube_image_checker_reconcile_failures_total[30m]),
+                "namespace", "$1", "exported_namespace", "(.+)")
+            ) > 0
+          for: 15m
+          keep_firing_for: {{ $keepFiring }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Checker {{`{{ $labels.operation }}`}} failing in {{`{{ $labels.namespace }}`}} ({{`{{ $labels.error_class }}`}})"
+            description: "The operator could not {{`{{ $labels.operation }}`}} the checker in {{`{{ $labels.namespace }}`}} over the last 30 minutes. error_class=api is an API server condition — a 403 from an admission webhook, a 409, a 503 — and may clear on its own; error_class=internal is a defect in the operator and will not. The ImageAuditPolicy status for that namespace carries the reason and the operator log has the traceback. Audit coverage for that namespace is degraded or absent until it succeeds."
+
+        {{- if .Values.checker.enabled }}
         - alert: RegistryCredentialInvalid
           expr: |
             max by (cluster, namespace, registry, secret_name) (
               label_replace(kube_image_credential_valid, "namespace", "$1", "exported_namespace", "(.+)")
             ) == 0
           for: {{ add .Values.policy.availability.intervalMinutes 10 }}m
+          keep_firing_for: {{ $keepFiring }}
           labels:
             severity: critical
           annotations:
             summary: "Registry credential invalid: {{`{{ $labels.registry }}`}}"
             description: "Credential {{`{{ $labels.secret_name }}`}} in namespace {{`{{ $labels.namespace }}`}} failed validation against {{`{{ $labels.registry }}`}}."
+        {{- end }}
 {{- end }}

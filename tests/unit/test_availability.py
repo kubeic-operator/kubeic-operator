@@ -344,7 +344,7 @@ class TestInspectWithCandidates:
         from kubeic_checker.credentials import ResolvedCredential
         return ResolvedCredential(
             registry="r.corp.io", username=user, password="p",
-            source=f"pod:imagePullSecret:{secret}",
+            source=f"pod:imagePullSecret:{secret}", namespace="default",
         )
 
     @patch("kubeic_checker.availability.subprocess.run")
@@ -356,7 +356,7 @@ class TestInspectWithCandidates:
             MagicMock(returncode=0, stdout='{"Digest": "sha256:abc"}'),
         ]
         pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
-        image_creds = {"r.corp.io/org/app:v1": [self._cred("wrong-scope"), self._cred("right-scope")]}
+        image_creds = {("default", "r.corp.io/org/app:v1"): [self._cred("wrong-scope"), self._cred("right-scope")]}
         results = check_availability(pods, image_creds=image_creds)
         assert results[0].available is True
         assert mock_run.call_count == 2
@@ -372,7 +372,7 @@ class TestInspectWithCandidates:
         # credential's auth file; the second candidate is never used.
         mock_run.return_value = MagicMock(returncode=1, stderr="manifest unknown")
         pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
-        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        image_creds = {("default", "r.corp.io/org/app:v1"): [self._cred("a"), self._cred("b")]}
         results = check_availability(pods, image_creds=image_creds)
         assert results[0].available is False
         assert results[0].error_class == "not_found"
@@ -383,16 +383,92 @@ class TestInspectWithCandidates:
     def test_all_candidates_auth_fail(self, mock_run):
         mock_run.return_value = MagicMock(returncode=1, stderr="unauthorized: authentication required")
         pods = [_make_pod("pod-1", "default", "r.corp.io/org/app:v1")]
-        image_creds = {"r.corp.io/org/app:v1": [self._cred("a"), self._cred("b")]}
+        image_creds = {("default", "r.corp.io/org/app:v1"): [self._cred("a"), self._cred("b")]}
         results = check_availability(pods, image_creds=image_creds)
         assert results[0].available is False
         assert results[0].error_class == "auth_failure"
         assert mock_run.call_count == 2
 
     @patch("kubeic_checker.availability.subprocess.run")
+    def test_uncredentialled_image_shared_across_namespaces(self, mock_run):
+        # Public images are the bulk of a cluster, and they carry no
+        # credentials, so one inspect must still serve every namespace — that
+        # is where nearly all of the central-mode saving comes from.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [
+            _make_pod("pod-a", "ns-a", "quay.io/org/app:v1"),
+            _make_pod("pod-b", "ns-b", "quay.io/org/app:v1"),
+        ]
+        results = check_availability(pods, image_creds={
+            ("ns-a", "quay.io/org/app:v1"): [],
+            ("ns-b", "quay.io/org/app:v1"): [],
+        })
+        assert len(results) == 2
+        assert mock_run.call_count == 1
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_same_image_with_different_credentials_inspected_separately(self, mock_run):
+        # A private repo can be readable with one deploy token and 403 with
+        # another, so sharing one result between them would report a namespace
+        # as healthy on the strength of a credential it does not hold.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        pods = [
+            _make_pod("pod-a", "ns-a", "r.corp.io/org/app:v1"),
+            _make_pod("pod-b", "ns-b", "r.corp.io/org/app:v1"),
+        ]
+        results = check_availability(pods, image_creds={
+            ("ns-a", "r.corp.io/org/app:v1"): [self._cred("token-a", user="a")],
+            ("ns-b", "r.corp.io/org/app:v1"): [self._cred("token-b", user="b")],
+        })
+        assert len(results) == 2
+        assert mock_run.call_count == 2
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_replicated_pull_secret_costs_one_inspect_not_one_per_namespace(self, mock_run):
+        # A cluster-wide pull secret replicated into many namespaces resolves to
+        # one ResolvedCredential per namespace with identical material. Keying on
+        # namespace or secret name would re-inspect the same image once per
+        # namespace for an identical answer; the fingerprint collapses them.
+        from kubeic_checker.credentials import ResolvedCredential
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+
+        def replicated(ns):
+            return ResolvedCredential(
+                registry="r.corp.io", username="shared", password="p",
+                source="pod:imagePullSecret:gitlab-pull", namespace=ns,
+            )
+
+        pods = [
+            _make_pod("pod-a", "ns-a", "r.corp.io/org/app:v1"),
+            _make_pod("pod-b", "ns-b", "r.corp.io/org/app:v1"),
+        ]
+        results = check_availability(pods, image_creds={
+            ("ns-a", "r.corp.io/org/app:v1"): [replicated("ns-a")],
+            ("ns-b", "r.corp.io/org/app:v1"): [replicated("ns-b")],
+        })
+        assert len(results) == 2
+        assert mock_run.call_count == 1
+
+    @patch("kubeic_checker.availability.subprocess.run")
+    def test_candidate_order_is_not_shared_between_namespaces(self, mock_run):
+        # [A, B] and [B, A] can genuinely differ: the first non-auth-failure
+        # wins, so the order is part of what determines the answer.
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}")
+        a, b = self._cred("a", user="a"), self._cred("b", user="b")
+        pods = [
+            _make_pod("pod-a", "ns-a", "r.corp.io/org/app:v1"),
+            _make_pod("pod-b", "ns-b", "r.corp.io/org/app:v1"),
+        ]
+        check_availability(pods, image_creds={
+            ("ns-a", "r.corp.io/org/app:v1"): [a, b],
+            ("ns-b", "r.corp.io/org/app:v1"): [b, a],
+        })
+        assert mock_run.call_count == 2
+
+    @patch("kubeic_checker.availability.subprocess.run")
     def test_no_candidates_inspects_unauthenticated(self, mock_run):
         mock_run.return_value = MagicMock(returncode=0, stdout="{}")
         pods = [_make_pod("pod-1", "default", "quay.io/org/app:v1")]
-        results = check_availability(pods, image_creds={"quay.io/org/app:v1": []})
+        results = check_availability(pods, image_creds={("default", "quay.io/org/app:v1"): []})
         assert results[0].available is True
         assert "--authfile" not in mock_run.call_args[0][0]

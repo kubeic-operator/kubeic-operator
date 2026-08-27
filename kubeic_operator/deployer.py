@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import threading
+import time
 
 from kubernetes import client
 from kubernetes.client import ApiException
@@ -13,6 +15,29 @@ CHECKER_ROLE_BINDING = "kubeic-checker"
 CHECKER_DEPLOYMENT = "kubeic-checker"
 CHECKER_SERVICE = os.environ.get("CHECKER_SERVICE", "kubeic-checker-metrics")
 OPERATOR_NAME = "kubeic-operator"
+OPERATOR_NAMESPACE = os.environ.get("OPERATOR_NAMESPACE", "kubeic-operator")
+
+# Central-mode resources. Named apart from the per-namespace CHECKER_ROLE and
+# CHECKER_ROLE_BINDING rather than reusing them: the two have different subjects
+# — a ServiceAccount local to the namespace, versus the central checker's in the
+# operator namespace — and a RoleBinding's roleRef and subjects are effectively
+# immutable, so a mode switch must create a separate object, not mutate one.
+CENTRAL_CHECKER_ROLE = "kubeic-checker-central"
+CENTRAL_CHECKER_ROLE_BINDING = "kubeic-checker-central"
+
+# Helm owns the central checker's Deployment, ServiceAccount, Service and
+# ClusterRole; the operator only ever references them by name. It cannot own
+# them: its own ClusterRole holds namespaced roles/rolebindings verbs but no
+# clusterroles/clusterrolebindings, so an operator-managed central checker would
+# mean widening the operator's grant to include the cluster-wide RBAC it hands
+# out — and would put the central rollout back on the very code path #61 exists
+# to remove.
+CENTRAL_CHECKER_SERVICE_ACCOUNT = os.environ.get(
+    "CENTRAL_CHECKER_SERVICE_ACCOUNT", "kubeic-operator-checker",
+)
+CENTRAL_CHECKER_DEPLOYMENT = os.environ.get(
+    "CENTRAL_CHECKER_DEPLOYMENT", "kubeic-operator-checker",
+)
 
 CHECKER_IMAGE = os.environ.get("CHECKER_IMAGE", "kubeic-checker:latest")
 RELEASE_NAME = os.environ.get("RELEASE_NAME", "kubeic-operator")
@@ -37,6 +62,86 @@ def _parse_json_env(key: str, default: str = "{}") -> dict:
 
 CHECKER_POD_LABELS = _parse_json_env("CHECKER_POD_LABELS")
 CHECKER_POD_ANNOTATIONS = _parse_json_env("CHECKER_POD_ANNOTATIONS")
+
+
+def _parse_bool_env(key: str, default: bool = True) -> bool:
+    """Parse a boolean env var, treating unset *and* empty as the default.
+
+    Helm renders a missing value as an empty string rather than omitting the
+    env var, so "" must fall back to the default instead of reading as false —
+    otherwise a chart typo silently disables checkers fleet-wide.
+    """
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+CHECKER_ENABLED = _parse_bool_env("CHECKER_ENABLED")
+
+CHECKER_MODES = ("perNamespace", "central")
+
+
+def _parse_mode_env(key: str, default: str = "perNamespace") -> str:
+    """Parse the checker mode, falling back to the default on anything unexpected.
+
+    Unset and empty both mean the default, for the same reason as
+    _parse_bool_env: Helm renders a missing value as "" rather than omitting the
+    variable. An unrecognised value falls back rather than raising, because
+    crashing the operator at import is worse than running the mode it ran
+    yesterday. The chart validates the value with `fail`, so a typo is caught at
+    install time instead of arriving here.
+
+    perNamespace is the safe fallback: it is the long-standing behaviour, and it
+    keeps auditing every namespace. Defaulting to central on a bad value would
+    silently tear down every checker in the cluster.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    for mode in CHECKER_MODES:
+        if raw.lower() == mode.lower():
+            return mode
+    logger.warning("Env %s=%r is not one of %s, falling back to %s", key, raw, CHECKER_MODES, default)
+    return default
+
+
+CHECKER_MODE = _parse_mode_env("CHECKER_MODE")
+CENTRAL_MODE = CHECKER_MODE == "central"
+
+
+def _parse_int_env(key: str, default: int, minimum: int = 0) -> int:
+    """Parse a non-negative integer env var, falling back to the default.
+
+    Unset, empty, non-numeric and out-of-range values all fall back rather than
+    raising: a bad value here would crash the operator at import time, which is
+    a far worse outcome than one setting reverting to its default.
+    """
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("Failed to parse env %s as int, falling back to %d", key, default)
+        return default
+    if value < minimum:
+        logger.warning("Env %s (%d) is below minimum %d, falling back to %d", key, value, minimum, default)
+        return default
+    return value
+
+
+# Deployments default to keeping 10 old ReplicaSets. With one checker Deployment
+# per namespace that is the dominant source of API objects this operator creates
+# — 54 checkers on one production cluster had accumulated 521 ReplicaSets — and
+# every version bump adds another per namespace. Two is enough to roll back one
+# bad release.
+CHECKER_REVISION_HISTORY_LIMIT = _parse_int_env("CHECKER_REVISION_HISTORY_LIMIT", 2)
+
+# Rollout pacing. minimum=1 because a zero timeout would skip the readiness wait
+# entirely and a zero poll interval would busy-loop against the API server.
+CHECKER_READY_TIMEOUT = _parse_int_env("CHECKER_READY_TIMEOUT_SECONDS", 90, minimum=1)
+CHECKER_READY_POLL_SECONDS = _parse_int_env("CHECKER_READY_POLL_SECONDS", 2, minimum=1)
 
 
 def _parse_excluded_namespaces() -> set[str]:
@@ -211,6 +316,7 @@ def _build_deployment(
         ),
         spec=client.V1DeploymentSpec(
             replicas=1,
+            revision_history_limit=CHECKER_REVISION_HISTORY_LIMIT,
             selector=client.V1LabelSelector(
                 match_labels=_selector_labels(),
             ),
@@ -221,6 +327,38 @@ def _build_deployment(
                 ),
                 spec=client.V1PodSpec(
                     service_account_name=CHECKER_SERVICE_ACCOUNT,
+                    # The checker is a sleep loop that installs no SIGTERM
+                    # handler, so it never exits early and always burns the full
+                    # grace period before SIGKILL. It holds nothing that needs
+                    # flushing — metrics are in memory and authfiles live in an
+                    # emptyDir that dies with the pod — so the default 30s is
+                    # dead time during which N terminating pods hold their node
+                    # slots and CNI state after a mass teardown.
+                    termination_grace_period_seconds=5,
+                    # Spread checkers across nodes. topologySpreadConstraints
+                    # cannot do this: a TSC labelSelector only counts pods in
+                    # the *same* namespace, and each checker is replicas:1 alone
+                    # in its own namespace, so it would only ever match itself.
+                    # podAntiAffinity with an empty namespaceSelector (= all
+                    # namespaces) is the cross-namespace equivalent. Preferred
+                    # rather than required so it degrades gracefully once
+                    # checkers outnumber nodes, which they always will.
+                    affinity=client.V1Affinity(
+                        pod_anti_affinity=client.V1PodAntiAffinity(
+                            preferred_during_scheduling_ignored_during_execution=[
+                                client.V1WeightedPodAffinityTerm(
+                                    weight=100,
+                                    pod_affinity_term=client.V1PodAffinityTerm(
+                                        topology_key="kubernetes.io/hostname",
+                                        label_selector=client.V1LabelSelector(
+                                            match_labels=_selector_labels(),
+                                        ),
+                                        namespace_selector=client.V1LabelSelector(),
+                                    ),
+                                ),
+                            ],
+                        ),
+                    ),
                     security_context=client.V1PodSecurityContext(
                         run_as_non_root=True,
                         seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
@@ -284,6 +422,208 @@ def get_secret_names_for_namespace(namespace: str) -> list[str] | None:
     if namespace in NO_SECRET_NAMESPACES:
         return []
     return None
+
+
+# --- Central mode: per-namespace secret grants for the one cluster-wide checker ---
+#
+# The central checker reads pods and namespaces through a ClusterRole, but NOT
+# secrets. A cluster-wide secrets:get would hand every secret in the cluster to
+# a pod that shells out to skopeo against arbitrary, sometimes untrusted
+# registries — a far larger blast radius than the per-namespace checkers it
+# replaces, each of which could only ever read its own namespace.
+#
+# Instead the operator binds the central checker into one namespace at a time,
+# which is also the only way to keep honouring noSecretNamespaces and
+# namespaceSecrets: a ClusterRole's resourceNames are cluster-wide names, so
+# "these secret names, but only in this namespace" cannot be expressed in one.
+
+
+def _build_central_secret_role(namespace: str, secret_names: list[str] | None) -> client.V1Role | None:
+    """Role letting the central checker read pull secrets in one namespace.
+
+    Returns None when the namespace is configured for no secret access at all,
+    which the caller treats as "remove any grant that exists".
+
+    Grants only secrets. Pods and namespaces come from the Helm-owned
+    ClusterRole, so there is no reason to repeat them per namespace.
+    """
+    if secret_names is not None and not secret_names:
+        return None
+
+    return client.V1Role(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="Role",
+        metadata=client.V1ObjectMeta(
+            name=CENTRAL_CHECKER_ROLE,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        rules=[
+            client.V1PolicyRule(
+                api_groups=[""],
+                resources=["secrets"],
+                verbs=["get"],
+                resource_names=list(secret_names) if secret_names else None,
+            ),
+        ],
+    )
+
+
+def _build_central_secret_role_binding(namespace: str) -> client.V1RoleBinding:
+    """RoleBinding tying the central checker's ServiceAccount into one namespace.
+
+    roleRef always points at the local Role, never at a shared ClusterRole.
+    Referencing a ClusterRole for the unrestricted case would be fewer objects,
+    but roleRef is immutable: moving a namespace between unrestricted and
+    name-restricted access would then need a delete-and-recreate of the binding.
+    Pointing at a local Role means only the Role's rules ever change.
+    """
+    return client.V1RoleBinding(
+        api_version="rbac.authorization.k8s.io/v1",
+        kind="RoleBinding",
+        metadata=client.V1ObjectMeta(
+            name=CENTRAL_CHECKER_ROLE_BINDING,
+            namespace=namespace,
+            labels=_common_labels(),
+        ),
+        role_ref=client.V1RoleRef(
+            api_group="rbac.authorization.k8s.io",
+            kind="Role",
+            name=CENTRAL_CHECKER_ROLE,
+        ),
+        subjects=[
+            client.RbacV1Subject(
+                kind="ServiceAccount",
+                name=CENTRAL_CHECKER_SERVICE_ACCOUNT,
+                namespace=OPERATOR_NAMESPACE,
+            ),
+        ],
+    )
+
+
+def _rule_signature(rules) -> list[tuple]:
+    """Comparable form of a Role's rules, for drift detection."""
+    return [
+        (
+            tuple(rule.api_groups or []),
+            tuple(rule.resources or []),
+            tuple(rule.verbs or []),
+            tuple(rule.resource_names or []),
+        )
+        for rule in (rules or [])
+    ]
+
+
+def _labels_match(existing_labels: dict | None, desired_labels: dict) -> bool:
+    """Whether every desired label is already present with the desired value.
+
+    Subset rather than equality: labels applied by something else — a policy
+    engine, a user — are left alone rather than being fought over every pass.
+    """
+    current = existing_labels or {}
+    return all(current.get(key) == value for key, value in desired_labels.items())
+
+
+def ensure_central_secret_access(namespace: str, secret_names: list[str] | None = None) -> None:
+    """Converge the central checker's secret grant in one namespace.
+
+    Writes only on drift. Reconcile calls this for every namespace on every
+    pass, so unconditional patching would mean four API writes per namespace
+    per pass — on a 227-namespace estate that is a needless write storm that
+    also churns resourceVersions and wakes every RBAC watcher in the cluster.
+
+    Safe to call concurrently for the same namespace, which the namespace-create
+    handler and the reconcile pass do at startup: the create paths below treat
+    409 as success, so whichever caller loses the race still ends up converged.
+    """
+    rbac_v1 = client.RbacAuthorizationV1Api()
+
+    role = _build_central_secret_role(namespace, secret_names)
+    if role is None:
+        # Configured for no secret access: make sure nothing is left over from
+        # when it was configured differently.
+        if teardown_central_secret_access(namespace):
+            logger.info("Removed central checker secret grant from %s (no secret access configured)", namespace)
+        return
+
+    try:
+        existing = rbac_v1.read_namespaced_role(CENTRAL_CHECKER_ROLE, namespace)
+        if (
+            _rule_signature(existing.rules) != _rule_signature(role.rules)
+            or not _labels_match(existing.metadata.labels, role.metadata.labels)
+        ):
+            rbac_v1.patch_namespaced_role(CENTRAL_CHECKER_ROLE, namespace, role)
+            logger.info("Updated central checker secret Role in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            try:
+                rbac_v1.create_namespaced_role(namespace, role)
+                logger.info("Created central checker secret Role in %s", namespace)
+            except ApiException as create_exc:
+                # 409: someone created it between our read and our create. This
+                # function takes no rollout lock, and the namespace-create
+                # handler and the reconcile pass both call it — at startup they
+                # overlap, so on a fresh central-mode install both see 404 for
+                # the same namespace and both create. The loser's 409 means the
+                # grant exists, which is all we wanted; anything else is real.
+                # Left unhandled it counted a reconcile failure and tripped
+                # ImageAuditReconcileFailing, whose 30m increase() window keeps
+                # firing for half an hour off a single occurrence.
+                if create_exc.status != 409:
+                    raise
+                logger.debug("Central checker secret Role in %s already created concurrently", namespace)
+        else:
+            raise
+
+    rb = _build_central_secret_role_binding(namespace)
+    try:
+        existing_rb = rbac_v1.read_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace)
+        if not _labels_match(existing_rb.metadata.labels, rb.metadata.labels):
+            # Labels only. roleRef and subjects are fixed for the life of the
+            # binding, and roleRef is immutable anyway.
+            rbac_v1.patch_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace, rb)
+            logger.info("Updated central checker secret RoleBinding in %s", namespace)
+    except ApiException as e:
+        if e.status == 404:
+            try:
+                rbac_v1.create_namespaced_role_binding(namespace, rb)
+                logger.info("Created central checker secret RoleBinding in %s", namespace)
+            except ApiException as create_exc:
+                # Same concurrent-create race as the Role above.
+                if create_exc.status != 409:
+                    raise
+                logger.debug(
+                    "Central checker secret RoleBinding in %s already created concurrently", namespace,
+                )
+        else:
+            raise
+
+
+def teardown_central_secret_access(namespace: str) -> bool:
+    """Remove the central checker's secret grant from a namespace.
+
+    Returns whether anything was actually deleted, so callers can log a
+    transition instead of a line per excluded namespace per reconcile pass.
+
+    Unlike checker teardown this takes no rollout lock: it creates and destroys
+    no pods, so it cannot contribute to the CNI burst behind #61.
+    """
+    rbac_v1 = client.RbacAuthorizationV1Api()
+    deleted = False
+    # Binding first: between the two deletes the grant is already gone either
+    # way, and removing the Role first would briefly leave a binding pointing
+    # at nothing.
+    for delete_fn in [
+        lambda: rbac_v1.delete_namespaced_role_binding(CENTRAL_CHECKER_ROLE_BINDING, namespace),
+        lambda: rbac_v1.delete_namespaced_role(CENTRAL_CHECKER_ROLE, namespace),
+    ]:
+        try:
+            delete_fn()
+            deleted = True
+        except ApiException as e:
+            if e.status != 404:
+                raise
+    return deleted
 
 
 def deploy_checker(
@@ -366,6 +706,119 @@ def deploy_checker(
             logger.info("Created checker Deployment in %s", namespace)
         else:
             raise
+
+
+# Every checker pod template carries app.kubernetes.io/version, so a version
+# bump changes all N templates at once and Kubernetes rolls them simultaneously.
+# On 2026-08-17 that put 34 new pods on one node in 29 seconds and drove its
+# kube-multus into OOMKill, stranding 36 pods for ~50 minutes (#61).
+#
+# One lock, held across the patch *and* the readiness wait, makes checker
+# rollouts strictly one-at-a-time however they are triggered. Both the paced
+# bulk loops and the namespace handler go through it, so neither can burst on
+# its own or race the other.
+_rollout_lock = threading.Lock()
+
+
+def _rollout_complete(deployment) -> bool:
+    """Whether a Deployment has finished rolling out to its current generation.
+
+    Mirrors `kubectl rollout status`. Checking readyReplicas alone is not
+    enough: for a single-replica Deployment the default strategy surges to two
+    pods, so immediately after a patch the *old* pod is still Ready and a naive
+    check returns instantly — serialising nothing at all.
+    """
+    spec_replicas = deployment.spec.replicas if deployment.spec.replicas is not None else 1
+    status = deployment.status
+    generation = deployment.metadata.generation
+
+    # The controller has not yet acted on the patch we just made.
+    if generation is not None and (status.observed_generation or 0) < generation:
+        return False
+    # Not every replica has been recreated against the new template.
+    if (status.updated_replicas or 0) < spec_replicas:
+        return False
+    # Old-template pods are still terminating.
+    if (status.replicas or 0) > (status.updated_replicas or 0):
+        return False
+    if (status.available_replicas or 0) < spec_replicas:
+        return False
+    return True
+
+
+def wait_for_checker_ready(namespace: str, timeout: int = CHECKER_READY_TIMEOUT) -> bool:
+    """Block until the checker Deployment in a namespace finishes rolling out.
+
+    Returns False on timeout or API error rather than raising, so one wedged
+    namespace cannot stall the rollout for every namespace behind it.
+    """
+    apps_v1 = client.AppsV1Api()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            deployment = apps_v1.read_namespaced_deployment(CHECKER_DEPLOYMENT, namespace)
+        except ApiException as exc:
+            logger.warning("Cannot read checker Deployment in %s while waiting: %s", namespace, exc)
+            return False
+
+        if _rollout_complete(deployment):
+            return True
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Checker in %s did not roll out within %ds; continuing to next namespace",
+                namespace, timeout,
+            )
+            return False
+
+        time.sleep(CHECKER_READY_POLL_SECONDS)
+
+
+def deploy_checker_serialised(namespace: str, *, blocking: bool = True, **kwargs) -> bool:
+    """Deploy a checker, serialised cluster-wide against other checker rollouts.
+
+    With blocking=False the call is skipped entirely when another rollout holds
+    the lock, and the caller relies on the reconcile loop to pick the namespace
+    up on its next pass. That is what keeps the namespace event handler from
+    fanning out: on startup kopf fires it for every existing namespace at once,
+    and all but one of those return immediately. Untested against a real
+    cluster, though: the handler was never registered with kopf until
+    handlers/__init__.py began importing its modules at module scope.
+    """
+    if not _rollout_lock.acquire(blocking=blocking):
+        logger.info("Checker rollout in progress; deferring %s to reconcile", namespace)
+        return False
+    try:
+        deploy_checker(namespace=namespace, **kwargs)
+        wait_for_checker_ready(namespace)
+        return True
+    finally:
+        _rollout_lock.release()
+
+
+def teardown_checker_serialised(namespace: str, *, blocking: bool = True) -> bool:
+    """Tear down a checker under the same lock that serialises deployments.
+
+    Teardown is already sequential per namespace, so this is not about rate —
+    it is about not interleaving with a deployment. `checker.enabled: false`
+    makes every namespace fail _should_audit at once, so reconcile walks the
+    whole cluster tearing down while the namespace handler may still be
+    deploying; without a shared lock those two can race the same namespace and
+    leave a half-removed checker behind.
+
+    Deliberately does not wait for the pods to disappear. Pod deletion is
+    asynchronous and grace-period bound, so waiting would stall the audit thread
+    for roughly grace x N with little gained: a CNI DEL burst has none of the
+    retry amplification that makes an ADD burst self-sustaining (#61).
+    """
+    if not _rollout_lock.acquire(blocking=blocking):
+        logger.info("Checker rollout in progress; deferring teardown of %s to reconcile", namespace)
+        return False
+    try:
+        teardown_checker(namespace)
+        return True
+    finally:
+        _rollout_lock.release()
 
 
 def teardown_checker(namespace: str) -> None:

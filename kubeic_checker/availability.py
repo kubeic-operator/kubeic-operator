@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -181,43 +182,98 @@ def _inspect_ref(image: str) -> str:
     return image
 
 
+def _credential_fingerprint(cred) -> str:
+    """Stable identifier for what a credential *is*, not where it came from.
+
+    A pull secret replicated into fifty namespaces is fifty ResolvedCredentials
+    with different namespaces and the same token. Keying on namespace or secret
+    name would re-inspect the same image fifty times for an identical answer;
+    keying on the material dedupes them. Hashed rather than used directly so no
+    token ends up as a dict key.
+    """
+    material = cred.auth if cred.auth else f"{cred.username}:{cred.password}"
+    return hashlib.sha256(f"{cred.registry}\x00{material}".encode()).hexdigest()[:16]
+
+
+def _dedupe_key(image: str, candidates: list) -> tuple:
+    """Key under which an inspect result may be shared between containers.
+
+    An image inspected with one set of credentials says nothing about the same
+    image inspected with another — a private repo can be readable with one
+    deploy token and 403 with the next — so the credentials are part of the key.
+    Public images resolve to an empty candidate tuple and therefore still share
+    a single inspect across the whole cluster, which is where nearly all of the
+    saving is.
+
+    Order is preserved, not sorted: candidates are tried in the pod's
+    imagePullSecrets order and the first non-auth-failure wins, so [A, B] and
+    [B, A] can genuinely produce different results and must not share a result.
+    """
+    return (image, tuple(_credential_fingerprint(c) for c in candidates))
+
+
+def plan_inspections(
+    pods: list[dict],
+    image_creds: dict[tuple[str, str], list] | None = None,
+) -> dict[tuple, tuple[str, list]]:
+    """The distinct inspections a pod list implies: key -> (ref, candidates).
+
+    Exposed so a caller can size the work before starting it, which is what
+    lets the sweep be paced evenly across its interval rather than run flat out
+    and then idle.
+    """
+    plan: dict[tuple, tuple[str, list]] = {}
+    for pod in pods:
+        namespace = pod["metadata"]["namespace"]
+        containers = pod.get("spec", {}).get("containers", [])
+        init_containers = pod.get("spec", {}).get("initContainers", [])
+        for container in list(containers) + list(init_containers):
+            image = container["image"]
+            candidates = (
+                image_creds.get((namespace, image), []) if image_creds is not None else []
+            )
+            key = _dedupe_key(image, candidates)
+            if key not in plan:
+                plan[key] = (_inspect_ref(image), candidates)
+    return plan
+
+
 def check_availability(
     pods: list[dict],
     auth_file: str | None = None,
-    image_creds: dict[str, list] | None = None,
+    image_creds: dict[tuple[str, str], list] | None = None,
+    pacer=None,
 ) -> list[AvailabilityResult]:
     """Check image availability for all containers in the given pods.
 
-    Each unique image is inspected once and the result is reused for all
-    containers referencing it.
+    Each unique (image, credential set) is inspected once and the result reused
+    for every container that resolves to the same pair.
 
     Args:
-        pods: List of pod dicts with metadata and spec.
+        pods: List of pod dicts with metadata and spec. May span namespaces.
         auth_file: Path to a docker config JSON file for registry auth.
             Ignored when image_creds is provided.
-        image_creds: Map of image -> ordered ResolvedCredential candidates
-            (from build_image_credentials). Candidates are tried per image in
-            kubelet order, advancing only on auth failure.
+        image_creds: Map of (namespace, image) -> ordered ResolvedCredential
+            candidates (from build_image_credentials). Candidates are tried per
+            image in kubelet order, advancing only on auth failure.
+        pacer: Optional zero-argument callable invoked after each inspection.
+            Used to spread the sweep across its interval instead of running it
+            flat out; see _Pacer in the checker entrypoint.
 
     Returns:
         One AvailabilityResult per container.
     """
     results: list[AvailabilityResult] = []
 
-    # Inspect each unique image once
-    seen_images: dict[str, tuple[bool, str | None, dict | None, str]] = {}
-    for pod in pods:
-        containers = pod.get("spec", {}).get("containers", [])
-        init_containers = pod.get("spec", {}).get("initContainers", [])
-        for container in list(containers) + list(init_containers):
-            image = container["image"]
-            if image not in seen_images:
-                if image_creds is not None:
-                    seen_images[image] = _inspect_with_candidates(
-                        _inspect_ref(image), image_creds.get(image, []),
-                    )
-                else:
-                    seen_images[image] = _run_skopeo_inspect(_inspect_ref(image), auth_file)
+    # Inspect each unique image once per distinct credential set.
+    seen_images: dict[tuple, tuple[bool, str | None, dict | None, str]] = {}
+    for key, (ref, candidates) in plan_inspections(pods, image_creds).items():
+        if image_creds is not None:
+            seen_images[key] = _inspect_with_candidates(ref, candidates)
+        else:
+            seen_images[key] = _run_skopeo_inspect(ref, auth_file)
+        if pacer is not None:
+            pacer()
 
     for pod in pods:
         pod_name = pod["metadata"]["name"]
@@ -231,7 +287,11 @@ def check_availability(
             if "@" in image:
                 _, pinned_digest = image.split("@", 1)
 
-            available, error, inspect_data, error_class = seen_images[image]
+            if image_creds is not None:
+                key = _dedupe_key(image, image_creds.get((namespace, image), []))
+            else:
+                key = (image, ())
+            available, error, inspect_data, error_class = seen_images[key]
             registry, image_name, _ = _parse_image(image)
 
             digest_match: bool | None = None

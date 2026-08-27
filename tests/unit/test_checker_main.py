@@ -1,10 +1,16 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from kubeic_checker.main import _get_pods, _check_credential_validity
 
 
 def _make_mock_pod(
     name="my-pod",
+    # Matches the NAMESPACE the cycle tests patch in. _trim_pod reads the
+    # namespace off the pod now, so a mismatch makes any assertion on a
+    # "testns" sample vacuous — it looks for a series that could never exist.
+    namespace="testns",
     annotations=None,
     containers=None,
     init_containers=None,
@@ -21,6 +27,7 @@ def _make_mock_pod(
 
     pod = MagicMock()
     pod.metadata.name = name
+    pod.metadata.namespace = namespace
     pod.metadata.annotations = annotations
     pod.status.phase = phase
 
@@ -50,29 +57,41 @@ def _make_mock_pod(
     return pod
 
 
+def _pod_page(items):
+    """A V1PodList-shaped mock: items plus an exhausted continue token.
+
+    _get_pods pages until the token is falsy, so a bare MagicMock page (whose
+    ._continue is a truthy Mock) loops forever. The page mock has to be real.
+    """
+    page = MagicMock(items=items)
+    page.metadata._continue = None
+    return page
+
+
 class TestGetPods:
     @patch("kubeic_checker.main.client")
     def test_returns_empty_list_when_no_pods(self, mock_client_module):
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = []
+        mock_v1.list_namespaced_pod.return_value = _pod_page([])
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("my-ns")
 
         assert result == []
-        mock_v1.list_namespaced_pod.assert_called_once_with("my-ns")
+        mock_v1.list_namespaced_pod.assert_called_once_with("my-ns", limit=500)
 
     @patch("kubeic_checker.main.client")
     def test_returns_pod_dicts_with_all_fields(self, mock_client_module):
         pod = _make_mock_pod(
             name="app-pod",
+            namespace="prod",
             annotations={"note": "test"},
             containers=[{"name": "main", "image": "nginx:1.25"}],
             init_containers=[{"name": "init", "image": "busybox:1.36"}],
             image_pull_secrets=[{"name": "my-secret"}],
         )
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = [pod]
+        mock_v1.list_namespaced_pod.return_value = _pod_page([pod])
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("prod")
@@ -95,7 +114,7 @@ class TestGetPods:
             image_pull_secrets=None,
         )
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = [pod]
+        mock_v1.list_namespaced_pod.return_value = _pod_page([pod])
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("default")
@@ -113,7 +132,7 @@ class TestGetPods:
             _make_mock_pod(name="pod-b", containers=[{"name": "c2", "image": "img2"}]),
         ]
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = pods
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods)
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("test-ns")
@@ -126,7 +145,7 @@ class TestGetPods:
     def test_annotations_default_to_empty_dict_when_none(self, mock_client_module):
         pod = _make_mock_pod(name="no-anno", annotations=None)
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = [pod]
+        mock_v1.list_namespaced_pod.return_value = _pod_page([pod])
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("ns")
@@ -143,6 +162,7 @@ class TestCheckCredentialValidity:
         cred.auth = auth
         cred.username = username
         cred.password = password
+        cred.namespace = "ns"
         return cred
 
     def _make_pods(self, secrets_images):
@@ -168,7 +188,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.assert_called_once_with(
             registry="r.io", namespace="ns", secret_name="my-secret",
@@ -183,7 +203,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
 
@@ -196,7 +216,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
@@ -207,7 +227,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"other-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
 
@@ -222,7 +242,7 @@ class TestCheckCredentialValidity:
         cred.username = None
         cred.password = None
 
-        _check_credential_validity([cred], "ns", [])
+        _check_credential_validity([cred], [])
 
         mock_gauge.labels.assert_not_called()
 
@@ -235,7 +255,7 @@ class TestCheckCredentialValidity:
         cred = self._make_cred()
         pods = self._make_pods({"my-secret": {"r.io/app/img"}})
 
-        _check_credential_validity([cred], "ns", pods)
+        _check_credential_validity([cred], pods)
 
         # Should be called with the test image, not a pod image
         call_args = mock_list_tags.call_args[0]
@@ -297,9 +317,117 @@ def _run_one_cycle():
     """Run exactly one run_check_loop cycle (sleep breaks the loop)."""
     import pytest
     from kubeic_checker.main import run_check_loop
-    with patch("kubeic_checker.main.time.sleep", side_effect=KeyboardInterrupt):
+    # _pace_sleep is neutralised so the paced sweep runs instantly; the
+    # end-of-cycle time.sleep still raises to break the infinite loop.
+    with (
+        patch("kubeic_checker.main._pace_sleep"),
+        patch("kubeic_checker.main.time.sleep", side_effect=KeyboardInterrupt),
+    ):
         with pytest.raises(KeyboardInterrupt):
             run_check_loop()
+
+
+class TestPacer:
+    def test_spreads_work_evenly_across_the_interval(self):
+        from kubeic_checker.main import _Pacer
+        slept = []
+        with patch("kubeic_checker.main.time.monotonic", return_value=0.0), \
+             patch("kubeic_checker.main._pace_sleep", side_effect=slept.append):
+            pacer = _Pacer(deadline=100.0, total=5)
+            for _ in range(5):
+                pacer()
+        # monotonic frozen, so each gap is time_left / items_left:
+        # 100/4, 100/3, 100/2, 100/1, then nothing on the last item.
+        assert slept == [25.0, pytest.approx(33.333, rel=1e-3), 50.0, 100.0]
+
+    def test_a_slow_item_shortens_the_gap_that_follows_it(self):
+        # The gap is recomputed from the clock every call, so an item that ate
+        # most of the interval leaves a correspondingly smaller gap behind it
+        # rather than the sweep overrunning.
+        from kubeic_checker.main import _Pacer
+
+        def gap_after(elapsed):
+            slept = []
+            with (
+                patch("kubeic_checker.main.time.monotonic", return_value=elapsed),
+                patch("kubeic_checker.main._pace_sleep", side_effect=slept.append),
+            ):
+                _Pacer(deadline=100.0, total=4)()
+            return slept[0]
+
+        assert gap_after(0.0) == pytest.approx(100.0 / 3)
+        assert gap_after(90.0) == pytest.approx(10.0 / 3)
+        assert gap_after(90.0) < gap_after(0.0)
+
+    def test_runs_flat_out_once_the_interval_is_spent(self):
+        from kubeic_checker.main import _Pacer
+        slept = []
+        with patch("kubeic_checker.main.time.monotonic", return_value=200.0), \
+             patch("kubeic_checker.main._pace_sleep", side_effect=slept.append):
+            pacer = _Pacer(deadline=100.0, total=5)
+            for _ in range(4):
+                pacer()
+        # Overrunning must not overlap the next cycle — it just stops waiting.
+        assert slept == []
+
+    def test_never_sleeps_after_the_last_item(self):
+        from kubeic_checker.main import _Pacer
+        slept = []
+        with patch("kubeic_checker.main.time.monotonic", return_value=0.0), \
+             patch("kubeic_checker.main._pace_sleep", side_effect=slept.append):
+            pacer = _Pacer(deadline=100.0, total=1)
+            pacer()
+        assert slept == []
+
+    def test_zero_work_does_not_divide_by_zero(self):
+        from kubeic_checker.main import _Pacer
+        with patch("kubeic_checker.main.time.monotonic", return_value=0.0), \
+             patch("kubeic_checker.main._pace_sleep") as slept:
+            _Pacer(deadline=100.0, total=0)()
+        slept.assert_not_called()
+
+
+class TestPodListingScope:
+    @patch("kubeic_checker.main.client")
+    def test_central_mode_lists_the_whole_cluster(self, mock_client_module):
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        _get_pods("")
+
+        mock_v1.list_pod_for_all_namespaces.assert_called_once_with(limit=500)
+        mock_v1.list_namespaced_pod.assert_not_called()
+
+    @patch("kubeic_checker.main.client")
+    def test_pages_until_the_continue_token_is_exhausted(self, mock_client_module):
+        # Unpaginated, a cluster-wide list deserialises every pod at once and
+        # that peak becomes the pod's resident floor.
+        first = MagicMock(items=[_make_mock_pod(name="a", namespace="ns-a")])
+        first.metadata._continue = "tok-1"
+        second = MagicMock(items=[_make_mock_pod(name="b", namespace="ns-b")])
+        second.metadata._continue = ""
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.side_effect = [first, second]
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("")
+
+        assert [p["metadata"]["name"] for p in result] == ["a", "b"]
+        assert mock_v1.list_pod_for_all_namespaces.call_args_list[1][1]["_continue"] == "tok-1"
+
+    @patch("kubeic_checker.main.client")
+    def test_each_pod_keeps_its_own_namespace(self, mock_client_module):
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([
+            _make_mock_pod(name="a", namespace="ns-a"),
+            _make_mock_pod(name="b", namespace="ns-b"),
+        ])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("")
+
+        assert [p["metadata"]["namespace"] for p in result] == ["ns-a", "ns-b"]
 
 
 class TestRunCheckLoopCycle:
@@ -321,8 +449,13 @@ class TestRunCheckLoopCycle:
                 raise value
             return value
 
+        # The pod's own namespace is what everything downstream keys on now,
+        # so it has to agree with the patched NAMESPACE below.
+        for pod in pods:
+            pod.metadata.namespace = "testns"
+
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = pods
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods)
         mock_v1.read_namespaced_secret.side_effect = read_secret
         with patch("kubeic_checker.main.config"), \
              patch("kubeic_checker.main.client") as mock_client, \
@@ -407,7 +540,7 @@ class TestRunCheckLoopCycle:
         checked = _make_mock_pod(name="checked",
                                  containers=[{"name": "main", "image": "r.corp.io/org/checked:v1"}])
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = [skipped, checked]
+        mock_v1.list_namespaced_pod.return_value = _pod_page([skipped, checked])
         with patch("kubeic_checker.main.config"), \
              patch("kubeic_checker.main.client") as mock_client, \
              patch("kubeic_checker.main.NAMESPACE", "testns"), \
@@ -420,6 +553,104 @@ class TestRunCheckLoopCycle:
         assert "docker://r.corp.io/org/skipped:v1" not in refs
 
 
+class TestCredentialValidityPublishIsAtomic:
+    """The gauge must not vanish while a paced sweep is in progress.
+
+    Clearing up front and setting each series as its probe finished was
+    harmless when the sweep was instantaneous. Under pacing it leaves the
+    series absent for most of the cycle, and Prometheus reads an absent series
+    as stale — so RegistryCredentialInvalid (critical, for: interval + 10m)
+    would reset its pending timer every cycle and could never fire.
+    """
+
+    def setup_method(self):
+        from kubeic_operator import metrics
+        metrics.kube_image_credential_valid.clear()
+
+    teardown_method = setup_method
+
+    @staticmethod
+    def _cred(secret, namespace="ns", registry="r.io", auth="dG9rZW4="):
+        from kubeic_checker.credentials import ResolvedCredential
+        return ResolvedCredential(
+            registry=registry, auth=auth,
+            source=f"pod:imagePullSecret:{secret}", namespace=namespace,
+        )
+
+    @staticmethod
+    def _pods(secret, image="r.io/app/img", namespace="ns"):
+        return [{
+            "metadata": {"name": "pod1", "namespace": namespace},
+            "spec": {
+                "containers": [{"name": "c", "image": image}],
+                "initContainers": [],
+                "imagePullSecrets": [{"name": secret}],
+            },
+        }]
+
+    @patch("kubeic_checker.availability._run_skopeo_list_tags", return_value=(True, None, ""))
+    def test_previous_cycles_series_stay_visible_until_the_new_set_lands(self, _tags):
+        from prometheus_client import REGISTRY
+        from kubeic_operator import metrics
+
+        stale_labels = {"registry": "r.io", "namespace": "ns", "secret_name": "from-last-cycle"}
+        metrics.kube_image_credential_valid.labels(**stale_labels).set(0)
+
+        mid_loop = []
+
+        def snapshot():
+            mid_loop.append(
+                REGISTRY.get_sample_value("kube_image_credential_valid", stale_labels)
+            )
+
+        creds = [self._cred("secret-a"), self._cred("secret-b")]
+        pods = self._pods("secret-a") + self._pods("secret-b")
+        _check_credential_validity(creds, pods, pacer=snapshot)
+
+        # Sampled after each probe: the old series is still being served
+        # throughout, rather than a hole opening at the top of the function.
+        assert mid_loop and all(v == 0 for v in mid_loop), mid_loop
+        # ...and is replaced only once the new set is published.
+        assert REGISTRY.get_sample_value("kube_image_credential_valid", stale_labels) is None
+        assert REGISTRY.get_sample_value("kube_image_credential_valid", {
+            "registry": "r.io", "namespace": "ns", "secret_name": "secret-a",
+        }) == 1
+
+    @patch("kubeic_checker.availability._run_skopeo_list_tags", return_value=(True, None, ""))
+    def test_pacer_fires_once_per_credential_actually_probed(self, _tags):
+        # The pacer is sized on _probeable_credentials, so it has to be
+        # advanced exactly that many times or the gaps are miscomputed and the
+        # sweep drifts back towards burst-then-idle.
+        from kubeic_checker.main import _probeable_credentials
+
+        creds = [
+            self._cred("secret-a"),
+            self._cred("secret-a"),                  # duplicate: same ns/registry/source
+            self._cred("secret-c", auth=None),       # no auth material: never probed
+            self._cred("secret-b"),
+        ]
+        pods = self._pods("secret-a") + self._pods("secret-b")
+
+        calls = []
+        _check_credential_validity(creds, pods, pacer=lambda: calls.append(1))
+
+        assert len(_probeable_credentials(creds)) == 2
+        assert len(calls) == 2
+
+    def test_probeable_credentials_skips_duplicates_and_empty_material(self):
+        from kubeic_checker.main import _probeable_credentials
+
+        creds = [
+            self._cred("secret-a"),
+            self._cred("secret-a"),
+            self._cred("secret-a", namespace="other-ns"),   # same name, different ns
+            self._cred("secret-c", auth=None),
+        ]
+        probeable = _probeable_credentials(creds)
+
+        assert [ns for ns, _ in probeable] == ["ns", "other-ns"]
+
+
 class TestCredentialValidityBranches:
     def _cred(self, registry="r.io", secret="my-secret", auth="dG9rZW4=",
               username=None, password=None):
@@ -429,6 +660,7 @@ class TestCredentialValidityBranches:
         cred.auth = auth
         cred.username = username
         cred.password = password
+        cred.namespace = "ns"
         return cred
 
     def _pods(self, image="r.io/app/img", secret="my-secret"):
@@ -447,7 +679,7 @@ class TestCredentialValidityBranches:
         # A dockerconfig entry with no auth and no user/pass carries nothing
         # to test — it must not produce a gauge sample at all.
         cred = self._cred(auth=None, username=None, password=None)
-        _check_credential_validity([cred], "ns", self._pods())
+        _check_credential_validity([cred], self._pods())
         mock_gauge.labels.assert_not_called()
         mock_list_tags.assert_not_called()
 
@@ -458,7 +690,7 @@ class TestCredentialValidityBranches:
         # each must be probed against the registry exactly once per cycle.
         mock_list_tags.return_value = (True, None, "")
         cred = self._cred()
-        _check_credential_validity([cred, cred], "ns", self._pods())
+        _check_credential_validity([cred, cred], self._pods())
         assert mock_list_tags.call_count == 1
         assert mock_gauge.labels.call_count == 1
 
@@ -469,7 +701,7 @@ class TestCredentialValidityBranches:
         # blob (older tooling writes these) must still be testable.
         mock_list_tags.return_value = (True, None, "")
         cred = self._cred(auth=None, username="u", password="p")
-        _check_credential_validity([cred], "ns", self._pods())
+        _check_credential_validity([cred], self._pods())
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
     @patch("kubeic_checker.main.CREDENTIAL_TEST_IMAGE", "r.io/canary/probe")
@@ -477,7 +709,7 @@ class TestCredentialValidityBranches:
     @patch("kubeic_checker.availability._run_skopeo_list_tags")
     def test_configured_test_image_auth_failure_marks_invalid(self, mock_list_tags, mock_gauge):
         mock_list_tags.return_value = (False, "unauthorized", "auth_failure")
-        _check_credential_validity([self._cred()], "ns", self._pods())
+        _check_credential_validity([self._cred()], self._pods())
         mock_list_tags.assert_called_once()
         assert mock_list_tags.call_args[0][0] == "r.io/canary/probe"
         mock_gauge.labels.return_value.set.assert_called_once_with(0)
@@ -494,7 +726,7 @@ class TestCredentialValidityBranches:
         # rate-limit shape.
         mock_list_tags.return_value = (False, "timeout", "network")
         mock_inspect.return_value = (True, None, {}, "")
-        _check_credential_validity([self._cred()], "ns", self._pods())
+        _check_credential_validity([self._cred()], self._pods())
         mock_gauge.labels.return_value.set.assert_called_once_with(1)
 
 
@@ -511,7 +743,7 @@ class TestCycleLogging:
 
     def _cycle(self, pods_items, registry):
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = pods_items
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods_items)
         with patch("kubeic_checker.main.config"), \
              patch("kubeic_checker.main.client") as mock_client, \
              patch("kubeic_checker.main.NAMESPACE", "testns"), \
@@ -564,7 +796,7 @@ class TestTerminatedPodsExcluded:
                            containers=[{"name": "c", "image": "img:1"}]),
         ]
         mock_v1 = MagicMock()
-        mock_v1.list_namespaced_pod.return_value.items = pods
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods)
         mock_client_module.CoreV1Api.return_value = mock_v1
 
         result = _get_pods("ns")
@@ -591,7 +823,7 @@ class TestTerminatedPodsExcluded:
                 containers=[{"name": "main", "image": "r.corp.io/org/live:v1"}],
             )
             mock_v1 = MagicMock()
-            mock_v1.list_namespaced_pod.return_value.items = [dead, live]
+            mock_v1.list_namespaced_pod.return_value = _pod_page([dead, live])
             # the ephemeral secret is gone/expired — reading it would fail
             mock_v1.read_namespaced_secret.side_effect = RuntimeError("secret deleted with job")
             with patch("kubeic_checker.main.config"), \
@@ -606,6 +838,14 @@ class TestTerminatedPodsExcluded:
             # the dead pod's secret was never even read
             mock_v1.read_namespaced_secret.assert_not_called()
             from prometheus_client import REGISTRY
+            # Positive control: the live pod's series must be present under
+            # these exact labels, so the absence assertions below are looking
+            # in a place where a sample really could have appeared.
+            assert REGISTRY.get_sample_value("kube_image_available", {
+                "image": "r.corp.io/org/live:v1", "registry": "r.corp.io",
+                "image_name": "org/live", "namespace": "testns",
+                "pod": "live", "container": "main", "error_class": "",
+            }) == 1
             for ec in ("auth_failure", "not_found", "network", "unknown"):
                 v = REGISTRY.get_sample_value("kube_image_available", {
                     "image": "r.corp.io/devops/ci-images:v1", "registry": "r.corp.io",
@@ -616,3 +856,469 @@ class TestTerminatedPodsExcluded:
         finally:
             metrics.kube_image_available.clear()
             metrics.kube_image_credential_valid.clear()
+
+
+def _namespace(name, labels=None):
+    ns = MagicMock()
+    ns.metadata.name = name
+    ns.metadata.labels = labels
+    return ns
+
+
+def _namespace_list(*namespaces):
+    return MagicMock(items=list(namespaces))
+
+
+class TestParseExcludeLabels:
+    def _parse(self, raw):
+        from kubeic_checker.main import _parse_exclude_labels
+        with patch.dict("os.environ", {"EXCLUDE_LABELS": raw}):
+            return _parse_exclude_labels()
+
+    def test_reads_a_json_object(self):
+        assert self._parse('{"audit": "disabled"}') == {"audit": "disabled"}
+
+    def test_empty_means_no_exclusions(self):
+        # Helm renders an unset value as "", not as an absent variable.
+        assert self._parse("") == {}
+        assert self._parse("   ") == {}
+
+    def test_empty_object_means_no_exclusions(self):
+        assert self._parse("{}") == {}
+
+    def test_malformed_json_falls_back_to_no_exclusions(self):
+        # Raising here would crash the checker at import and stop all auditing,
+        # which is worse than auditing a namespace that asked not to be.
+        assert self._parse("{not json") == {}
+
+    def test_non_object_json_falls_back_to_no_exclusions(self):
+        assert self._parse('["audit"]') == {}
+        assert self._parse('"audit"') == {}
+
+    def test_coerces_non_string_values(self):
+        # Helm can render a bare `true` or a number into the JSON; label
+        # comparison is string-to-string, so both sides must be strings.
+        assert self._parse('{"audit": true, "tier": 3}') == {"audit": "True", "tier": "3"}
+
+
+class TestResolveExcludedNamespaces:
+    def setup_method(self):
+        # Module-level cache: without resetting it, one test's successful list
+        # would satisfy the next test's failure path.
+        import kubeic_checker.main as checker_main
+        checker_main._last_excluded = None
+
+    teardown_method = setup_method
+
+    def _resolve(self, static=frozenset(), labels=None, namespaces=None, list_error=None):
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        if list_error is not None:
+            mock_v1.list_namespace.side_effect = list_error
+        else:
+            mock_v1.list_namespace.return_value = namespaces or _namespace_list()
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", static),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", labels or {}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            return _resolve_excluded_namespaces(), mock_v1
+
+    def test_returns_the_static_list(self):
+        excluded, _ = self._resolve(static=frozenset({"kube-public", "kube-node-lease"}))
+        assert excluded == {"kube-public", "kube-node-lease"}
+
+    def test_skips_the_namespace_list_when_no_labels_are_configured(self):
+        # The label lookup is the only reason this needs namespaces get/list.
+        # With no labels configured it must not spend an API call per cycle.
+        _, mock_v1 = self._resolve(static=frozenset({"kube-public"}))
+        mock_v1.list_namespace.assert_not_called()
+
+    def test_excludes_a_namespace_carrying_the_label(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(
+                _namespace("opted-out", {"audit": "disabled"}),
+                _namespace("normal", {"team": "platform"}),
+            ),
+        )
+        assert excluded == {"opted-out"}
+
+    def test_requires_the_label_value_to_match(self):
+        # `audit: enabled` must not be read as an opt-out.
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("keen", {"audit": "enabled"})),
+        )
+        assert excluded == set()
+
+    def test_any_one_of_several_labels_excludes(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled", "kubeic.io/skip": "true"},
+            namespaces=_namespace_list(
+                _namespace("by-first", {"audit": "disabled"}),
+                _namespace("by-second", {"kubeic.io/skip": "true"}),
+                _namespace("by-neither", {}),
+            ),
+        )
+        assert excluded == {"by-first", "by-second"}
+
+    def test_handles_a_namespace_with_no_labels(self):
+        excluded, _ = self._resolve(
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("bare", None)),
+        )
+        assert excluded == set()
+
+    def test_unions_the_static_list_with_label_matches(self):
+        excluded, _ = self._resolve(
+            static=frozenset({"kube-public"}),
+            labels={"audit": "disabled"},
+            namespaces=_namespace_list(_namespace("opted-out", {"audit": "disabled"})),
+        )
+        assert excluded == {"kube-public", "opted-out"}
+
+    def test_raises_when_the_list_fails_and_nothing_is_cached(self):
+        # Failing open would audit namespaces that explicitly opted out. The
+        # caller treats the raise as a failed cycle and retries on the next one.
+        with pytest.raises(RuntimeError):
+            self._resolve(
+                labels={"audit": "disabled"},
+                list_error=RuntimeError("apiserver unavailable"),
+            )
+
+    def test_reuses_the_previous_answer_when_the_list_fails(self):
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.return_value = _namespace_list(
+            _namespace("opted-out", {"audit": "disabled"}),
+        )
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            assert _resolve_excluded_namespaces() == {"opted-out"}
+
+            # A transient failure on the next cycle must not silently re-include
+            # the namespace that opted out.
+            mock_v1.list_namespace.side_effect = RuntimeError("transient")
+            assert _resolve_excluded_namespaces() == {"opted-out"}
+
+    def test_a_relabelled_namespace_is_picked_up_on_the_next_cycle(self):
+        # Recomputed per cycle rather than cached for the pod's lifetime, so an
+        # opt-out applied today takes effect within one interval.
+        from kubeic_checker.main import _resolve_excluded_namespaces
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.return_value = _namespace_list(_namespace("app", {}))
+        with (
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.main.client") as mock_client,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            assert _resolve_excluded_namespaces() == set()
+
+            mock_v1.list_namespace.return_value = _namespace_list(
+                _namespace("app", {"audit": "disabled"}),
+            )
+            assert _resolve_excluded_namespaces() == {"app"}
+
+
+class TestGetPodsExclusion:
+    @patch("kubeic_checker.main.client")
+    def test_drops_pods_from_excluded_namespaces(self, mock_client_module):
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([
+            _make_mock_pod(name="keep", namespace="app"),
+            _make_mock_pod(name="drop", namespace="opted-out"),
+        ])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("", exclude=frozenset({"opted-out"}))
+
+        assert [p["metadata"]["name"] for p in result] == ["keep"]
+
+    @patch("kubeic_checker.main.client")
+    def test_excludes_across_every_page(self, mock_client_module):
+        # The filter is applied per page, so it must not be defeated by an
+        # excluded namespace appearing only in a later page.
+        first = MagicMock(items=[_make_mock_pod(name="keep", namespace="app")])
+        first.metadata._continue = "tok-1"
+        second = MagicMock(items=[_make_mock_pod(name="drop", namespace="opted-out")])
+        second.metadata._continue = ""
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.side_effect = [first, second]
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        result = _get_pods("", exclude=frozenset({"opted-out"}))
+
+        assert [p["metadata"]["name"] for p in result] == ["keep"]
+
+    @patch("kubeic_checker.main.client")
+    def test_no_exclusions_by_default(self, mock_client_module):
+        # perNamespace mode passes no exclude set, and must be unaffected.
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.return_value = _pod_page([
+            _make_mock_pod(name="a", namespace="testns"),
+        ])
+        mock_client_module.CoreV1Api.return_value = mock_v1
+
+        assert len(_get_pods("testns")) == 1
+
+
+class TestCentralCycleHonoursExclusions:
+    """A whole cycle in central mode, proving an excluded namespace produces
+    neither a registry call nor a metric.
+
+    The exclusion parity gap this closes: in perNamespace mode an excluded
+    namespace never gets a checker, so nothing enforces it in code. A central
+    checker lists every pod in the cluster, so without this filter switching
+    mode would silently start auditing every namespace that had opted out.
+    """
+
+    def setup_method(self):
+        from kubeic_operator import metrics
+        metrics.kube_image_available.clear()
+        metrics.kube_image_credential_valid.clear()
+        import kubeic_checker.main as checker_main
+        checker_main._last_excluded = None
+
+    teardown_method = setup_method
+
+    def _run_central(self, pods, namespaces, static=frozenset(), labels=None):
+        """Run one central-mode cycle; returns the fake registry it talked to.
+
+        Both images are public, so anything reaching the registry succeeds — an
+        excluded image being absent from inspect_calls therefore means it was
+        filtered out, not that it merely failed.
+        """
+        registry = _FakeRegistry({}, public_repos={
+            "docker://r.corp.io/org/included:v1",
+            "docker://r.corp.io/org/excluded:v1",
+        })
+        mock_v1 = MagicMock()
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page(pods)
+        mock_v1.list_namespace.return_value = namespaces
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.CENTRAL_MODE", True),
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", static),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", labels or {}),
+            patch("kubeic_checker.availability.time.sleep"),
+            patch("kubeic_checker.availability.subprocess.run", side_effect=registry),
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            _run_one_cycle()
+        return registry
+
+    @staticmethod
+    def _available(namespace, image, pod):
+        from prometheus_client import REGISTRY
+        return REGISTRY.get_sample_value("kube_image_available", {
+            "image": image, "registry": "r.corp.io",
+            "image_name": image.split("/", 1)[1].rsplit(":", 1)[0],
+            "namespace": namespace, "pod": pod, "container": "main", "error_class": "",
+        })
+
+    def test_a_label_excluded_namespace_is_neither_inspected_nor_measured(self):
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+        namespaces = _namespace_list(
+            _namespace("included", {}),
+            _namespace("opted-out", {"audit": "disabled"}),
+        )
+
+        self._run_central(pods, namespaces, labels={"audit": "disabled"})
+
+        assert self._available("included", "r.corp.io/org/included:v1", "in") == 1
+        # Not merely a different value — the series must not exist at all.
+        assert self._available("opted-out", "r.corp.io/org/excluded:v1", "out") is None
+
+    def test_a_statically_excluded_namespace_is_not_audited(self):
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="kube-public",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+
+        self._run_central(pods, _namespace_list(), static=frozenset({"kube-public"}))
+
+        assert self._available("included", "r.corp.io/org/included:v1", "in") == 1
+        assert self._available("kube-public", "r.corp.io/org/excluded:v1", "out") is None
+
+    def test_an_excluded_image_is_never_sent_to_the_registry(self):
+        # Auditing an opted-out namespace would also mean authenticating against
+        # its registries, which is a side effect the opt-out is meant to prevent.
+        pods = [
+            _make_mock_pod(name="in", namespace="included",
+                           containers=[{"name": "main", "image": "r.corp.io/org/included:v1"}]),
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ]
+        namespaces = _namespace_list(
+            _namespace("included", {}), _namespace("opted-out", {"audit": "disabled"}),
+        )
+
+        registry = self._run_central(pods, namespaces, labels={"audit": "disabled"})
+
+        inspected = {ref for ref, _ in registry.inspect_calls}
+        assert inspected == {"docker://r.corp.io/org/included:v1"}
+
+    def test_a_namespace_list_failure_fails_the_cycle_rather_than_auditing_everything(self):
+        # With no cached answer the cycle must abort, not fall open. The loop's
+        # own exception handling keeps the process alive.
+        mock_v1 = MagicMock()
+        mock_v1.list_namespace.side_effect = RuntimeError("apiserver unavailable")
+        mock_v1.list_pod_for_all_namespaces.return_value = _pod_page([
+            _make_mock_pod(name="out", namespace="opted-out",
+                           containers=[{"name": "main", "image": "r.corp.io/org/excluded:v1"}]),
+        ])
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.CENTRAL_MODE", True),
+            patch("kubeic_checker.main.EXCLUDED_NAMESPACES", frozenset()),
+            patch("kubeic_checker.main.EXCLUDE_LABELS", {"audit": "disabled"}),
+            patch("kubeic_checker.availability.subprocess.run") as mock_run,
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            _run_one_cycle()  # KeyboardInterrupt from sleep, not RuntimeError
+
+        mock_run.assert_not_called()
+        assert self._available("opted-out", "r.corp.io/org/excluded:v1", "out") is None
+
+
+class TestFirstCyclePublishesPromptly:
+    """The first sweep after startup must not take a whole interval.
+
+    Metrics are published only when a sweep finishes, so pacing the first sweep
+    across the interval like every other one leaves a restarted checker
+    exporting nothing for `intervalMinutes`. That is longer than any alert's
+    `for`, so every alert built on these metrics resolves on restart and the
+    downstream tickets close — a 30 minute cluster-wide blackout on sca1 during
+    the 0.3.0-alpha.8 rollout (#74).
+
+    These assert on *when the publish happens* against a fake clock, rather than
+    on sleep totals. Time-to-first-publish is the property that broke, and the
+    existing cycle tests cannot see it: they neutralise _pace_sleep so a cycle
+    always finishes instantly.
+    """
+
+    def setup_method(self):
+        from kubeic_operator import metrics
+        metrics.kube_image_available.clear()
+        metrics.kube_image_credential_valid.clear()
+
+    teardown_method = setup_method
+
+    def _run(self, cycles=2, interval=1800, first_cycle_seconds=60, images=6):
+        """Run `cycles` cycles on a fake clock.
+
+        Returns (publish_times, pace_totals): the clock reading at each publish,
+        and how much paced delay each cycle spent.
+        """
+        from kubeic_operator.metrics import update_availability_metrics as real_update
+
+        registry = _FakeRegistry({}, public_repos={
+            f"docker://r.corp.io/org/app-{i}:v1" for i in range(images)
+        })
+        pods = [
+            _make_mock_pod(name=f"p{i}", containers=[
+                {"name": "main", "image": f"r.corp.io/org/app-{i}:v1"}])
+            for i in range(images)
+        ]
+        mock_v1 = MagicMock()
+        mock_v1.list_namespaced_pod.return_value = _pod_page(pods)
+
+        # A clock the mocked sleeps advance. Without it the pacer recomputes
+        # time_left against a frozen clock, never sees its budget shrink, and
+        # the sleeps come out as a harmonic series instead of summing to the
+        # deadline — measuring the mock rather than the code.
+        clock = [0.0]
+        publishes = []
+        pace_totals = [0.0]
+
+        def pace(seconds):
+            clock[0] += seconds
+            pace_totals[-1] += seconds
+
+        def sleep(seconds):
+            # End-of-cycle sleep only. A fully paced cycle consumes the whole
+            # interval, leaving time_left at zero, so this is NOT reached every
+            # cycle and cannot be used as the cycle boundary.
+            clock[0] += seconds
+
+        def on_publish(results):
+            real_update(results)
+            publishes.append(clock[0])
+            if len(publishes) >= cycles:
+                raise KeyboardInterrupt
+            pace_totals.append(0.0)
+
+        from kubeic_checker.main import run_check_loop
+        # ONE patch of time.sleep: kubeic_checker.main.time and
+        # kubeic_checker.availability.time are the same module object, so
+        # patching both means whichever is applied last silently wins. Every
+        # image below resolves, so skopeo never retries into it.
+        with (
+            patch("kubeic_checker.main.config"),
+            patch("kubeic_checker.main.client") as mock_client,
+            patch("kubeic_checker.main.NAMESPACE", "testns"),
+            patch("kubeic_checker.main.CHECK_INTERVAL", interval),
+            patch("kubeic_checker.main.FIRST_CYCLE_SECONDS", first_cycle_seconds),
+            patch("kubeic_checker.main.update_availability_metrics", side_effect=on_publish),
+            patch("kubeic_checker.main._pace_sleep", side_effect=pace),
+            patch("kubeic_checker.main.time.sleep", side_effect=sleep),
+            patch("kubeic_checker.main.time.monotonic", side_effect=lambda: clock[0]),
+            patch("kubeic_checker.availability.subprocess.run", side_effect=registry),
+        ):
+            mock_client.CoreV1Api.return_value = mock_v1
+            with pytest.raises(KeyboardInterrupt):
+                run_check_loop()
+        return publishes, pace_totals
+
+    def test_first_publish_lands_inside_the_short_window(self):
+        # The regression: this was ~1800, one full interval after startup.
+        publishes, _ = self._run(interval=1800, first_cycle_seconds=60)
+        assert publishes[0] <= 60, f"first publish at t+{publishes[0]:.0f}s, expected <= 60s"
+
+    def test_first_publish_is_a_small_fraction_of_the_interval(self):
+        publishes, _ = self._run(interval=1800, first_cycle_seconds=60)
+        assert publishes[0] < 1800 / 10, f"first publish at t+{publishes[0]:.0f}s of a 1800s interval"
+
+    def test_steady_state_still_paces_across_the_whole_interval(self):
+        # The fix must not undo #72: later sweeps still fill the interval,
+        # otherwise the checker returns to burst-then-idle.
+        _, pace_totals = self._run(interval=1800, first_cycle_seconds=60)
+        assert pace_totals[1] > 1800 / 2, f"second sweep paced over only {pace_totals[1]:.0f}s"
+
+    def test_first_sweep_is_far_shorter_than_later_ones(self):
+        _, pace_totals = self._run(interval=1800, first_cycle_seconds=60)
+        assert pace_totals[1] > pace_totals[0] * 5, (
+            f"first={pace_totals[0]:.0f}s second={pace_totals[1]:.0f}s — not compressed"
+        )
+
+    def test_short_intervals_clamp_to_the_interval(self):
+        # FIRST_CYCLE_SECONDS must never exceed the interval, or a checker on
+        # intervalMinutes=1 would pace its first sweep past its own cycle end.
+        publishes, _ = self._run(interval=30, first_cycle_seconds=60)
+        assert publishes[0] <= 30, f"first publish at t+{publishes[0]:.0f}s for a 30s interval"
+
+    def test_metrics_are_actually_published_by_the_first_cycle(self):
+        # The point of the exercise: something is scrapeable early.
+        from prometheus_client import REGISTRY
+        self._run(cycles=1, interval=1800, first_cycle_seconds=60)
+        assert REGISTRY.get_sample_value("kube_image_available", {
+            "image": "r.corp.io/org/app-0:v1", "registry": "r.corp.io",
+            "image_name": "org/app-0", "namespace": "testns",
+            "pod": "p0", "container": "main", "error_class": "",
+        }) == 1

@@ -3,3 +3,5 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+# Build output from `pip install -e .`, which CI and local dev both create.
+*.egg-info/
