@@ -5,21 +5,20 @@
 | Name                                      |    Stmts |     Miss |   Cover |   Missing |
 |------------------------------------------ | -------: | -------: | ------: | --------: |
 | kubeic\_checker/\_\_init\_\_.py           |        0 |        0 |    100% |           |
-| kubeic\_checker/availability.py           |      149 |       13 |     91% |79-80, 91-93, 119-124, 152-153 |
-| kubeic\_checker/credentials.py            |       87 |        1 |     99% |        81 |
-| kubeic\_checker/main.py                   |      124 |        7 |     94% |147-148, 206-207, 222-224 |
+| kubeic\_checker/availability.py           |      168 |       13 |     92% |80-81, 92-94, 120-125, 153-154 |
+| kubeic\_checker/credentials.py            |       89 |        1 |     99% |        93 |
+| kubeic\_checker/main.py                   |      220 |        8 |     96% |98, 372-373, 498-499, 526-528 |
 | kubeic\_operator/\_\_init\_\_.py          |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/\_\_init\_\_.py   |        0 |        0 |    100% |           |
 | kubeic\_operator/checks/prerelease.py     |       99 |        1 |     99% |       241 |
 | kubeic\_operator/checks/spread.py         |       25 |        0 |    100% |           |
-| kubeic\_operator/cleanup.py               |       18 |        1 |     94% |        34 |
-| kubeic\_operator/deployer.py              |      157 |       16 |     90% |46, 53, 60-62, 65-66, 70-73, 316, 327, 338, 349, 368, 388 |
-| kubeic\_operator/handlers/\_\_init\_\_.py |        0 |        0 |    100% |           |
-| kubeic\_operator/handlers/namespace.py    |       56 |        1 |     98% |        43 |
-| kubeic\_operator/handlers/policy.py       |       18 |        0 |    100% |           |
-| kubeic\_operator/main.py                  |      176 |       72 |     59% |36, 39, 42, 45, 48, 63, 66, 71-81, 85-109, 126-128, 143, 153-154, 160-161, 236, 242, 249-260, 269-283 |
-| kubeic\_operator/metrics.py               |       55 |        0 |    100% |           |
-| **TOTAL**                                 |  **964** |  **112** | **88%** |           |
+| kubeic\_operator/cleanup.py               |       26 |        1 |     96% |        58 |
+| kubeic\_operator/deployer.py              |      304 |       17 |     94% |151, 158, 165-167, 170-171, 175-178, 594, 656, 667, 678, 689, 708, 841 |
+| kubeic\_operator/handlers/\_\_init\_\_.py |        1 |        0 |    100% |           |
+| kubeic\_operator/handlers/namespace.py    |       61 |        1 |     98% |        50 |
+| kubeic\_operator/main.py                  |      265 |       48 |     82% |55, 135-145, 207-208, 262-264, 271, 281-282, 304-306, 337, 482, 488, 501-502, 515-517, 521-530, 539-552 |
+| kubeic\_operator/metrics.py               |       56 |        0 |    100% |           |
+| **TOTAL**                                 | **1314** |   **90** | **93%** |           |
 
 
 ## Setup coverage badge
